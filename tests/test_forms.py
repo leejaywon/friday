@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from friday import bot as botmod
-from friday.forms import login_spec, parse_fields
+from friday.forms import login_spec, make_spec, outcome, parse_fields
 from friday.miniapp import AppKey, encrypt_like_the_page
 from friday.vault import Vault
 
@@ -32,24 +32,27 @@ async def _reply(f, rid, *lines):
     await f._login_reply(SimpleNamespace(text="\n".join(lines), chat_id=1, delete=delete), f.store.login_request(rid))
 
 
-def test_login_reply_goes_to_the_vault_only(cfg, caplog):
+def test_login_with_only_the_fields_the_site_needs(cfg, caplog):
+    """An email and a password were asked; the site needs only the email, so the owner skips the password."""
     f, sent, edited = _bot(replace(cfg, allowed_user_ids=(1,)))
-    extra = parse_fields('[{"name": "member_id", "label": "Member ID"}]', sensitive_default=True)
-    rid = f.store.add_login_request("mysite", "example.com", "monthly report", spec=login_spec(
-        "mysite", "example.com", "monthly report", extra))
+    fields = parse_fields('[{"name": "email", "label": "Email", "type": "email"},'
+                          ' {"name": "password", "label": "Password", "type": "password"}]')
+    spec = make_spec("example.com login", fields, "", "example.com", "mysite")
+    rid = f.store.add_login_request("mysite", "example.com", "", kind="login", spec=spec)
     asyncio.run(f._send_login_request(rid))
-    assert "Member ID" in sent[-1] and "example.com" in sent[-1]
+    assert "🔐 Password" in sent[-1] and "Write - on a line" in sent[-1]
 
-    asyncio.run(_reply(f, rid, "alex", "pw secret 1"))  # a line short: nothing saved
+    asyncio.run(_reply(f, rid, "alex@example.com"))  # a line short: nothing saved
     assert Vault(cfg.vault_dir).get("mysite") is None and f.store.login_request(rid)["status"] == "pending"
 
-    asyncio.run(_reply(f, rid, " alex ", "pw secret 1", "2024123"))
+    asyncio.run(_reply(f, rid, " alex@example.com ", "-"))
     login = Vault(cfg.vault_dir).get("mysite")
     assert (login.username, login.password, login.extra, login.trusted) == (
-        "alex", "pw secret 1", {"member_id": "2024123"}, ("example.com",))
-    assert f.store.login_request(rid)["status"] == "saved"
-    assert f.store.take_result(rid) == {}  # nothing for the agent
-    assert "pw secret" not in caplog.text and "2024123" not in caplog.text
+        "alex@example.com", "", {"email": "alex@example.com"}, ("example.com",))
+    result = f.store.take_result(rid)
+    assert result == {"email": "alex@example.com", "_skipped": ["password"]}  # the email is the AI's to see
+    note = outcome(spec, "mysite", {"email": "alex@example.com"}, ["password"])
+    assert "not needed: Password" in note and "Saved as login 'mysite'" in note
     f.store.close()
 
 
@@ -102,7 +105,7 @@ def test_request_form_returns_plain_values_and_only_stores_sensitive_ones(cfg, t
     assert json.loads(out.removeprefix("Submitted: ")) == {
         "account": "work", "notify": True, "api_key": "stored as openai.api_key"}
     secret = Vault(cfg.vault_dir).get("openai")
-    assert secret.extra == {"api_key": "sk-very-secret"} and secret.domains == () and not secret.password
+    assert secret.extra == {"api_key": "sk-very-secret", "account": "work"} and not secret.password
     row = f.store.conn.execute("SELECT * FROM login_requests").fetchone()
     assert row["status"] == "saved" and row["result"] is None  # erased once the tool read it
     assert "sk-very" not in json.dumps(dict(row)) and "sk-very" not in " ".join(sent + edited)

@@ -1,6 +1,8 @@
-// The form component: request_form, request_login, request_code and /login (src/friday/forms.py
+// The form component: request_form, request_code and /login (src/friday/forms.py
 // builds the spec: {fields: [{name, label, type, required, sensitive, placeholder, help,
-// options, default}]}). Sends {name: value}; the server checks every value again.
+// options, default}]}). Sends {values: {name: value}, skipped: [names marked not needed]}; the
+// server checks every value again. Sensitive fields show "Hidden from AI"; required ones can be
+// marked "Not needed" when the agent asked for something the site doesn't use.
 "use strict";
 
 FridayApp.register("form", function (spec, app) {
@@ -12,7 +14,7 @@ FridayApp.register("form", function (spec, app) {
   const AUTOCOMPLETE = { username: "username", password: "current-password", code: "one-time-code" };
   const fields = (spec.fields || []).filter((f) => f && typeof f.name === "string" && KINDS.includes(f.type));
   const form = el("form", { className: "group", noValidate: true, autocomplete: "on" });
-  const controls = []; // {f, box, input, get(), focus(), initial}
+  const controls = []; // {f, box, input, get(), focus(), initial, skipped}
 
   function placeholderFor(f) {
     if (f.placeholder) return f.placeholder;
@@ -24,7 +26,7 @@ FridayApp.register("form", function (spec, app) {
     box.querySelector(".msg").textContent = "";
   }
   function changed() {
-    app.changed(controls.some((c) => c.get() !== c.initial));
+    app.changed(controls.some((c) => c.skipped || c.get() !== c.initial));
   }
 
   fields.forEach(function (f, i) {
@@ -38,6 +40,12 @@ FridayApp.register("form", function (spec, app) {
     if (f.type !== "choice") label.htmlFor = id;
     label.append(el("span", { textContent: name }));
     if (f.required === false && f.type !== "checkbox") label.append(el("span", { className: "opt", textContent: "· optional" }));
+    const side = el("span", { className: "side" });
+    if (f.sensitive) {
+      const tag = el("span", { className: "tag" });
+      tag.append(icon("lock"), el("span", { textContent: "Hidden from AI" }));
+      side.appendChild(tag);
+    }
 
     if (f.type === "checkbox") {
       const lab = el("label", { className: "switch-row" });
@@ -130,14 +138,28 @@ FridayApp.register("form", function (spec, app) {
       input.addEventListener("input", function () { clearError(box); changed(); });
       input.addEventListener("change", function () { clearError(box); changed(); });
     }
-    if (f.type !== "checkbox") box.append(label);
+    const control = { f: f, box: box, input: input, get: get, focus: focus || (() => {}), initial: get(), skipped: false };
+    if (f.required !== false) {
+      const skip = el("button", { type: "button", className: "skip", textContent: "Not needed" });
+      skip.addEventListener("click", function () {
+        control.skipped = !control.skipped;
+        box.classList.toggle("skipped", control.skipped);
+        skip.textContent = control.skipped ? "Needed" : "Not needed";
+        for (const e of box.querySelectorAll("input, select, textarea, .choices button, .eye")) e.disabled = control.skipped;
+        clearError(box);
+        haptic("select");
+        changed();
+      });
+      side.appendChild(skip);
+    }
+    if (f.type === "checkbox") box.append(side); else { label.append(side); box.append(label); }
     box.append(row);
     if (f.help) box.appendChild(el("div", { className: "help", textContent: f.help }));
     const msg = el("div", { className: "msg" });
     msg.setAttribute("role", "alert");
     box.appendChild(msg);
     form.appendChild(box);
-    controls.push({ f: f, box: box, input: input, get: get, focus: focus || (() => {}), initial: get() });
+    controls.push(control);
   });
   // Enter key hints: "next" until the last single-line field, which sends.
   const typed = controls.filter((c) => c.input && c.input.tagName === "INPUT" && c.input.type !== "checkbox");
@@ -150,6 +172,7 @@ FridayApp.register("form", function (spec, app) {
     for (const c of controls) {
       const v = c.get();
       let problem = "";
+      if (c.skipped) { c.box.classList.remove("bad"); continue; }
       if (c.f.required !== false && (v === "" || v === false)) {
         problem = c.f.type === "checkbox" ? "Turn this on to send"
           : ["select", "choice", "date", "time"].includes(c.f.type) ? "Choose one" : "Required";
@@ -165,9 +188,9 @@ FridayApp.register("form", function (spec, app) {
       first.box.scrollIntoView({ block: "center", behavior: "smooth" });
       return null;
     }
-    const values = {};
-    for (const c of controls) values[c.f.name] = c.get();
-    return values;
+    const values = {}, skipped = [];
+    for (const c of controls) { if (c.skipped) skipped.push(c.f.name); else values[c.f.name] = c.get(); }
+    return { values: values, skipped: skipped };
   }
 
   return { collect: collect, submitLabel: "Send" };

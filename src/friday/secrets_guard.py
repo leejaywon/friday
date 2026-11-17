@@ -49,6 +49,6 @@ def looks_secret(text: str) -> bool:
 
 REFUSAL = (
     "Refused: this looks like a password, key, card or ID number, which can't go into memory, "
-    "reminders, tasks or files. To keep it, use request_login (or request_form with a sensitive "
-    "field): it goes to the encrypted vault."
+    "reminders, tasks or files. To keep it, use request_form with a password-type field and "
+    "save_as: it goes to the encrypted vault."
 )

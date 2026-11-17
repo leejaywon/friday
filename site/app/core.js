@@ -5,8 +5,8 @@
 //
 // A component is one file in components/ that calls
 //   FridayApp.register(kind, function (spec, app) { ...; return { collect, submitLabel } })
-// where collect() returns the values to send, or null when something needs fixing (the component
-// shows what). app gives it: body (its container), el, icon, haptic, changed (call on every edit,
+// where collect() returns {values, skipped} to send (skipped: names the owner marked not needed),
+// or null when something needs fixing (the component shows what). app gives it: body (its container), el, icon, haptic, changed (call on every edit,
 // for the close confirmation), submit and inTelegram.
 "use strict";
 
@@ -58,6 +58,7 @@ window.FridayApp = (function () {
     chevron: '<svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>',
     info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 11v5.5M12 7.5v.01"/></svg>',
     alert: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5V13M12 16.5v.01"/></svg>',
+    lock: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>',
   };
 
   const can = (v) => inTelegram && tg.isVersionAtLeast && tg.isVersionAtLeast(v);
@@ -144,8 +145,8 @@ window.FridayApp = (function () {
     async function submit() {
       if (sending) return;
       $("error").hidden = true;
-      const values = view.collect();
-      if (!values) { haptic("error"); return; }
+      const answer = view.collect();
+      if (!answer) { haptic("error"); return; }
       if (!inTelegram) { // a preview in a browser: point at the note instead of sending
         const p = $("preview");
         p.classList.remove("flash");
@@ -158,7 +159,7 @@ window.FridayApp = (function () {
       tg.MainButton.showProgress(false);
       tg.MainButton.disable();
       try {
-        const data = await encryptForServer(spec.key, { rid: spec.rid, values: values });
+        const data = await encryptForServer(spec.key, { rid: spec.rid, values: answer.values, skipped: answer.skipped || [] });
         if (data.length > LIMIT) throw new Error("too long");
         haptic("success");
         if (can("6.2")) tg.disableClosingConfirmation();

@@ -32,8 +32,8 @@ from .models import available_models, model_list
 from .models import summary as models_summary
 from .models import switch as switch_model
 from .secrets_guard import REFUSAL, looks_secret
-from .vault import DOMAIN, NAME, Vault, check, domain_allowed
-from .forms import code_spec, login_spec, make_spec, parse_fields
+from .vault import DOMAIN, NAME, Vault, domain_allowed
+from .forms import SKIPPED_KEY, code_spec, make_spec, outcome, parse_fields
 
 cfg = load_config()
 ensure_dirs(cfg)
@@ -708,8 +708,11 @@ async def fill_login(name: str, ctx: Context | None = None) -> str:
     login, err = _vault_login(name)
     if err:
         return err
-    if not (login.password and login.domains):
-        return f"'{name}' isn't a website login (no password or no site)."
+    if not login.domains:
+        return f"'{name}' isn't bound to a site, so it can't be typed into a web page."
+    if not login.password:
+        fields = ", ".join(sorted(login.extra)) or "none"
+        return f"'{name}' has no password; type its fields with fill_login_field (its fields: {fields})."
     try:
         ok, host = await browser.check_site(login.domains)
     except Exception as e:
@@ -778,74 +781,55 @@ NOT_SUBMITTED = {"cancelled": "Cancelled", "expired": "Timed out"}
 @server.tool()
 async def request_form(title: str, fields: str, description: str = "", domain: str = "", save_as: str = "",
                        submit_label: str = "", ctx: Context | None = None) -> str:
-    """Ask the user for structured input or anything secret through a form on Telegram (a Mini App
-    whose answer is encrypted to this server, or a reply Friday deletes). For a simple question,
-    just ask in chat instead.
-    Sensitive fields (passwords by default, or "sensitive": true) go only to the vault under
-    save_as and are never returned to you; the other values are. Waits up to 5 minutes.
-    Returns 'Submitted: {json}' (sensitive fields read "stored as <save_as>.<field>"),
+    """Ask the user on Telegram for logins, API keys or any structured input: a form in Friday's
+    Mini App (encrypted to this server) or a reply Friday deletes. For a simple question, just ask
+    in chat. List exactly the fields this site or service needs, for example:
+      email-only login     [{"name": "email", "label": "Email", "type": "email"}]
+      username + password  [{"name": "username", "label": "Username", "type": "text"},
+                            {"name": "password", "label": "Password", "type": "password"}]
+      one API key          [{"name": "api_key", "label": "API key", "type": "password"}]
+      key pair             [{"name": "public_key", "label": "Public key", "type": "text"},
+                            {"name": "secret_key", "label": "Secret key", "type": "password"}]
+    Secrets (passwords, keys, PINs) use type password, which makes them sensitive: you never see
+    them, only "stored as <save_as>.<field>". Other values (an email, a username, a public key) come
+    back to you. The user can mark any field "not needed"; the result says which.
+    With save_as, everything the user entered is kept in the vault under that name (bound to
+    domain if given): fill_login then types its username (or email) and password on that site, and
+    fill_login_field any field. Waits up to 5 minutes. Returns 'Submitted: {json}' plus notes,
     'Cancelled' or 'Timed out'.
 
-    title: what the form is for, in the user's language, e.g. 'OpenAI API key'.
+    title: what the form is for, in the user's language, e.g. 'example.com login'.
     fields: JSON list (at most 12) of {"name", "label", "type", "required" (default true;
         checkbox false), "placeholder", "help", "options" (select/choice: strings or
         {"value", "label"}), "default", "sensitive"}. type: text, password, code, number, email,
         url, textarea, select, choice, checkbox, date, time.
     description: a sentence on why you ask and how it will be used; shown to the user.
-    domain: the site a sensitive value is for (like a login); empty = not bound to any site.
-    save_as: vault name for the sensitive values (required if any field is sensitive);
-        replaces an entry of that name.
+    domain: the site it is for, e.g. 'example.com' (no https://, no path; subdomains included);
+        empty = not bound to any site (an API key).
+    save_as: vault name, e.g. 'mysite' or 'openai' (letters, digits, '.', '_', '-'); required when a
+        field is sensitive. Replaces an entry of that name.
     submit_label: the submit button's text, e.g. 'Save'.
     """
     try:
         parsed = parse_fields(fields)
-        sensitive = [f["name"] for f in parsed if f["sensitive"]]
-        if sensitive and not NAME.match(save_as):
-            raise ValueError("save_as is required when a field is sensitive: letters, digits, '.', '_' or '-'")
+        if any(f["sensitive"] for f in parsed) and not save_as:
+            raise ValueError("save_as is required when a field is sensitive (type password)")
+        if save_as and not NAME.match(save_as):
+            raise ValueError("save_as: letters, digits, '.', '_' or '-' (max 40)")
         domain = domain.strip().lower().rstrip(".")
         if domain and not DOMAIN.match(domain):
             raise ValueError("domain: a site like example.com (no https://, no path), or empty")
         spec = make_spec(title, parsed, description, domain, save_as, submit_label)
     except ValueError as e:
         return f"Not requested: {e}"
-    status, values = await _run_form(spec, "form", save_as if sensitive else "", domain, ctx)
+    kind = "login" if domain and save_as else "form"
+    status, result = await _run_form(spec, kind, save_as, domain, ctx)
     if status == "sent":
         return SENT
     if status != "saved":
         return NOT_SUBMITTED.get(status, "Timed out")
-    values.update({n: f"stored as {save_as}.{n}" for n in sensitive})
-    return "Submitted: " + json.dumps(values, ensure_ascii=False)
-
-
-@server.tool()
-async def request_login(name: str, domain: str, reason: str = "", fields: str = "", ctx: Context | None = None) -> str:
-    """Ask the user on Telegram for a website login when no saved login fits (see list_logins).
-    They type it into a form (or reply with it; Friday deletes the reply) and Friday stores it in
-    the vault, so you never see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
-    with that name: it won't ask again on that site), 'Cancelled' or 'Timed out'.
-
-    name: short name for the login, e.g. 'mysite' (letters, digits, '.', '_', '-').
-    domain: the site it is for, e.g. 'example.com' (no https://, no path; subdomains included).
-    reason: optional few words in the user's language, e.g. 'submit the report'.
-    fields: optional JSON list of extra fields the site needs besides username and password
-        (always asked), e.g. '[{"name": "member_id", "label": "Member ID", "type": "text"}]', same
-        format as request_form. They are sensitive (kept in the vault, typed with
-        fill_login_field) unless a field says "sensitive": false.
-    """
-    try:
-        domain = check(name, [domain])[0]
-        spec = login_spec(name, domain, " ".join(reason.split()), parse_fields(fields, sensitive_default=True))
-        if {"username", "password"} & {f["name"] for f in spec["fields"][2:]}:
-            raise ValueError("username and password are always asked; don't list them in fields")
-    except ValueError as e:
-        return f"Not requested: {e}"
-    status, values = await _run_form(spec, "login", name, domain, ctx, "request_login")
-    if status == "sent":
-        return SENT
-    if status != "saved":
-        return NOT_SUBMITTED.get(status, "Timed out")
-    return f"Saved login {name} for {domain}" + (f". Other values: {json.dumps(values, ensure_ascii=False)}"
-                                                 if values else "")
+    skipped = result.pop(SKIPPED_KEY, [])
+    return outcome(spec, save_as, result, skipped)
 
 
 @server.tool()
@@ -860,6 +844,7 @@ async def request_code(reason: str, label: str = "Code", ctx: Context | None = N
     status, values = await _run_form(code_spec(reason, label), "code", ctx=ctx, tool="request_code")
     if status == "sent":
         return SENT
+    values.pop(SKIPPED_KEY, None)
     if status == "saved" and values.get("code"):
         return f"Code: {values['code']}"
     return NOT_SUBMITTED.get(status, "Timed out")
@@ -985,7 +970,7 @@ async def add_watch(title: str, check: str, every: str, until: str = "", toolset
     known = {n for n, _ in Vault(cfg.vault_dir).names()}
     if unknown := [n for n in names if n not in known]:
         return (f"Not added: no saved login named {', '.join(unknown)}. Saved: {', '.join(sorted(known)) or 'none'}"
-                " (request_login adds one).")
+                " (request_form with domain and save_as adds one).")
     if store.active_watch_count() >= wt.MAX_ACTIVE:
         return f"Not added: {wt.MAX_ACTIVE} watches are already active. list_watches shows them; cancel one first."
     end = f", until {tu.local_str(expires, tz)}" if expires else ""

@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS approvals (      -- yes/no questions for the user's t
     decided_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS login_requests ( -- "reply with the login for <domain>" (request_login, /login)
+CREATE TABLE IF NOT EXISTS login_requests ( -- forms: request_form, request_code, /login
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,           -- vault name
     domain     TEXT NOT NULL,
@@ -173,7 +173,7 @@ JOB_FIELDS = (
 MIGRATIONS = [
     ("reminders", "skip_dates", "TEXT NOT NULL DEFAULT ''"),  # comma-separated local dates
     ("memories", "updated_at", "TEXT"),
-    # login_requests are forms (request_form, request_login, request_code, /login): `spec` is the
+    # login_requests are forms (request_form, request_code, /login): `spec` is the
     # form (forms.make_spec; '{}' = a plain login), `result` the non-sensitive values handed back
     # to the agent, erased as soon as it reads them. name/domain: where sensitive values are saved.
     ("login_requests", "kind", "TEXT NOT NULL DEFAULT 'login'"),  # login | code | form

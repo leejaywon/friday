@@ -1,7 +1,7 @@
 """Website logins and other secrets, encrypted at rest.
 
 Entries are added from the server's terminal (`friday vault add`) or through a form on Telegram
-(request_form / request_login: its sensitive fields, forms.py, or a reply the bot deletes),
+(request_form with save_as: the values the owner entered, forms.py, or a reply the bot deletes),
 never by the agent.
 Only the MCP server's fill_login and fill_login_field read the values, and they type them straight
 into the browser: no agent ever sees them. A login is "trusted" on a domain once the user approved
@@ -33,7 +33,7 @@ class Login:
     password: str = field(repr=False)
     domains: tuple[str, ...]
     trusted: tuple[str, ...] = ()  # domains where it is filled without asking
-    # Other sensitive fields from a form (request_form / request_login fields=...), e.g. a member
+    # The form's other fields (request_form with save_as), e.g. an email, a member
     # ID, a PIN or an API key: name -> value. Typed by fill_login_field, never shown.
     extra: dict[str, str] = field(default_factory=dict, repr=False)
 
@@ -95,15 +95,16 @@ class Vault:
         self._save(data)
 
     def save(self, name: str, values: dict[str, str], domains: list[str], trusted: bool = False) -> None:
-        """Store a form's sensitive values under name, replacing any entry of that name (never
-        merged: a new form must not rebind an old password to another site). 'username' and
-        'password' make it a website login; the rest are extra fields. No domains = a secret that
-        isn't bound to a site, which the browser tools refuse to type."""
+        """Store a form's values under name, replacing any entry of that name (never merged: a new
+        form must not rebind an old password to another site). 'username' (or else 'email') and
+        'password' are what fill_login types; every other field, email included, is an extra field
+        for fill_login_field. No domains = a secret that isn't bound to a site, which the browser
+        tools refuse to type."""
         if not NAME.match(name):
             raise ValueError("name: use letters, digits, '.', '_' or '-' (max 40)")
         domains = check(name, domains) if domains else []
         data = self._load()
-        data[name] = {"username": values.get("username", ""), "password": values.get("password", ""),
+        data[name] = {"username": values.get("username") or values.get("email", ""), "password": values.get("password", ""),
                       "domains": domains, "trusted": domains if trusted else [],
                       "extra": {k: v for k, v in values.items() if k not in ("username", "password")}}
         self._save(data)

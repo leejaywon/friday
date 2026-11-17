@@ -45,7 +45,7 @@ from .agent import AgentResult, engine_status, instructions, run_turn
 from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
-from .forms import check_values, login_spec
+from .forms import SKIP, SKIPPED_KEY, check_values, login_spec, outcome, vault_values
 from .jobs import JobError, Outcome, Runner, github_slug, parse_code_args, short
 from .jobs import run as run_cmd
 from .models import available_models, model_list
@@ -541,19 +541,15 @@ class Friday(WatchBot):
         spec = self._request_spec(r)
         values = self.store.take_result(rid)
         if r["status"] == "cancelled":
-            outcome = "the user cancelled it"
+            result = "the user cancelled it"
         elif r["status"] != "saved":
-            outcome = f"no answer within {FOLLOWUP_EXPIRES.seconds // 60} minutes; it expired"
+            result = f"no answer within {FOLLOWUP_EXPIRES.seconds // 60} minutes; it expired"
         elif tool == "request_code":
-            outcome = f"Code: {values.get('code', '')}"
-        elif tool == "request_login":
-            outcome = (f"Saved login {r['name']} for {r['domain']} (fill_login with that name won't ask "
-                       "again on that site)") + (f". Other values: {json.dumps(values, ensure_ascii=False)}"
-                                                   if values else "")
+            result = f"Code: {values.get('code', '')}"
         else:
-            values.update({f["name"]: f"stored as {r['name']}.{f['name']}" for f in spec["fields"] if f["sensitive"]})
-            outcome = "Submitted: " + json.dumps(values, ensure_ascii=False)
-        return f"[Answer to your {tool} ({spec['title']}): {outcome}. Continue the user's request.]"
+            skipped = values.pop(SKIPPED_KEY, [])
+            result = outcome(spec, r["name"], values, skipped)
+        return f"[Answer to your {tool} ({spec['title']}): {result}. Continue the user's request.]"
 
     async def _expire_followups(self) -> None:
         now = tu.now_utc()
@@ -1194,7 +1190,7 @@ class Friday(WatchBot):
         return self._request_spec(r)["title"]
 
     async def _send_login_request(self, rid: int) -> None:
-        """Send a form request (request_form, request_login, request_code, /login). With the Mini App
+        """Send a form request (request_form, request_code, /login). With the Mini App
         (FRIDAY_APP_URL) the message carries a reply-keyboard button that opens the form, whose
         encrypted answer arrives in on_app_data, and a plain [Cancel] button (on_text cancels on that
         exact text). Replying to the message, one field per line (on_text, _login_reply), works
@@ -1207,11 +1203,11 @@ class Friday(WatchBot):
         icon = {"login": "🔑", "code": "🔢"}.get(r["kind"], "📝")
         why = f" ({short(' '.join(spec['description'].split()), 120)})" if spec["description"] else ""
         lines = [f"{icon} {spec['title']}{why}"]
-        secret = [f["label"] for f in spec["fields"] if f["sensitive"]]
-        if secret:
+        if r["name"]:
             where = f"used only on {spec['site']}" if spec["site"] else "not tied to any site"
-            lines.append(f"🔐 {', '.join(secret)}: stored only in the vault as '{r['name']}', never shown to "
-                         f"the AI ({where}).")
+            lines.append(f"Kept in the vault as '{r['name']}' ({where}).")
+        if any(f["sensitive"] for f in spec["fields"]):
+            lines.append("🔐 fields are never shown to the AI.")
         url = ""
         if self.cfg.app_url:
             try:
@@ -1224,6 +1220,7 @@ class Friday(WatchBot):
         else:
             lines.append("Reply to this message with one value per line; I delete your reply right away:")
         lines += [f"{i}. {self._field_hint(f)}" for i, f in enumerate(spec["fields"], 1)]
+        lines.append(f"Write {SKIP} on a line for a field that isn't needed.")
         text = "\n".join(lines)[:TELEGRAM_LIMIT]
         if not url:
             cancel = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"login:cancel:{rid}")]])
@@ -1245,8 +1242,8 @@ class Friday(WatchBot):
         hint = {"checkbox": "yes or no", "date": "YYYY-MM-DD", "time": "HH:MM"}.get(f["type"], "")
         if f.get("options"):
             hint = " / ".join(o["label"] for o in f["options"])
-        extra = [h for h in (hint, f.get("help", ""), "" if f["required"] else "optional, empty line to skip") if h]
-        return f["label"] + (f" ({'; '.join(extra)})" if extra else "")
+        extra = [h for h in (hint, f.get("help", ""), "" if f["required"] else "optional") if h]
+        return ("🔐 " if f["sensitive"] else "") + f["label"] + (f" ({'; '.join(extra)})" if extra else "")
 
     async def _close_login_request(self, rid: int, text: str, chat_id: int | None = None) -> None:
         """Show how a request ended: with the Mini App keyboard, remove it with a new message (a
@@ -1260,31 +1257,33 @@ class Friday(WatchBot):
         elif r["message_id"]:
             await self._quiet(bot.edit_message_text(text, chat_id=chat, message_id=r["message_id"]))
 
-    def _save_answer(self, req, values: dict) -> tuple[bool, str]:
-        """Route what the owner typed (form or reply), by the request's own spec: sensitive values
-        go to the vault under the request's name (trusted for its site, which the form showed),
-        the rest wait in the request row for the tool to take. Returns (saved, message). Never
-        logs or returns the values."""
+    def _save_answer(self, req, values: dict, skipped: list | tuple = ()) -> tuple[bool, str]:
+        """Route what the owner typed (form or reply), by the request's own spec: with a vault
+        name (save_as), everything they gave goes to the vault under it (trusted for its site,
+        which the form showed); the non-sensitive values and the fields marked not needed wait in
+        the request row for the tool to take. Returns (saved, message). Never logs or returns the
+        sensitive values."""
         spec = self._request_spec(req)
         try:
-            clean = check_values(spec["fields"], values)
+            clean, skipped = check_values(spec["fields"], values, skipped)
         except ValueError as e:
             return False, f"Not saved. {e}"
-        secret = {f["name"]: str(clean[f["name"]]) for f in spec["fields"]
-                  if f["sensitive"] and clean[f["name"]] not in ("", False)}
-        public = {f["name"]: clean[f["name"]] for f in spec["fields"] if not f["sensitive"]}
-        if secret:
+        public = {f["name"]: clean[f["name"]] for f in spec["fields"]
+                  if not f["sensitive"] and f["name"] not in skipped}
+        keep = vault_values(spec["fields"], clean, skipped) if req["name"] else {}
+        if keep:
             try:
-                Vault(self.cfg.vault_dir).save(req["name"], secret, [req["domain"]] if req["domain"] else [],
+                Vault(self.cfg.vault_dir).save(req["name"], keep, [req["domain"]] if req["domain"] else [],
                                                trusted=True)
             except Exception as e:
                 log.error("saving form request %s failed (%s)", req["id"], type(e).__name__)
                 return False, f"❌ Couldn't save it ({type(e).__name__})."
-        if not self.store.finish_login_request(req["id"], "saved", public):
+        if not self.store.finish_login_request(req["id"], "saved", {**public, SKIPPED_KEY: skipped}):
             return False, "This request has already ended."
-        if secret:
-            return True, f"✅ Saved {req['name']}" + (" (the rest was passed on)" if public else "")
-        return True, f"✅ {spec['title']}: passed on"
+        note = f" ({len(skipped)} marked not needed)" if skipped else ""
+        if keep:
+            return True, f"✅ Saved {req['name']}{note}"
+        return True, f"✅ {spec['title']}: passed on{note}"
 
     async def _login_reply(self, msg, req) -> None:
         """The user's reply to a form request: one field per line, in the form's order. Routed like
@@ -1306,7 +1305,8 @@ class Friday(WatchBot):
             await self.say(f"Not saved: wrong number of lines. Reply to the request message again, one per line: "
                            f"{order} ({len(fields)} lines).{undeleted}")
             return
-        ok, text = self._save_answer(req, {f["name"]: line for f, line in zip(fields, lines)})
+        skipped = [f["name"] for f, line in zip(fields, lines) if line.strip() == SKIP]
+        ok, text = self._save_answer(req, {f["name"]: line for f, line in zip(fields, lines)}, skipped)
         if not ok:
             await self.say(text + undeleted)
             return
@@ -1333,7 +1333,8 @@ class Friday(WatchBot):
             await bot.send_message(msg.chat_id, "This request has already ended, so nothing was saved.",
                                    reply_markup=ReplyKeyboardRemove())
             return
-        ok, text = self._save_answer(req, payload["values"])
+        skipped = payload.get("skipped")
+        ok, text = self._save_answer(req, payload["values"], skipped if isinstance(skipped, list) else [])
         if ok:
             await self._close_login_request(req["id"], text, msg.chat_id)
             await self._request_done("login", req["id"])
@@ -1852,7 +1853,7 @@ class Friday(WatchBot):
                 await self._send_approval(int(row["text"]), row["path"])
             elif row["kind"] == "login_request":  # text holds the login request id
                 await self._send_login_request(int(row["text"]))
-            elif row["kind"] == "login_expired":  # request_login / request_code gave up waiting
+            elif row["kind"] == "login_expired":  # request_form / request_code gave up waiting
                 await self._close_login_request(int(row["text"]), "⌛ This request timed out")
             elif row["kind"] == "html":  # show_tree: already escaped, too long ones split as plain text
                 if len(row["text"]) <= TELEGRAM_LIMIT:
