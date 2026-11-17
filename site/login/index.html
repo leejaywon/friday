@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<!-- Only Telegram's script and this file's own code run; nothing is fetched or posted from here:
+     the answer leaves only through Telegram.WebApp.sendData, encrypted. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src https://telegram.org 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Friday</title>
+<script>
+  // Read the spec before Telegram's script looks at the fragment (it appends its own launch
+  // parameters there). The spec never reaches the web host: browsers don't send the fragment.
+  window.FRIDAY_HASH = location.hash;
+</script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-secondary-bg-color, #f1f1f4);
+    --card: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, #ffffff));
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #8a8a8e);
+    --accent: var(--tg-theme-accent-text-color, var(--tg-theme-link-color, #2481cc));
+    --button: var(--tg-theme-button-color, #2481cc);
+    --button-text: var(--tg-theme-button-text-color, #ffffff);
+    --danger: var(--tg-theme-destructive-text-color, #e53935);
+    --line: var(--tg-theme-section-separator-color, rgba(127, 127, 127, 0.25));
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not(.tg) {
+      --bg: #0f0f10; --card: #1c1c1e; --text: #f2f2f2; --hint: #9a9a9f; --line: rgba(255, 255, 255, 0.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 4px 4px; font-weight: 600; overflow-wrap: anywhere; }
+  .site { margin: 0 4px 2px; color: var(--accent); font-size: 14px; word-break: break-all; }
+  .desc { margin: 4px 4px 0; color: var(--hint); font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .vault {
+    margin: 12px 0 0; padding: 10px 12px; border-radius: 10px; background: var(--card); font-size: 13px;
+    border-left: 3px solid var(--accent); overflow-wrap: anywhere;
+  }
+  form { margin-top: 16px; background: var(--card); border-radius: 12px; overflow: hidden; }
+  .field { padding: 10px 14px 12px; border-top: 1px solid var(--line); }
+  .field:first-child { border-top: 0; }
+  .label { display: block; font-size: 13px; color: var(--hint); margin-bottom: 4px; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  input, select, textarea {
+    flex: 1; min-width: 0; width: 100%; border: 0; outline: 0; background: transparent; color: var(--text);
+    font: inherit; font-size: 17px; padding: 4px 0;
+  }
+  textarea { resize: vertical; min-height: 84px; }
+  select { appearance: auto; }
+  input.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.15em; }
+  .check { display: flex; align-items: center; gap: 10px; font-size: 16px; color: var(--text); }
+  .check input { flex: none; width: 20px; height: 20px; accent-color: var(--button); }
+  .choices { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 2px; }
+  .choices button {
+    border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 16px;
+    padding: 6px 12px; font: inherit; font-size: 15px; cursor: pointer;
+  }
+  .choices button[aria-pressed="true"] { background: var(--button); color: var(--button-text); border-color: var(--button); }
+  .help { font-size: 12px; color: var(--hint); margin-top: 4px; }
+  .field.bad .label, .field.bad .msg { color: var(--danger); }
+  .msg { font-size: 12px; margin-top: 2px; }
+  .toggle {
+    flex: none; border: 0; background: transparent; color: var(--accent); font: inherit; font-size: 14px;
+    padding: 4px 2px; cursor: pointer;
+  }
+  .note { color: var(--hint); font-size: 13px; margin: 12px 4px 0; }
+  .error { color: var(--danger); font-size: 14px; margin: 12px 4px 0; }
+  .fallback {
+    display: none; width: 100%; margin-top: 16px; padding: 12px; border: 0; border-radius: 10px;
+    background: var(--button); color: var(--button-text); font: inherit; font-weight: 600;
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Friday</h1>
+  <p class="site" id="site" hidden></p>
+  <p class="desc" id="desc" hidden></p>
+  <p class="vault" id="vault" hidden></p>
+  <form id="form" autocomplete="on" novalidate hidden></form>
+  <p class="error" id="error" hidden></p>
+  <p class="note" id="note" hidden>입력한 내용은 Friday 서버만 열 수 있게 이 화면에서 암호화해서 보내요. Telegram에는 암호문만 전달돼요.</p>
+  <button type="button" class="fallback" id="fallback">보내기</button>
+</main>
+
+<script id="crypto">
+  // Pure functions (no DOM), so they can be checked outside the page.
+  function b64urlEncode(bytes) {
+    let s = "";
+    for (const b of new Uint8Array(bytes)) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function b64urlDecode(text) {
+    const s = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4));
+    return Uint8Array.from(s, (c) => c.charCodeAt(0));
+  }
+  // The fragment is '#<spec>', possibly followed by Telegram's own '?tgWebAppData=...' or '&...'.
+  function decodeSpec(hash) {
+    for (const part of (hash || "").replace(/^#/, "").split(/[?&]/)) {
+      if (!/^[A-Za-z0-9_-]{16,}$/.test(part)) continue;
+      try {
+        const spec = JSON.parse(new TextDecoder().decode(b64urlDecode(part)));
+        if (spec && spec.v === 1 && Number.isInteger(spec.rid) && Array.isArray(spec.fields) && spec.key) return spec;
+      } catch (e) { /* not ours */ }
+    }
+    return null;
+  }
+  // {rid, values} -> sendData's JSON {v, k, iv, ct}: AES-256-GCM with a fresh key, the key
+  // wrapped with the server's RSA-OAEP-SHA256 public key (SPKI, base64url).
+  async function encryptForServer(publicKeyB64, payload) {
+    const subtle = crypto.subtle;
+    const pub = await subtle.importKey("spki", b64urlDecode(publicKeyB64), { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
+    const aes = await subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt"]);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await subtle.encrypt({ name: "AES-GCM", iv }, aes, new TextEncoder().encode(JSON.stringify(payload)));
+    const k = await subtle.encrypt({ name: "RSA-OAEP" }, pub, await subtle.exportKey("raw", aes));
+    return JSON.stringify({ v: 1, k: b64urlEncode(k), iv: b64urlEncode(iv), ct: b64urlEncode(ct) });
+  }
+</script>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const inTelegram = !!(tg && tg.platform && tg.platform !== "unknown");
+  const $ = (id) => document.getElementById(id);
+  const LIMIT = 4096; // sendData's maximum
+  const INPUT_TYPES = { text: "text", password: "password", code: "text", number: "number", email: "email",
+                        url: "url", date: "date", time: "time" };
+  const KINDS = ["text", "password", "code", "number", "email", "url", "textarea", "select", "choice",
+                 "checkbox", "date", "time"];
+  let sending = false;
+
+  if (inTelegram) {
+    document.documentElement.classList.add("tg");
+    tg.ready();
+    tg.expand();
+  }
+
+  function fail(text) {
+    $("error").textContent = text;
+    $("error").hidden = false;
+  }
+
+  function el(tag, props) {
+    const e = document.createElement(tag);
+    Object.assign(e, props || {});
+    return e;
+  }
+
+  const spec = decodeSpec(window.FRIDAY_HASH);
+  if (!spec) {
+    fail("요청 정보를 찾지 못했어요. Friday의 요청 메시지에 답장으로 보내주세요.");
+    $("fallback").hidden = true;
+    return;
+  }
+
+  // Everything shown comes from the spec, as text (never HTML).
+  document.title = spec.title || "Friday";
+  $("title").textContent = spec.title || "Friday";
+  if (spec.site) { $("site").textContent = "🔒 " + spec.site; $("site").hidden = false; }
+  if (spec.description) { $("desc").textContent = spec.description; $("desc").hidden = false; }
+  const fields = spec.fields.filter((f) => f && typeof f.name === "string" && KINDS.includes(f.type));
+  const secret = fields.filter((f) => f.sensitive);
+  if (secret.length) {
+    // Where sensitive values go, so a request from the wrong place stands out.
+    $("vault").textContent = "🔐 " + secret.map((f) => f.label || f.name).join(", ") + ": 금고의 '" +
+      (spec.save_as || "?") + "'에만 저장되고 AI에게는 보이지 않아요. " +
+      (spec.site ? spec.site + " 에서만 쓰여요." : "특정 사이트에 묶이지 않아요.");
+    $("vault").hidden = false;
+  }
+  $("note").hidden = false;
+  const submitLabel = spec.submit || "보내기";
+
+  const form = $("form");
+  const controls = []; // {f, box, get(), focus()}
+
+  fields.forEach(function (f, i) {
+    const id = "f" + i;
+    const box = el("div", { className: "field" });
+    const label = el(f.type === "checkbox" ? "span" : "label", { className: "label", textContent: (f.sensitive ? "🔐 " : "") + (f.label || f.name) });
+    if (f.type !== "checkbox") label.htmlFor = id;
+    const row = el("div", { className: "row" });
+    let get, focus, input = null;
+
+    if (f.type === "checkbox") {
+      const lab = el("label", { className: "check" });
+      input = el("input", { type: "checkbox", id: id, checked: f.default === true });
+      lab.append(input, document.createTextNode((f.sensitive ? "🔐 " : "") + (f.label || f.name)));
+      row.appendChild(lab);
+      get = () => input.checked;
+    } else if (f.type === "choice") {
+      const group = el("div", { className: "choices", role: "group" });
+      let chosen = f.default || "";
+      (f.options || []).forEach(function (o) {
+        const b = el("button", { type: "button", textContent: o.label || o.value });
+        b.setAttribute("aria-pressed", String(o.value === chosen));
+        b.addEventListener("click", function () {
+          chosen = o.value;
+          for (const other of group.children) other.setAttribute("aria-pressed", String(other === b));
+          box.classList.remove("bad");
+          box.querySelector(".msg").textContent = "";
+          if (inTelegram && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+        });
+        group.appendChild(b);
+      });
+      row.appendChild(group);
+      get = () => chosen;
+      focus = () => group.firstChild && group.firstChild.focus();
+    } else if (f.type === "select") {
+      input = el("select", { id: id, name: f.name });
+      input.appendChild(el("option", { value: "", textContent: f.placeholder || "선택하세요" }));
+      (f.options || []).forEach((o) => input.appendChild(el("option", { value: o.value, textContent: o.label || o.value })));
+      input.value = f.default || "";
+      row.appendChild(input);
+      get = () => input.value;
+    } else {
+      input = el(f.type === "textarea" ? "textarea" : "input", { id: id, name: f.name });
+      if (f.type !== "textarea") input.type = INPUT_TYPES[f.type];
+      input.maxLength = f.type === "textarea" ? 1000 : 256;
+      if (f.type === "textarea") input.rows = 4;
+      if (f.type === "number") { input.step = "any"; input.inputMode = "decimal"; }
+      if (f.type === "code") { input.className = "code"; input.inputMode = "numeric"; }
+      input.autocapitalize = "off";
+      input.setAttribute("autocorrect", "off");
+      input.spellcheck = false;
+      if (f.placeholder) input.placeholder = f.placeholder;
+      input.autocomplete = f.autocomplete || (f.type === "code" ? "one-time-code" : "off");
+      if (f.default) input.value = f.default;
+      row.appendChild(input);
+      if (f.type === "password") {
+        const t = el("button", { type: "button", className: "toggle", textContent: "보기" });
+        t.setAttribute("aria-label", "입력한 값 보기");
+        t.addEventListener("click", function () {
+          const show = input.type === "password";
+          input.type = show ? "text" : "password";
+          t.textContent = show ? "숨기기" : "보기";
+          input.focus();
+        });
+        row.appendChild(t);
+      }
+      get = () => (f.type === "password" ? input.value : input.value.trim());
+      if (f.type !== "textarea") {
+        input.addEventListener("keydown", function (ev) {
+          if (ev.key !== "Enter") return;
+          ev.preventDefault();
+          const next = controls[controls.findIndex((c) => c.f === f) + 1];
+          if (next) next.focus(); else submit();
+        });
+      }
+    }
+    if (input) {
+      focus = focus || (() => input.focus());
+      input.addEventListener("input", function () { box.classList.remove("bad"); box.querySelector(".msg").textContent = ""; });
+    }
+    if (f.type === "checkbox") box.append(row); else box.append(label, row);
+    if (f.help) box.appendChild(el("div", { className: "help", textContent: f.help }));
+    box.appendChild(el("div", { className: "msg" }));
+    form.appendChild(box);
+    controls.push({ f: f, box: box, input: input, get: get, focus: focus || (() => {}) });
+  });
+  form.hidden = false;
+  form.addEventListener("submit", function (ev) { ev.preventDefault(); submit(); });
+
+  function validate() {
+    let first = null;
+    for (const c of controls) {
+      const v = c.get();
+      let problem = "";
+      if (c.f.required !== false && (v === "" || v === false)) problem = c.f.type === "checkbox" ? "체크해주세요" : "입력해주세요";
+      else if (c.input && c.input.validity && !c.input.validity.valid) problem = "형식을 확인해주세요";
+      c.box.classList.toggle("bad", !!problem);
+      c.box.querySelector(".msg").textContent = problem;
+      if (problem && !first) first = c;
+    }
+    if (first) {
+      first.focus();
+      if (inTelegram && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
+    }
+    return !first;
+  }
+
+  async function submit() {
+    if (sending) return;
+    $("error").hidden = true;
+    if (!validate()) return;
+    if (!inTelegram) { fail("이 화면은 Telegram 안에서만 보낼 수 있어요."); return; }
+    sending = true;
+    tg.MainButton.showProgress(false);
+    try {
+      const values = {};
+      for (const c of controls) values[c.f.name] = c.get();
+      const data = await encryptForServer(spec.key, { rid: spec.rid, values: values });
+      if (data.length > LIMIT) throw new Error("too long");
+      tg.sendData(data); // Telegram closes the form after this
+    } catch (e) {
+      fail(e && e.message === "too long" ? "입력한 내용이 너무 길어요." : "암호화하지 못했어요. 다시 시도하거나 요청 메시지에 답장으로 보내주세요.");
+      sending = false;
+      tg.MainButton.hideProgress();
+    }
+  }
+
+  if (inTelegram) {
+    $("fallback").hidden = true;
+    tg.MainButton.setText(submitLabel);
+    tg.MainButton.onClick(submit);
+    tg.MainButton.show();
+  } else {
+    $("fallback").textContent = submitLabel;
+    $("fallback").style.display = "block";
+    $("fallback").addEventListener("click", submit);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-"""Command line: `friday bot | ask | google-auth | doctor | mcp | vault`."""
+"""Command line: `friday bot | ask | google-auth | doctor | mcp | vault | botapi`."""
 
 from __future__ import annotations
 
@@ -29,6 +29,12 @@ def main() -> None:
     vsub.add_parser("list", help="names, domains and where they're trusted (never passwords)")
     vrm = vsub.add_parser("remove", help="delete a login")
     vrm.add_argument("name")
+    botapi = sub.add_parser("botapi", help="the local Bot API server, for files up to 2 GB (README)")
+    bsub = botapi.add_subparsers(dest="botapi_cmd", required=True)
+    bsub.add_parser("status", help="is it set up and running (never calls Telegram's cloud API)")
+    bswitch = bsub.add_parser("switch", help="log the bot out of the cloud Bot API, once, to use the local server")
+    bswitch.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    bsub.add_parser("serve", help="run the server (what friday-botapi.service runs)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -47,6 +53,15 @@ def main() -> None:
 
     if args.cmd == "vault":
         vault_cmd(cfg, args)
+    elif args.cmd == "botapi":
+        from . import botapi
+
+        if args.botapi_cmd == "serve":
+            botapi.serve(cfg)
+        elif args.botapi_cmd == "switch":
+            botapi.switch(cfg, yes=args.yes)
+        else:
+            botapi.status(cfg)
     elif args.cmd == "bot":
         from .bot import run_bot
 

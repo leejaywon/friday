@@ -32,11 +32,21 @@ main() {
   npm install -s --no-fund --no-audit --prefix ~/.local/share/friday/playwright-mcp \
     "$(grep -o '@playwright/mcp@[0-9.]*' src/friday/browser.py)"
   mkdir -p ~/.config/systemd/user
-  cp deploy/friday.service deploy/claude-rc.service deploy/friday-browser.service ~/.config/systemd/user/
+  cp deploy/friday.service deploy/claude-rc.service deploy/friday-browser.service deploy/friday-botapi.service \
+    ~/.config/systemd/user/
   systemctl --user daemon-reload
   systemctl --user enable -q friday.service
   # Started if it isn't running, not restarted: that would interrupt a browser run in progress.
   systemctl --user enable -q --now friday-browser.service
+  # The local Bot API server (files up to 2 GB), only when TELEGRAM_API_ID is set in .env. Restarted
+  # along with Friday (a transfer in progress is lost either way), which starts once it listens.
+  if .venv/bin/python -c 'from friday.config import load_config as c; raise SystemExit(not c().local_botapi)'; then
+    systemctl --user enable -q friday-botapi.service
+    systemctl --user restart friday-botapi.service
+    for _ in $(seq 30); do (exec 3<>/dev/tcp/127.0.0.1/8081) 2>/dev/null && break; sleep 0.5; done
+  else
+    systemctl --user disable -q --now friday-botapi.service 2>/dev/null || true
+  fi
   systemctl --user restart friday.service
   sleep 3
   systemctl --user --no-pager --lines=15 status friday.service || true

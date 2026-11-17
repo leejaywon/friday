@@ -203,3 +203,21 @@ def test_split_message():
     parts = split_message(text, limit=100)
     assert all(len(p) <= 100 for p in parts)
     assert "\n".join(parts).replace("\n", "") == text.replace("\n", "")
+
+
+def test_set_model_tool(tools, store, tmp_path, monkeypatch):
+    import json
+
+    levels = lambda *es: [{"effort": e} for e in es]  # noqa: E731
+    cache = {"models": [
+        {"slug": "gpt-6-sol", "visibility": "list", "supported_reasoning_levels": levels("medium", "max")},
+        {"slug": "gpt-6-mini", "visibility": "list", "supported_reasoning_levels": levels("low", "medium")},
+    ]}
+    (tmp_path / "models_cache.json").write_text(json.dumps(cache))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    assert "gpt-6-mini" in tools.set_model()
+    tools.set_model("gpt-6-mini", "medium")
+    assert (store.get("model"), store.get("effort")) == ("gpt-6-mini", "medium")
+    assert "supports" in tools.set_model(effort="max")
+    assert store.get("effort") == "medium"

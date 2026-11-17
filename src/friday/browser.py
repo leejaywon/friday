@@ -42,13 +42,21 @@ FIND_USERNAME = """pw => {
   }
   return null;
 }"""
+# The focused text field in this frame (an iframe's own document answers for fields inside it).
+FOCUSED_INPUT = """() => {
+  const e = document.activeElement;
+  if (!e || e.disabled || e.readOnly) return null;
+  if (e.tagName === 'TEXTAREA') return e;
+  const t = (e.getAttribute('type') || 'text').toLowerCase();
+  return e.tagName === 'INPUT' && ['text', 'password', 'email', 'tel', 'number', 'search', ''].includes(t) ? e : null;
+}"""
 
 
 def private_paths(cfg: Config) -> list[Path]:
     """Hidden from the chat agent's shell and the Playwright MCP server: the vault, the browser
     profile (session cookies), and Friday's other secrets."""
     home = Path.home()
-    return [cfg.vault_dir, cfg.browser_profile, env_file(), cfg.google_token,
+    return [cfg.vault_dir, cfg.browser_profile, env_file(), cfg.google_token, cfg.botapi_dir,
             home / ".ssh", home / ".codex", home / ".claude", home / ".claude.json"]
 
 
@@ -160,6 +168,51 @@ async def fill_login(login: Login) -> str:
             return (f"Submitted on {host}, but the login form is still there (wrong password, captcha "
                     "or another step?). The password field was emptied; look at the page.")
         return f"Filled and submitted on {host}"
+
+
+async def _focused_input(browser, domains: tuple[str, ...]):
+    """(state, element, host) for fill_login_field: state is ok, wrong_site (the newest real tab
+    isn't an allowed https site) or no_input (no text field has focus there). The tab and the
+    frame holding the focused field must both be on an allowed domain."""
+    pages = [p for p in await _pages(browser) if not p.url.startswith(("about:", "chrome"))]
+    if not pages:
+        return "wrong_site", None, "no open page"
+    page = pages[-1]  # the tab the agent works in
+    host = _host(page.url)
+    if not _allowed(page.url, domains):
+        return "wrong_site", None, host
+    for frame in page.frames:
+        if not _allowed(frame.url, domains):
+            continue
+        try:
+            el = (await frame.evaluate_handle(FOCUSED_INPUT)).as_element()
+        except Exception:  # a frame that went away
+            continue
+        if el:
+            return "ok", el, host
+    return "no_input", None, host
+
+
+async def check_focused(domains: tuple[str, ...]) -> tuple[str, str]:
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(CDP_URL)
+        state, _, host = await _focused_input(browser, domains)
+        return state, host
+
+
+async def fill_focused(domains: tuple[str, ...], value: str, label: str) -> str:
+    """Type a stored value into the focused field (checked again). Never returns the value."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(CDP_URL)
+        state, el, host = await _focused_input(browser, domains)
+        if state != "ok":
+            return f"Not filled: {'wrong site' if state == 'wrong_site' else 'no input has focus'} ({host})"
+        await el.fill(value)
+        return f"Filled {label} on {host} (not submitted)"
 
 
 async def screenshot(path: Path) -> str | None:

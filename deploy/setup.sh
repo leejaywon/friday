@@ -460,6 +460,38 @@ claude_extras() {
   fi
 }
 
+login_form() {
+  step "Secure form on GitHub Pages (optional; README.md step 11)"
+  if is_set FRIDAY_FORM_URL || grep -q '^FRIDAY_FORM_URL=' "$ENV_FILE" 2>/dev/null; then
+    ok "FRIDAY_FORM_URL is set in $ENV_FILE; not using GitHub Pages"
+    return
+  fi
+  local owner=${SLUG%%/*} repo=${SLUG#*/} vis
+  owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+  if gh api "repos/$SLUG/pages" >/dev/null 2>&1; then
+    ok "Pages is on: https://$owner.github.io/$repo/login/"
+    return
+  fi
+  vis=$(gh repo view "$SLUG" --json visibility -q .visibility 2>/dev/null) || vis=""
+  info "Friday's requests (logins, codes, secrets) can open a form with masked fields. It's a static page"
+  info "(site/login/) that GitHub Pages serves at https://$owner.github.io/$repo/login/."
+  if [[ "$vis" != PUBLIC ]]; then
+    warn "$SLUG isn't public, and free GitHub Pages needs a public repo. Host site/login/index.html"
+    warn "on any static https host and set FRIDAY_FORM_URL in $ENV_FILE, or reply to the requests instead."
+    return
+  fi
+  if ! confirm "Turn on GitHub Pages for $SLUG (source: GitHub Actions)?" N; then
+    warn "skipped; Friday's requests still work by reply."
+    return
+  fi
+  gh api -X POST "repos/$SLUG/pages" -f build_type=workflow >/dev/null || die "couldn't turn on Pages for $SLUG."
+  if gh workflow run pages.yml --repo "$SLUG" >/dev/null 2>&1; then
+    ok "Pages on; the 'Pages' workflow is publishing the form (a minute or two)"
+  else
+    ok "Pages on; it publishes the form on the next push of site/ (or run the 'Pages' workflow)"
+  fi
+}
+
 main() {
   cd "$(dirname "$0")/.."
   [[ -t 0 ]] || die "run this in a terminal; it asks questions."
@@ -477,6 +509,7 @@ main() {
   first_deploy
   telegram_user
   claude_extras
+  login_form
   echo
   echo "${B}Done.${R} Friday should answer you in Telegram now. Health check:"
   echo "   ssh $HOST 'cd ~/friday && .venv/bin/friday doctor'"

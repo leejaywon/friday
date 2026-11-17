@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import re
+import shutil
 import sqlite3
 import tempfile
 from dataclasses import replace
@@ -15,11 +16,19 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+    WebAppInfo,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -27,21 +36,25 @@ from telegram.ext import (
     filters,
 )
 
-from . import browser, gcal, mcp_config
+from . import botapi, browser, gcal, mcp_config
 from . import timeutil as tu
+from . import workspace as wsfiles
 from .agent import AgentResult, instructions, run_codex
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
 from .jobs import JobError, Outcome, Runner, github_slug, parse_code_args, short
 from .jobs import run as run_cmd
-from .models import all_efforts, available_models, find
+from .models import available_models, model_list
+from .models import summary as models_summary
+from .models import switch as switch_model
 from .transcribe import TranscriptionError, model_for, transcribe
 from .vault import Vault, check
+from .webform import FormKey, check_values, form_url, login_spec
 
 log = logging.getLogger(__name__)
 
 TELEGRAM_LIMIT = 4000
-BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Telegram's Bot API refuses larger downloads
+FILES_PAGE = 8  # entries per /files page
 IDLE_NEW_THREAD = timedelta(hours=6)  # start a fresh Codex thread after this much silence
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILES_ONLY = (
@@ -77,6 +90,7 @@ Voice messages work too: I transcribe them and answer what you said.
 /login <name> <domain> - save a website login for the browser (you reply with it; I delete the message)
 /logins - saved website logins: ask again before use, or delete
 /tz [Area/City] - show or change your timezone
+/files [folder] - browse my files: tap one to get or delete it
 /backup - send the database file
 /status - health check"""
 
@@ -94,6 +108,7 @@ COMMANDS = [
     ("logins", "Saved website logins"),
     ("new", "Start a fresh conversation"),
     ("tz", "Show or change your timezone"),
+    ("files", "Browse files: get or delete them"),
     ("status", "Health check"),
     ("backup", "Send the database file"),
     ("help", "What Friday can do"),
@@ -133,12 +148,15 @@ class Friday:
         self._downloads = 0  # incoming files still downloading
         self._run_task: asyncio.Task | None = None  # the scheduled browser run in progress, if any
         self._run_id: int | None = None
+        # /files buttons carry an index into this list, not a path (callback data is 64 bytes at most)
+        self._fs_paths: list[str] = []
+        self._fs_index: dict[str, int] = {}
 
     # --- setup -------------------------------------------------------------
 
     def build(self) -> Application:
         app = (
-            ApplicationBuilder()
+            botapi.builder(self.cfg)  # the local Bot API server when TELEGRAM_API_ID is set
             .token(self.cfg.telegram_token)
             .concurrent_updates(True)
             .post_init(self._on_start)
@@ -164,10 +182,13 @@ class Friday:
         app.add_handler(CommandHandler("login", self.cmd_login, filters=me))
         app.add_handler(CommandHandler("logins", self.cmd_logins, filters=me))
         app.add_handler(CallbackQueryHandler(self.on_login_button, pattern=r"^login:cancel:\d+$"))
+        app.add_handler(MessageHandler(me & filters.StatusUpdate.WEB_APP_DATA, self.on_form_data))
         app.add_handler(CallbackQueryHandler(self.on_vault_button, pattern=r"^vault:(untrust|del|delyes|delno):[A-Za-z0-9_.-]{1,40}$"))
         app.add_handler(CallbackQueryHandler(self.on_job_button, pattern=r"^job:(merge|close|deploy|undo):\d+$"))
         app.add_handler(CallbackQueryHandler(self.on_proposal_button, pattern=r"^prop:(accept|dismiss):\d+$"))
         app.add_handler(CallbackQueryHandler(self.on_submission_button, pattern=r"^sub:(remind|approve|auto):\d+:\d+$"))
+        app.add_handler(CommandHandler("files", self.cmd_files, filters=me))
+        app.add_handler(CallbackQueryHandler(self.on_files_button, pattern=r"^fs:(r|[dfgxy]:\d{1,6}(:\d{1,4})?)$"))
         app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, self.on_text))
         attachments = filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.VOICE
         app.add_handler(MessageHandler(me & attachments, self.on_file))
@@ -330,8 +351,9 @@ class Friday:
             ext = mimetypes.guess_extension(mime) if mime.startswith("image/") else None
             if ext in IMAGE_SUFFIXES and Path(name).suffix.lower() not in IMAGE_SUFFIXES:
                 name += ext  # an image sent as a file without its extension: still show it as an image
-        if media.file_size and media.file_size > BOT_DOWNLOAD_LIMIT:
-            await msg.reply_text("Telegram only lets bots download files up to 20 MB. Copy bigger files with scp.")
+        if media.file_size and media.file_size > botapi.download_limit(self.cfg):
+            await msg.reply_text("Telegram only lets bots download files up to 20 MB. Copy bigger files with scp."
+                                 if not self.cfg.local_botapi else "That's over 2 GB, more than Telegram lets bots download.")
             return
 
         day_dir = self.cfg.files_dir / "inbox" / datetime.now(ZoneInfo(self.tz)).strftime("%Y-%m-%d")
@@ -339,7 +361,7 @@ class Friday:
         dest = day_dir / name
         self._downloads += 1
         try:
-            await (await media.get_file()).download_to_drive(dest)
+            await self._download(media, dest)
         finally:
             self._downloads -= 1
         rel = str(dest.relative_to(self.cfg.workspace))
@@ -486,55 +508,20 @@ class Friday:
         await update.message.reply_text(f"Timezone: {self.tz}. Now: {tu.local_str(tu.now_utc(), self.tz)}")
 
     def _model_summary(self) -> str:
-        model = self.store.get("model") or self.cfg.codex_model or "Codex default"
-        effort = self.store.get("effort") or self.cfg.codex_effort or "model default"
-        return f"Model: {model}, effort: {effort}"
+        return models_summary(self.store, self.cfg.codex_model, self.cfg.codex_effort)
 
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         models = available_models()
-        efforts = all_efforts(models)
         args = [a.strip() for a in (ctx.args or []) if a.strip()][:2]
-        note = ""
-
-        if args and args[0].lower() in ("default", "reset"):
-            self.store.delete("model")
-            self.store.delete("effort")
-        elif args:
-            model_arg = next((a for a in args if a.lower() not in efforts), None)
-            effort_arg = next((a.lower() for a in args if a.lower() in efforts), None)
-            if model_arg:
-                m = find(models, model_arg)
-                if models and not m:
-                    await update.message.reply_text(f"Unknown model '{model_arg}'.\n\n{self._model_list(models)}")
-                    return
-                self.store.set("model", m.slug if m else model_arg)
-            current = find(models, self.store.get("model") or self.cfg.codex_model)
-            if effort_arg:
-                if current and effort_arg not in current.efforts:
-                    await update.message.reply_text(
-                        f"{current.slug} supports: {', '.join(current.efforts)}"
-                    )
-                    return
-                self.store.set("effort", effort_arg)
-            elif current and (self.store.get("effort") or "") not in ("", *current.efforts):
-                self.store.delete("effort")
-                note = "\n(Reset effort: the new model doesn't support the previous one.)"
-
+        try:
+            note = switch_model(self.store, self.cfg.codex_model, args, models) if args else ""
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+            return
         text = self._model_summary() + note
         if not args:
-            text += "\n\n" + self._model_list(models)
+            text += "\n\n" + model_list(models)
         await update.message.reply_text(text)
-
-    @staticmethod
-    def _model_list(models) -> str:
-        if not models:
-            return "Usage: /model <name> [effort], /model <effort>, /model default"
-        lines = ["Available models (efforts, default*):"]
-        for m in models:
-            levels = ", ".join(e + ("*" if e == m.default_effort else "") for e in m.efforts)
-            lines.append(f"• {m.slug} ({levels})")
-        lines.append("\nUsage: /model gpt-6-sol high, /model low, /model default")
-        return "\n".join(lines)
 
     async def cmd_backup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -882,25 +869,107 @@ class Friday:
         elif q.message:
             await self._quiet(q.edit_message_text(f"{q.message.text}\n\n{label}"))
 
-    # --- website logins (request_login, /login, /logins) --------------------
+    # --- forms and website logins (request_form/login/code, /login, /logins) ---
+
+    @staticmethod
+    def _request_spec(r) -> dict:
+        spec = json.loads(r["spec"] or "{}")
+        return spec if spec.get("fields") else login_spec(r["name"], r["domain"], r["reason"])  # /login
+
+    def _request_title(self, r) -> str:
+        return self._request_spec(r)["title"]
 
     async def _send_login_request(self, rid: int) -> None:
-        """Ask for a login; the user's reply to this message is caught by on_text (_login_reply)."""
+        """Send a form request (request_form, request_login, request_code, /login). With
+        FRIDAY_FORM_URL the message carries a reply-keyboard button that opens the encrypted form
+        (on_form_data), and a second small message the [취소] button; a reply to the request
+        (on_text, _login_reply) works either way. The text says where sensitive values go: it comes
+        from Friday, not from the agent's wording, so a phishing attempt shows."""
         r = self.store.login_request(rid)
         if not r or r["status"] != "pending" or r["message_id"]:
             return
-        why = f" ({r['reason']})" if r["reason"] else ""
-        m = await self.app.bot.send_message(  # type: ignore[union-attr]
-            self.owner,
-            f"🔑 {r['domain']} 로그인이 필요해요{why}. 이 메시지에 답장으로 첫 줄에 아이디, 둘째 줄에 "
-            "비밀번호를 보내주세요. 보내자마자 채팅에서 지우고 금고에만 저장해요.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("취소", callback_data=f"login:cancel:{rid}")]]),
-        )
+        spec = self._request_spec(r)
+        fields = spec["fields"]
+        cancel = InlineKeyboardMarkup([[InlineKeyboardButton("취소", callback_data=f"login:cancel:{rid}")]])
+        url = ""
+        if self.cfg.form_url:
+            try:
+                url = form_url(self.cfg.form_url, {**spec, "v": 1, "rid": rid,
+                                                   "key": FormKey(self.cfg.vault_dir).public_b64()})
+            except Exception as e:  # no form then: the reply still works
+                log.error("form unavailable (%s)", type(e).__name__)
+        icon = {"login": "🔑", "code": "🔢"}.get(r["kind"], "📝")
+        lines = [f"{icon} {spec['title']}"]
+        if spec["description"]:
+            lines.append(spec["description"])
+        secret = [f["label"] for f in fields if f["sensitive"]]
+        if secret:
+            where = f"{spec['site']} 에서만 쓰여요" if spec["site"] else "특정 사이트에 묶이지 않아요"
+            try:
+                replaces = r["name"] in {n for n, _ in Vault(self.cfg.vault_dir).names()}
+            except Exception:
+                replaces = False
+            lines.append(f"🔐 {', '.join(secret)}: 금고의 '{r['name']}'에만 저장되고 AI에게는 보이지 않아요 "
+                         f"({where})." + (f" 지금 있는 '{r['name']}'은 새 값으로 바뀌어요." if replaces else ""))
+        how = "아래 [📝 입력하기]를 눌러 입력해주세요 (암호화해서 보내요). 또는 이 메시지에 답장으로" if url \
+            else "이 메시지에 답장으로"
+        lines.append(f"{how} 한 줄에 하나씩: {', '.join(f['label'] for f in fields)}. 답장은 바로 채팅에서 지워요.")
+        text = "\n".join(lines)[:TELEGRAM_LIMIT]
+        if not url:
+            m = await self.app.bot.send_message(self.owner, text, reply_markup=cancel)  # type: ignore[union-attr]
+            self.store.set_login_request_message(rid, m.message_id)
+            return
+        # sendData only works from a reply-keyboard button, and a message has one keyboard, so
+        # [취소] goes on its own message.
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("📝 입력하기", web_app=WebAppInfo(url))]],
+                                       resize_keyboard=True, one_time_keyboard=True)
+        m = await self.app.bot.send_message(self.owner, text, reply_markup=keyboard)  # type: ignore[union-attr]
         self.store.set_login_request_message(rid, m.message_id)
+        c = await self.app.bot.send_message(self.owner, "필요 없으면:", reply_markup=cancel)  # type: ignore[union-attr]
+        self.store.set_login_request_form_message(rid, c.message_id)
+
+    async def _close_login_request(self, rid: int, text: str, chat_id: int | None = None) -> None:
+        """Show how a request ended: with the form, drop the [취소] message and the keyboard;
+        otherwise edit the request message."""
+        r = self.store.login_request(rid)
+        if not r:
+            return
+        bot, chat = self.app.bot, chat_id or self.owner  # type: ignore[union-attr]
+        if r["form_message_id"]:
+            await self._quiet(bot.delete_message(chat, r["form_message_id"]))
+            await self._quiet(bot.send_message(chat, text, reply_markup=ReplyKeyboardRemove()))
+        elif r["message_id"]:
+            await self._quiet(bot.edit_message_text(text, chat_id=chat, message_id=r["message_id"]))
+
+    def _save_answer(self, req, values: dict) -> tuple[bool, str]:
+        """Route what the owner typed (form or reply), by the request's own spec: sensitive values
+        go to the vault under the request's name (trusted for its site, which the form showed),
+        the rest wait in the request row for the tool to take. Returns (saved, message). Never
+        logs or returns the values."""
+        spec = self._request_spec(req)
+        try:
+            clean = check_values(spec["fields"], values)
+        except ValueError as e:
+            return False, f"저장하지 않았어요. {e}"
+        secret = {f["name"]: str(clean[f["name"]]) for f in spec["fields"]
+                  if f["sensitive"] and clean[f["name"]] not in ("", False)}
+        public = {f["name"]: clean[f["name"]] for f in spec["fields"] if not f["sensitive"]}
+        if secret:
+            try:
+                Vault(self.cfg.vault_dir).save(req["name"], secret, [req["domain"]] if req["domain"] else [],
+                                               trusted=True)
+            except Exception as e:
+                log.error("saving form request %s failed (%s)", req["id"], type(e).__name__)
+                return False, f"❌ 저장하지 못했어요 ({type(e).__name__})."
+        if not self.store.finish_login_request(req["id"], "saved", public):
+            return False, "이 요청은 이미 끝났어요."
+        if secret:
+            return True, f"✅ {req['name']} 저장됨" + (" (나머지는 전달함)" if public else "")
+        return True, f"✅ {spec['title']} 전달함"
 
     async def _login_reply(self, msg, req) -> None:
-        """The user's reply to a login request: line 1 username, line 2 password. Saved in the vault
-        and deleted from the chat; the text is never logged or shown to the agent."""
+        """The user's reply to a form request: one field per line, in the form's order. Routed like
+        the form's answer and deleted from the chat; the text is never logged."""
         lines = (msg.text or "").split("\n")
         try:
             deleted = bool(await msg.delete())
@@ -908,27 +977,47 @@ class Friday:
             log.warning("could not delete a login reply (%s)", type(e).__name__)
             deleted = False
         undeleted = "" if deleted else "\n⚠️ 메시지를 지우지 못했어요. 직접 삭제해주세요."
-        name, domain = req["name"], req["domain"]
         if req["status"] != "pending":
-            await self.say(f"이 로그인 요청은 이미 끝났어요. 저장하지 않았어요. 다시 하려면 /login {name} {domain}{undeleted}")
+            again = f" 다시 하려면 /login {req['name']} {req['domain']}" if req["kind"] == "login" else ""
+            await self.say(f"이 요청은 이미 끝났어요. 저장하지 않았어요.{again}{undeleted}")
             return
-        if len(lines) != 2 or not lines[0].strip() or not lines[1]:
-            await self.say("형식이 맞지 않아 저장하지 않았어요. 요청 메시지에 다시 답장해주세요: 첫 줄에 아이디, "
-                           f"둘째 줄에 비밀번호 (두 줄만).{undeleted}")
+        fields = self._request_spec(req)["fields"]
+        if len(lines) != len(fields):
+            order = ", ".join(f["label"] for f in fields)
+            await self.say(f"형식이 맞지 않아 저장하지 않았어요. 요청 메시지에 다시 답장해주세요: 한 줄에 하나씩 "
+                           f"{order} ({len(fields)}줄).{undeleted}")
             return
-        try:
-            # The owner typed it for this site, so it counts as approved there.
-            Vault(self.cfg.vault_dir).add(name, lines[0].strip(), lines[1], [domain], trusted=True)
-        except Exception as e:
-            log.error("saving login request %s failed (%s)", req["id"], type(e).__name__)
-            await self.say(f"❌ 저장하지 못했어요 ({type(e).__name__}).{undeleted}")
+        ok, text = self._save_answer(req, {f["name"]: line for f, line in zip(fields, lines)})
+        if not ok:
+            await self.say(text + undeleted)
             return
-        self.store.finish_login_request(req["id"], "saved")
-        await self._quiet(self.app.bot.edit_message_text(  # type: ignore[union-attr]
-            f"✅ {name} 저장됨" + (" (메시지 삭제함)" if deleted else ""), chat_id=msg.chat_id,
-            message_id=req["message_id"]))
+        await self._close_login_request(req["id"], text + (" (메시지 삭제함)" if deleted else ""), msg.chat_id)
         if not deleted:
-            await self.say(f"✅ {name} 저장했어요.{undeleted}")
+            await self.say(f"{text}{undeleted}")
+
+    async def on_form_data(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """The form's answer (Telegram.WebApp.sendData): ciphertext only the vault's form key opens
+        (webform.py). Routed like a reply; the service message is deleted."""
+        msg = update.message
+        data = msg.web_app_data.data if msg.web_app_data else ""
+        await self._quiet(msg.delete())
+        bot = self.app.bot  # type: ignore[union-attr]
+        try:
+            payload = FormKey(self.cfg.vault_dir).decrypt(data)
+        except ValueError as e:
+            log.warning("form answer unreadable (%s)", e)
+            await bot.send_message(msg.chat_id, "❌ 입력 내용을 읽지 못했어요. 다시 시도해주세요.")
+            return
+        req = self.store.login_request(payload["rid"])
+        if not req or req["status"] != "pending":
+            await bot.send_message(msg.chat_id, "이 요청은 이미 끝났거나 없는 요청이에요. 저장하지 않았어요.",
+                                   reply_markup=ReplyKeyboardRemove())
+            return
+        ok, text = self._save_answer(req, payload["values"])
+        if ok:
+            await self._close_login_request(req["id"], text, msg.chat_id)
+        else:
+            await bot.send_message(msg.chat_id, text)
 
     async def cmd_login(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         args = ctx.args or []
@@ -947,7 +1036,7 @@ class Friday:
         buttons = [InlineKeyboardButton("🗑 삭제", callback_data=f"vault:del:{name}")]
         if trusted:
             buttons.insert(0, InlineKeyboardButton("🔒 다시 승인받기", callback_data=f"vault:untrust:{name}"))
-        return f"🔑 {name}: {', '.join(domains)}\n{state}", InlineKeyboardMarkup([buttons])
+        return f"🔑 {name}: {', '.join(domains) or '사이트 없음'}\n{state}", InlineKeyboardMarkup([buttons])
 
     def _vault_lookup(self, name: str):
         return next((e for e in Vault(self.cfg.vault_dir).entries() if e[0] == name), None)
@@ -974,7 +1063,8 @@ class Friday:
         r = self.store.login_request(rid)
         if r and self.store.finish_login_request(rid, "cancelled"):
             await q.answer("취소됨")
-            await self._quiet(q.edit_message_text(f"❌ {r['domain']} 로그인 요청 취소됨"))
+            await self._close_login_request(rid, f"❌ {self._request_title(r)} 요청 취소됨",
+                                            q.message.chat_id if q.message else None)
         else:
             await q.answer("이미 끝난 요청이에요")
             await self._quiet(q.edit_message_reply_markup(None))
@@ -1270,6 +1360,150 @@ class Friday:
             f"{'🧭' if choice == 'approve' else '🤖'} {title}: {self._ko_time(run_at)}에 시작해서 {how}. (실행 #{rid}){missing}"
         ))
 
+    # --- files (getting files in and out; /files browses the workspace) ------
+
+    async def _download(self, media, dest: Path) -> None:
+        """Save an incoming file at dest. The local Bot API server has fetched it into its own folder
+        by the time getFile answers: move it from there (same disk, so instant), don't copy 2 GB."""
+        if not self.cfg.local_botapi:
+            await (await media.get_file()).download_to_drive(dest)
+            return
+        f = await media.get_file(read_timeout=botapi.TRANSFER_TIMEOUT)
+        src = Path(f.file_path or "")
+        if src.is_absolute() and src.is_file() and src.resolve().is_relative_to(self.cfg.botapi_dir.resolve()):
+            await asyncio.to_thread(shutil.move, src, dest)
+        else:
+            await f.download_to_drive(dest)
+
+    async def _send_path(self, path: Path, caption: str | None = None, chat_id: int | None = None) -> str | None:
+        """Send a file as a document. Returns why not when it's too big for Telegram."""
+        size, limit = path.stat().st_size, botapi.upload_limit(self.cfg)
+        if size > limit:
+            how = "" if self.cfg.local_botapi else " Copy it with scp, or set up the local Bot API server (README)."
+            return f"{path.name} is {wsfiles.human_size(size)}; Telegram lets me send up to {wsfiles.human_size(limit)}.{how}"
+        timeouts = {"read_timeout": botapi.TRANSFER_TIMEOUT, "write_timeout": botapi.TRANSFER_TIMEOUT}
+        if self.cfg.local_botapi:  # a Path becomes a file:// URI: the local server reads the file itself
+            await self.app.bot.send_document(chat_id or self.owner, path, filename=path.name, caption=caption, **timeouts)  # type: ignore[union-attr]
+        else:
+            with path.open("rb") as fh:
+                await self.app.bot.send_document(chat_id or self.owner, fh, filename=path.name, caption=caption, **timeouts)  # type: ignore[union-attr]
+        return None
+
+    def _fs_id(self, rel: str) -> int:
+        if rel not in self._fs_index:
+            self._fs_index[rel] = len(self._fs_paths)
+            self._fs_paths.append(rel)
+        return self._fs_index[rel]
+
+    def _fs_button(self, e: wsfiles.Entry) -> InlineKeyboardButton:
+        if e.is_dir:
+            return InlineKeyboardButton(f"📂 {short(e.name, 40)}", callback_data=f"fs:d:{self._fs_id(e.rel)}:0")
+        when = wsfiles.local_time(e.mtime, self.tz, "%m/%d %H:%M")
+        return InlineKeyboardButton(f"📄 {short(e.name, 30)} · {wsfiles.human_size(e.size)} · {when}",
+                                    callback_data=f"fs:f:{self._fs_id(e.rel)}")
+
+    def _fs_recent_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        files = wsfiles.recent(self.cfg.workspace)
+        rows = [[self._fs_button(e)] for e in files]
+        rows.append([InlineKeyboardButton("📂 폴더 보기", callback_data=f"fs:d:{self._fs_id('.')}:0")])
+        return ("🕘 최근 파일 (눌러서 받기·삭제)" if files else "아직 파일이 없어요."), InlineKeyboardMarkup(rows)
+
+    def _fs_dir_view(self, rel: str, page: int = 0, note: str = "") -> tuple[str, InlineKeyboardMarkup]:
+        items = wsfiles.entries(self.cfg.workspace, rel)
+        back = InlineKeyboardButton("🕘 최근 파일", callback_data="fs:r")
+        if items is None:
+            return f"{note}폴더를 찾을 수 없어요: {rel}", InlineKeyboardMarkup([[back]])
+        pages = max(1, -(-len(items) // FILES_PAGE))
+        page = min(max(page, 0), pages - 1)
+        rows = [[self._fs_button(e)] for e in items[page * FILES_PAGE:(page + 1) * FILES_PAGE]]
+        did = self._fs_id(rel)
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀", callback_data=f"fs:d:{did}:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("▶", callback_data=f"fs:d:{did}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        bottom = [back]
+        if rel not in ("", "."):
+            parent = Path(rel).parent.as_posix()
+            bottom.insert(0, InlineKeyboardButton("⬅️ 뒤로", callback_data=f"fs:d:{self._fs_id(parent)}:0"))
+        rows.append(bottom)
+        name = "workspace" if rel in ("", ".") else rel
+        count = f"{len(items)}개" + (f", {page + 1}/{pages}쪽" if pages > 1 else "")
+        return f"{note}📂 {name} ({count})" + ("" if items else "\n비어 있어요."), InlineKeyboardMarkup(rows)
+
+    def _fs_file_view(self, rel: str, path: Path) -> tuple[str, InlineKeyboardMarkup]:
+        st = path.stat()
+        fid = self._fs_id(rel)
+        text = f"📄 {rel}\n{wsfiles.human_size(st.st_size)} · {wsfiles.local_time(st.st_mtime, self.tz)}"
+        return text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 받기", callback_data=f"fs:g:{fid}"),
+             InlineKeyboardButton("🗑 삭제", callback_data=f"fs:x:{fid}")],
+            [InlineKeyboardButton("⬅️ 뒤로", callback_data=f"fs:d:{self._fs_id(Path(rel).parent.as_posix())}:0")],
+        ])
+
+    async def cmd_files(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        folder = " ".join(ctx.args or []).strip().strip("/")
+        if folder:
+            text, markup = self._fs_dir_view(folder)
+        else:
+            text, markup = await asyncio.to_thread(self._fs_recent_view)
+        await update.message.reply_text(text, reply_markup=markup)
+
+    async def on_files_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        q = update.callback_query
+        if not q.from_user or q.from_user.id not in self.cfg.allowed_user_ids:
+            await q.answer()
+            return
+        parts = q.data.split(":")
+        if parts[1] == "r":
+            await q.answer()
+            text, markup = await asyncio.to_thread(self._fs_recent_view)
+            await self._quiet(q.edit_message_text(text, reply_markup=markup))
+            return
+        op, idx = parts[1], int(parts[2])
+        rel = self._fs_paths[idx] if idx < len(self._fs_paths) else None
+        if rel is None:  # buttons from before a restart
+            await q.answer("목록이 오래됐어요. /files 를 다시 보내주세요.", show_alert=True)
+            return
+        if op == "d":
+            await q.answer()
+            text, markup = self._fs_dir_view(rel, int(parts[3]) if len(parts) > 3 else 0)
+            await self._quiet(q.edit_message_text(text, reply_markup=markup))
+            return
+        path = wsfiles.inside(self.cfg.workspace, rel)
+        if path is None or not path.is_file():
+            await q.answer("이 파일은 이제 없어요")
+            text, markup = self._fs_dir_view(Path(rel).parent.as_posix())
+            await self._quiet(q.edit_message_text(text, reply_markup=markup))
+            return
+        if op == "f":
+            await q.answer()
+            text, markup = self._fs_file_view(rel, path)
+        elif op == "g":
+            await q.answer("보내는 중…")
+            problem = await self._send_path(path, chat_id=q.message.chat_id if q.message else None)
+            if problem:
+                await self.say(f"⚠️ {problem}")
+            return
+        elif op == "x":
+            await q.answer()
+            text = f"🗑 {rel}\n삭제할까요? 되돌릴 수 없어요."
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 삭제", callback_data=f"fs:y:{idx}"),
+                InlineKeyboardButton("취소", callback_data=f"fs:f:{idx}"),
+            ]])
+        else:  # "y": delete. The link itself if rel is one (inside() checked where it leads), not its target.
+            try:
+                (self.cfg.workspace.resolve() / rel).unlink()
+            except OSError as e:
+                await q.answer(f"삭제하지 못했어요 ({type(e).__name__})", show_alert=True)
+                return
+            await q.answer("삭제했어요")
+            text, markup = self._fs_dir_view(Path(rel).parent.as_posix(), note=f"🗑 삭제했어요: {Path(rel).name}\n\n")
+        await self._quiet(q.edit_message_text(text, reply_markup=markup))
+
     # --- background loops (each returns seconds until its next run) --------
 
     async def reminder_loop(self) -> float:
@@ -1296,14 +1530,17 @@ class Friday:
             if row["kind"] == "file":
                 path = Path(row["path"])
                 if path.is_file():
-                    with path.open("rb") as fh:
-                        await self.app.bot.send_document(self.owner, fh, filename=path.name, caption=row["text"])  # type: ignore[union-attr]
+                    problem = await self._send_path(path, row["text"])
+                    if problem:
+                        await self.say(f"⚠️ {problem}")
             elif row["kind"] == "proposal":
                 await self._send_proposal(int(row["text"]))
             elif row["kind"] == "approval":  # text holds the approval id, path an optional screenshot
                 await self._send_approval(int(row["text"]), row["path"])
             elif row["kind"] == "login_request":  # text holds the login request id
                 await self._send_login_request(int(row["text"]))
+            elif row["kind"] == "login_expired":  # request_login / request_code gave up waiting
+                await self._close_login_request(int(row["text"]), "⌛ 시간이 지나 요청이 끝났어요")
             elif row["text"]:
                 await self.say(row["text"])
             self.store.mark_sent(row["id"])

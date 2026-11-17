@@ -1,10 +1,12 @@
-"""Website logins for the browser, encrypted at rest.
+"""Website logins and other secrets, encrypted at rest.
 
-Logins are added from the server's terminal (`friday vault add`) or by replying to a login
-request on Telegram (the bot deletes that message and stores the values here), never by the agent.
-Only the MCP server's fill_login reads a password, and it types it straight into the browser: no
-agent ever sees it. A login is "trusted" on a domain once the user approved a use there (or typed
-it in for that site); fill_login then fills it there without asking, until /logins revokes it.
+Entries are added from the server's terminal (`friday vault add`) or through a form on Telegram
+(request_form / request_login: its sensitive fields, webform.py, or a reply the bot deletes),
+never by the agent.
+Only the MCP server's fill_login and fill_login_field read the values, and they type them straight
+into the browser: no agent ever sees them. A login is "trusted" on a domain once the user approved
+a use there (or typed it in for that site); it is then filled there without asking, until /logins
+revokes it.
 
 The key and the encrypted file sit in their own 0700 folder, which the chat agent's shell, the
 Playwright MCP server and coding jobs can't read (see browser.private_paths and jobs.agent_secrets).
@@ -31,6 +33,9 @@ class Login:
     password: str = field(repr=False)
     domains: tuple[str, ...]
     trusted: tuple[str, ...] = ()  # domains where it is filled without asking
+    # Other sensitive fields from a form (request_form / request_login fields=...), e.g. a student
+    # id, a PIN or an API key: name -> value. Typed by fill_login_field, never shown.
+    extra: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def domain_allowed(host: str, domains: tuple[str, ...] | list[str]) -> bool:
@@ -78,14 +83,29 @@ class Vault:
             fh.write(token)
         tmp.replace(self.path)
 
-    def add(self, name: str, username: str, password: str, domains: list[str], trusted: bool = False) -> None:
+    def add(self, name: str, username: str, password: str, domains: list[str], trusted: bool = False,
+            extra: dict[str, str] | None = None) -> None:
         """Add or replace a login. Replacing it resets its trust; trusted=True trusts all its domains."""
         domains = check(name, domains)
         if not username or not password:
             raise ValueError("username and password can't be empty")
         data = self._load()
         data[name] = {"username": username, "password": password, "domains": domains,
-                      "trusted": domains if trusted else []}
+                      "trusted": domains if trusted else [], "extra": dict(extra or {})}
+        self._save(data)
+
+    def save(self, name: str, values: dict[str, str], domains: list[str], trusted: bool = False) -> None:
+        """Store a form's sensitive values under name, replacing any entry of that name (never
+        merged: a new form must not rebind an old password to another site). 'username' and
+        'password' make it a website login; the rest are extra fields. No domains = a secret that
+        isn't bound to a site, which the browser tools refuse to type."""
+        if not NAME.match(name):
+            raise ValueError("name: use letters, digits, '.', '_' or '-' (max 40)")
+        domains = check(name, domains) if domains else []
+        data = self._load()
+        data[name] = {"username": values.get("username", ""), "password": values.get("password", ""),
+                      "domains": domains, "trusted": domains if trusted else [],
+                      "extra": {k: v for k, v in values.items() if k not in ("username", "password")}}
         self._save(data)
 
     def trust(self, name: str, host: str) -> bool:
@@ -123,10 +143,17 @@ class Vault:
         """(name, domains, trusted domains), never usernames or passwords."""
         return [(n, tuple(e["domains"]), tuple(e.get("trusted", []))) for n, e in sorted(self._load().items())]
 
+    def field_names(self) -> dict[str, list[str]]:
+        """The extra fields each login has (names only, never values)."""
+        return {n: sorted(e.get("extra", {})) for n, e in self._load().items()}
+
     def names_for(self, host: str) -> list[str]:
         """Logins allowed on this host, e.g. to pre-approve them for a scheduled run on that site."""
         return [n for n, domains in self.names() if domain_allowed(host, domains)]
 
     def get(self, name: str) -> Login | None:
         e = self._load().get(name)
-        return Login(name, e["username"], e["password"], tuple(e["domains"]), tuple(e.get("trusted", []))) if e else None
+        if not e:
+            return None
+        return Login(name, e["username"], e["password"], tuple(e["domains"]), tuple(e.get("trusted", [])),
+                     dict(e.get("extra", {})))

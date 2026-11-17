@@ -9,6 +9,7 @@ A personal assistant that lives on your VPS and talks to you over Telegram (iPho
 - **Memory**: Friday saves lasting facts about you and recalls them later.
 - **Files and photos**: send them to the bot; they land in `files/inbox/` for Friday to use. A
   photo of a syllabus or notice turns into a list of deadlines and events you add with one tap.
+  `/files` lists them to get back or delete. Up to 20 MB, or 2 GB with the local Bot API server.
 - **Voice messages**: Friday transcribes them (Groq Whisper or OpenAI) and answers what you said.
 - **Browser**: a shared headless Chromium on the server that Friday drives for you, with an
   encrypted login vault. It asks you on Telegram before the first login on each site and before
@@ -262,6 +263,61 @@ ssh friday 'cd ~/friday && .venv/bin/friday vault list'
 ssh friday 'cd ~/friday && .venv/bin/friday vault remove school'
 ```
 
+### 11. Secure form (optional)
+
+When Friday needs structured input or a secret (a login, a one-time code, an API key, a few
+choices), its request comes with a **📝 입력하기** button under the text field. It opens a small
+form inside Telegram (a Mini App, `site/login/index.html`) with the fields the agent asked for:
+text, masked passwords, codes, numbers, email, URL, longer text, dropdowns, choice buttons,
+checkboxes, dates and times. The form encrypts what you type for your server (AES-256-GCM, the
+key wrapped with the server's RSA-3072 key, kept in `~/friday-data/vault/form_key.pem`), so
+Telegram only carries ciphertext. The form's settings travel in the URL's `#` part, which
+browsers never send to the web host.
+
+Sensitive fields (🔐; passwords always) go only to the vault and never to the agent, which gets
+just "stored as <name>.<field>"; the other values are handed to the agent. The request message
+and the form both say, in Friday's own words, which vault entry a 🔐 value goes to and which site
+it is bound to (or that it isn't bound to one). If that doesn't match what you're doing, cancel.
+
+The form is a static page published by GitHub Pages (`.github/workflows/pages.yml`). Turn Pages
+on once, in the repo's Settings > Pages > Source: **GitHub Actions**, or:
+
+```bash
+gh api -X POST repos/<you>/friday/pages -f build_type=workflow
+```
+
+Then push (or run the "Pages" workflow) and it is served at `https://<you>.github.io/friday/login/`,
+which Friday uses by default (worked out from the repo's GitHub `origin`). Free Pages needs a
+**public** repo; with a private one, host `site/login/index.html` on any static https host and
+set `FRIDAY_FORM_URL` in `.env.server` to its address. `FRIDAY_FORM_URL=` (empty) turns the form
+off. Without the form, or if it doesn't open, reply to the request message instead: one value
+per line (username, then password, then any extra fields it lists).
+
+### 12. Files up to 2 GB (optional)
+
+Telegram's Bot API lets bots download files up to 20 MB and send up to 50 MB. A local Bot API
+server ([tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api), built by
+`bootstrap.sh` into `/usr/local/bin`) raises both to 2 GB. It runs as `friday-botapi.service`,
+connects out to Telegram and listens on 127.0.0.1:8081 only, so no port is opened.
+
+1. Sign in at https://my.telegram.org with your phone number → **API development tools** →
+   create an app (any name). Put its `api_id` and `api_hash` in `.env.server` as
+   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`.
+2. Deploy (`deploy/push.sh`). It starts `friday-botapi.service` and restarts Friday pointed at it.
+3. Right after, log the bot out of Telegram's cloud Bot API, once (it asks to confirm):
+
+   ```bash
+   ssh -t friday 'cd ~/friday && .venv/bin/friday botapi switch'
+   ```
+
+   Without this Telegram doesn't guarantee the bot gets its messages through the local server.
+   After it, the cloud API refuses the bot for about 10 minutes.
+4. Check with `ssh friday 'cd ~/friday && .venv/bin/friday botapi status'` and send a big file.
+
+Going back: remove `TELEGRAM_API_ID` from `.env.server`, call `logOut` on the local server
+(`curl -s -X POST http://127.0.0.1:8081/bot<token>/logOut` on the VPS) and deploy; the cloud API
+takes the bot back 10 minutes after the switch.
+
 ## Using it
 
 | Telegram | What it does |
@@ -280,8 +336,9 @@ ssh friday 'cd ~/friday && .venv/bin/friday vault remove school'
 | `/jobs` | recent coding jobs and their pull requests |
 | `/stop <id>` | stop a running coding job |
 | `/runs` | scheduled browser runs and their results; `/runs cancel <id>` cancels one |
-| `/login <name> <domain>` | save a website login: reply to Friday's message with the username and password |
+| `/login <name> <domain>` | save a website login: tap 📝 입력하기 (the form), or reply to Friday's message with the username and password |
 | `/logins` | saved website logins: 🔒 ask again before use, 🗑 delete |
+| `/files [folder]` | the newest files in Friday's workspace (what you sent, what Friday made), with size and date; tap one for 📤 get or 🗑 delete (asks first); 📂 browses folders |
 | `/backup` | sends you the database file |
 | `/status` | Codex login, calendar, counts |
 
@@ -314,11 +371,14 @@ shared browser through the Playwright MCP server. To log in it uses a saved logi
 it types the username and password itself (the agent never sees them), only on the login's own
 domains and only over https. The first use on each site asks you on Telegram (✅ / ❌); after
 that it logs in there without asking, until you tap 🔒 in `/logins`. If no login fits, Friday
-sends a 🔑 request (or send `/login school lms.example.edu` yourself): reply to it with the
-username on the first line and the password on the second. The bot stores them in the vault,
-deletes your message from the chat (if that fails it tells you to delete it) and never passes
-the text to the agent or the logs. A login saved this way is already approved for its site.
-`friday vault add` on the server still works. Before anything
+sends a 🔑 request (or send `/login school lms.example.edu` yourself): tap **📝 입력하기** and
+fill in the form (step 11), or reply to the request with the username on the first line and the
+password on the second. Friday can ask for extra fields a site needs (a student id, a PIN); they
+are stored with the login and typed by Friday too. The bot stores them in the vault, deletes
+your message from the chat (if that fails it tells you to delete it) and never passes the text
+to the agent or the logs. A login saved this way is already approved for its site. For a
+one-time code (SMS, OTP) Friday sends the same kind of request; the code goes to the agent for
+that login only and isn't stored. `friday vault add` on the server still works. Before anything
 irreversible (submit, send, pay, delete) it sends you a screenshot and waits for ✅; without an
 answer within 5 minutes it doesn't go ahead. Ask for it later ("tomorrow at 9, submit the
 report on the course site") and Friday schedules a browser run: you approve the plan and the

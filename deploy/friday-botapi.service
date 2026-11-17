@@ -1,0 +1,21 @@
+[Unit]
+Description=Local Telegram Bot API server for Friday (files up to 2 GB, 127.0.0.1:8081)
+After=network-online.target
+Wants=network-online.target
+
+# tdlib/telegram-bot-api, built by deploy/bootstrap.sh. deploy.sh starts this only when
+# TELEGRAM_API_ID is set in ~/friday/.env. `friday botapi serve` reads TELEGRAM_API_ID and
+# TELEGRAM_API_HASH from that .env (parsed like the bot does) and runs, with only those two in its
+# environment:
+#   telegram-bot-api --local --http-ip-address=127.0.0.1 --http-port=8081 \
+#     --dir=~/friday-data/botapi --temp-dir=~/friday-data/botapi/tmp
+# It connects out to Telegram; nothing listens beyond 127.0.0.1, so no firewall change.
+[Service]
+WorkingDirectory=%h/friday
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/friday/.venv/bin/friday botapi serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -19,11 +19,16 @@ from mcp.server import MCPServer
 
 from . import browser, gcal
 from . import timeutil as tu
+from . import workspace as wsfiles
 from .config import ensure_dirs, load_config
 from .db import Store
 from .jobs import REPO_ARG, github_slug, short
+from .models import available_models, model_list
+from .models import summary as models_summary
+from .models import switch as switch_model
 from .secrets_guard import REFUSAL, looks_secret
-from .vault import Vault, check, domain_allowed
+from .vault import DOMAIN, NAME, Vault, check, domain_allowed
+from .webform import code_spec, login_spec, make_spec, parse_fields
 
 cfg = load_config()
 ensure_dirs(cfg)
@@ -435,9 +440,38 @@ NOT_APPROVED = {"denied": "Denied", "expired": "Not approved: no answer within 5
 
 @server.tool()
 def list_logins() -> str:
-    """Saved website logins: names and domains only (passwords are never shown). Use a name with fill_login."""
-    names = Vault(cfg.vault_dir).names()
-    return "\n".join(f"{n}: {', '.join(d)}" for n, d in names) or "No saved logins."
+    """Saved website logins: names, domains and the names of any extra fields (values are never
+    shown). Use a name with fill_login, and an extra field with fill_login_field."""
+    v = Vault(cfg.vault_dir)
+    extra = v.field_names()
+    lines = [f"{n}: {', '.join(d) or 'no site'}" + (f" (fields: {', '.join(extra[n])})" if extra.get(n) else "")
+             for n, d in v.names()]
+    return "\n".join(lines) or "No saved logins."
+
+
+async def _may_fill(name: str, login, host: str) -> str | None:
+    """None if the login may be typed on host: trusted there (approved once, or typed in for it),
+    pre-approved for this run, or approved now on Telegram. Otherwise the refusal to return."""
+    if domain_allowed(host, login.trusted) or (RUN_ID and store.run_allows_login(RUN_ID, name)):
+        return None
+    status = await _ask("login", f"🔑 '{name}' 로그인 정보를 {host} 에 입력할까요?\n"
+                                 "(허용하면 이 사이트에서는 다음부터 묻지 않아요. /logins 에서 되돌릴 수 있어요)")
+    if status != "approved":
+        return NOT_APPROVED[status]
+    try:
+        Vault(cfg.vault_dir).trust(name, host)
+    except Exception:  # not remembered: it just asks again next time
+        pass
+    return None
+
+
+def _vault_login(name: str):
+    """(login, None) or (None, the message to return)."""
+    try:
+        login = Vault(cfg.vault_dir).get(name)
+    except Exception as e:  # e.g. a missing or wrong key; the message never holds a secret
+        return None, f"The login vault can't be read ({type(e).__name__})."
+    return (login, None) if login else (None, f"No saved login named '{name}'. list_logins shows them.")
 
 
 @server.tool()
@@ -447,28 +481,19 @@ async def fill_login(name: str) -> str:
     each site on Telegram; after that it fills there without asking (logins of an approved
     scheduled run are already approved). You never see the password. Returns 'Filled and
     submitted…', 'Denied' or 'Wrong site: <host>'."""
-    try:
-        login = Vault(cfg.vault_dir).get(name)
-    except Exception as e:  # e.g. a missing or wrong key; the message never holds a secret
-        return f"The login vault can't be read ({type(e).__name__})."
-    if not login:
-        return f"No saved login named '{name}'. list_logins shows them."
+    login, err = _vault_login(name)
+    if err:
+        return err
+    if not (login.password and login.domains):
+        return f"'{name}' isn't a website login (no password or no site)."
     try:
         ok, host = await browser.check_site(login.domains)
     except Exception as e:
         return f"The browser isn't reachable ({type(e).__name__})."
     if not ok:
         return f"Wrong site: {host} (open the login form on https://{login.domains[0]} first)"
-    # Trusted on this site (approved here once, or typed in for it), or pre-approved for this run.
-    if not (domain_allowed(host, login.trusted) or (RUN_ID and store.run_allows_login(RUN_ID, name))):
-        status = await _ask("login", f"🔑 '{name}' 로그인 정보를 {host} 에 입력할까요?\n"
-                                     "(허용하면 이 사이트에서는 다음부터 묻지 않아요. /logins 에서 되돌릴 수 있어요)")
-        if status != "approved":
-            return NOT_APPROVED[status]
-        try:
-            Vault(cfg.vault_dir).trust(name, host)
-        except Exception:  # not remembered: it just asks again next time
-            pass
+    if refusal := await _may_fill(name, login, host):
+        return refusal
     try:
         return await browser.fill_login(login)
     except Exception as e:  # only the type: Playwright's messages could echo what was typed
@@ -476,29 +501,131 @@ async def fill_login(name: str) -> str:
 
 
 @server.tool()
-async def request_login(name: str, domain: str, reason: str = "") -> str:
-    """Ask the user on Telegram for a website login when no saved login fits (see list_logins).
-    They reply with the username and password; Friday deletes that message and stores the login
-    in the vault, so you never see it. Waits up to 5 minutes. Returns 'Saved login <name> for
-    <domain>' (then call fill_login with that name: it won't ask again on that site),
-    'Cancelled' or 'Timed out'.
-
-    name: short name for the login, e.g. 'school' (letters, digits, '.', '_', '-').
-    domain: the site it is for, e.g. 'lms.example.edu' (no https://, no path; subdomains included).
-    reason: optional few words in the user's language, e.g. '과제 제출'.
-    """
+async def fill_login_field(name: str, field: str) -> str:
+    """Type one extra field of a saved login (e.g. a student id or PIN, see list_logins) into the
+    input that has focus on the open page: click the input first. Only on the login's own domains
+    over https, with the same approval as fill_login. Doesn't submit. You never see the value."""
+    login, err = _vault_login(name)
+    if err:
+        return err
+    if field not in login.extra:
+        have = ", ".join(sorted(login.extra)) or "none"
+        return f"'{name}' has no field '{field}' (its fields: {have})."
+    if not login.domains:
+        return f"'{name}' isn't bound to a site, so it can't be typed into a web page."
     try:
-        domain = check(name, [domain])[0]
-    except ValueError as e:
-        return f"Not requested: {e}"
-    rid = store.add_login_request(name, domain, " ".join(reason.split())[:200])
+        state, host = await browser.check_focused(login.domains)
+    except Exception as e:
+        return f"The browser isn't reachable ({type(e).__name__})."
+    if state == "wrong_site":
+        return f"Wrong site: {host} (open https://{login.domains[0]} first)"
+    if state == "no_input":
+        return f"No input has focus on {host}: click the field first, then call fill_login_field again."
+    if refusal := await _may_fill(name, login, host):
+        return refusal
+    try:
+        return await browser.fill_focused(login.domains, login.extra[field], field)
+    except Exception as e:
+        return f"Couldn't fill the field ({type(e).__name__})."
+
+
+async def _run_form(spec: dict, kind: str = "form", name: str = "", domain: str = "") -> tuple[str, dict]:
+    """Send a form to the user and wait up to 5 minutes. Returns (status, the non-sensitive
+    values); sensitive values went to the vault under name, never here."""
+    rid = store.add_login_request(name, domain, spec["description"], kind=kind, spec=spec)
     store.queue("login_request", text=str(rid))
     deadline = time.monotonic() + APPROVAL_TIMEOUT
     while time.monotonic() < deadline and store.login_request(rid)["status"] == "pending":
         await asyncio.sleep(2)
-    store.finish_login_request(rid, "expired")  # no-op unless still pending
-    status = store.login_request(rid)["status"]
-    return {"saved": f"Saved login {name} for {domain}", "cancelled": "Cancelled"}.get(status, "Timed out")
+    if store.finish_login_request(rid, "expired"):  # still pending: close the form button too
+        store.queue("login_expired", text=str(rid))
+    return store.login_request(rid)["status"], store.take_result(rid)  # the result is erased once read
+
+
+NOT_SUBMITTED = {"cancelled": "Cancelled", "expired": "Timed out"}
+
+
+@server.tool()
+async def request_form(title: str, fields: str, description: str = "", domain: str = "", save_as: str = "",
+                       submit_label: str = "") -> str:
+    """Ask the user for structured input or anything secret through a secure form on Telegram
+    (encrypted to this server). For a simple question, just ask in chat instead.
+    Sensitive fields (passwords by default, or "sensitive": true) go only to the vault under
+    save_as and are never returned to you; the other values are. Waits up to 5 minutes.
+    Returns 'Submitted: {json}' (sensitive fields read "stored as <save_as>.<field>"),
+    'Cancelled' or 'Timed out'.
+
+    title: what the form is for, in the user's language, e.g. 'OpenAI API 키'.
+    fields: JSON list (at most 12) of {"name", "label", "type", "required" (default true;
+        checkbox false), "placeholder", "help", "options" (select/choice: strings or
+        {"value", "label"}), "default", "sensitive"}. type: text, password, code, number, email,
+        url, textarea, select, choice, checkbox, date, time.
+    description: a sentence on why you ask and how it will be used; shown to the user.
+    domain: the site a sensitive value is for (like a login); empty = not bound to any site.
+    save_as: vault name for the sensitive values (required if any field is sensitive);
+        replaces an entry of that name.
+    submit_label: the submit button's text, e.g. '저장'.
+    """
+    try:
+        parsed = parse_fields(fields)
+        sensitive = [f["name"] for f in parsed if f["sensitive"]]
+        if sensitive and not NAME.match(save_as):
+            raise ValueError("save_as is required when a field is sensitive: letters, digits, '.', '_' or '-'")
+        domain = domain.strip().lower().rstrip(".")
+        if domain and not DOMAIN.match(domain):
+            raise ValueError("domain: a site like lms.example.edu (no https://, no path), or empty")
+        spec = make_spec(title, parsed, description, domain, save_as, submit_label)
+    except ValueError as e:
+        return f"Not requested: {e}"
+    status, values = await _run_form(spec, "form", save_as if sensitive else "", domain)
+    if status != "saved":
+        return NOT_SUBMITTED.get(status, "Timed out")
+    values.update({n: f"stored as {save_as}.{n}" for n in sensitive})
+    return "Submitted: " + json.dumps(values, ensure_ascii=False)
+
+
+@server.tool()
+async def request_login(name: str, domain: str, reason: str = "", fields: str = "") -> str:
+    """Ask the user on Telegram for a website login when no saved login fits (see list_logins).
+    They type it into a secure form (or reply with it); Friday stores it in the vault, so you never
+    see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
+    with that name: it won't ask again on that site), 'Cancelled' or 'Timed out'.
+
+    name: short name for the login, e.g. 'school' (letters, digits, '.', '_', '-').
+    domain: the site it is for, e.g. 'lms.example.edu' (no https://, no path; subdomains included).
+    reason: optional few words in the user's language, e.g. '과제 제출'.
+    fields: optional JSON list of extra fields the site needs besides username and password
+        (always asked), e.g. '[{"name": "student_id", "label": "학번", "type": "text"}]', same
+        format as request_form. They are sensitive (kept in the vault, typed with
+        fill_login_field) unless a field says "sensitive": false.
+    """
+    try:
+        domain = check(name, [domain])[0]
+        spec = login_spec(name, domain, " ".join(reason.split()), parse_fields(fields, sensitive_default=True))
+        if {"username", "password"} & {f["name"] for f in spec["fields"][2:]}:
+            raise ValueError("username and password are always asked; don't list them in fields")
+    except ValueError as e:
+        return f"Not requested: {e}"
+    status, values = await _run_form(spec, "login", name, domain)
+    if status != "saved":
+        return NOT_SUBMITTED.get(status, "Timed out")
+    return f"Saved login {name} for {domain}" + (f". Other values: {json.dumps(values, ensure_ascii=False)}"
+                                                 if values else "")
+
+
+@server.tool()
+async def request_code(reason: str, label: str = "인증번호") -> str:
+    """Ask the user on Telegram for a one-time code (2FA, SMS or email code, OTP) a site asks for.
+    They type it into a form; the code is returned to you and not stored anywhere. Waits up to
+    5 minutes. Returns 'Code: <code>', 'Cancelled' or 'Timed out'.
+
+    reason: a few words in the user's language, e.g. 'lms.example.edu 로그인 문자 인증'.
+    label: the field's label, e.g. '인증번호' or 'OTP'.
+    """
+    status, values = await _run_form(code_spec(reason, label), "code")
+    if status == "saved" and values.get("code"):
+        return f"Code: {values['code']}"
+    return NOT_SUBMITTED.get(status, "Timed out")
 
 
 @server.tool()
@@ -560,6 +687,25 @@ async def schedule_browser_run(when: str, instructions: str, mode: str, logins: 
 
 
 @server.tool()
+def list_files(folder: str = "files") -> str:
+    """List a folder in the workspace: subfolders, then files newest first, with sizes and dates
+    (user's timezone). Folder is relative to the workspace ("." = the workspace itself); the paths
+    shown can be passed to send_file. Files the user sends are under files/inbox/<date>/."""
+    items = wsfiles.entries(cfg.workspace, folder)
+    if items is None:
+        inside = wsfiles.inside(cfg.workspace, folder or ".")
+        return "Refused: the folder must be inside the workspace." if inside is None else f"No such folder: {folder}"
+    if not items:
+        return f"{folder} is empty."
+    tz, cap = _tz(), 200
+    lines = [f"{e.rel}/" if e.is_dir else f"{e.rel}  {wsfiles.human_size(e.size)}  {wsfiles.local_time(e.mtime, tz)}"
+             for e in items[:cap]]
+    if len(items) > cap:
+        lines.append(f"(+{len(items) - cap} more)")
+    return "\n".join(lines)
+
+
+@server.tool()
 def send_file(path: str, caption: str = "") -> str:
     """Send a file from the workspace to the user's Telegram chat. Path is relative to the workspace."""
     p = (cfg.workspace / path).resolve()
@@ -569,6 +715,26 @@ def send_file(path: str, caption: str = "") -> str:
         return f"No such file: {path}"
     store.queue("file", text=caption or None, path=str(p))
     return f"Queued {p.name} for sending."
+
+
+@server.tool()
+def set_model(model: str = "", effort: str = "") -> str:
+    """Show or change the Codex model and reasoning effort Friday answers with (same as /model).
+
+    With no arguments: the current choice and the available models with their efforts. When the
+    user asks to switch ("a smaller model than sol", "medium effort"), call it once with no
+    arguments to see the list, pick the model they mean, then call it with model and/or effort.
+    model='default' resets both. The change applies from the user's next message.
+    """
+    models = available_models()
+    args = [a.strip() for a in (model, effort) if a.strip()]
+    if not args:
+        return models_summary(store, cfg.codex_model, cfg.codex_effort) + "\n\n" + model_list(models)
+    try:
+        note = switch_model(store, cfg.codex_model, args, models)
+    except ValueError as e:
+        return str(e)
+    return models_summary(store, cfg.codex_model, cfg.codex_effort) + note + "\n(Applies from the next message.)"
 
 
 def run() -> None:

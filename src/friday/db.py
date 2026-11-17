@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE TABLE IF NOT EXISTS outbox (
     id         INTEGER PRIMARY KEY,
-    kind       TEXT NOT NULL,           -- text | file | proposal | approval | login_request
+    kind       TEXT NOT NULL,           -- text | file | proposal | approval | login_request | login_expired
     text       TEXT,                    -- message or caption; for the others, the row id to send
     path       TEXT,
     created_at TEXT NOT NULL,
@@ -143,6 +143,13 @@ JOB_FIELDS = (
 MIGRATIONS = [
     ("reminders", "skip_dates", "TEXT NOT NULL DEFAULT ''"),  # comma-separated local dates
     ("memories", "updated_at", "TEXT"),
+    # login_requests are forms (request_form, request_login, request_code, /login): `spec` is the
+    # form (webform.make_spec; '{}' = a plain login), `result` the non-sensitive values handed back
+    # to the agent, erased as soon as it reads them. name/domain: where sensitive values are saved.
+    ("login_requests", "kind", "TEXT NOT NULL DEFAULT 'login'"),  # login | code | form
+    ("login_requests", "spec", "TEXT NOT NULL DEFAULT '{}'"),
+    ("login_requests", "form_message_id", "INTEGER"),  # the [취소] message sent with the form button
+    ("login_requests", "result", "TEXT"),
 ]
 
 # Korean particles stripped from search words, longest first ("엄마한테" -> "엄마").
@@ -579,12 +586,23 @@ class Store:
         )
         return cur.rowcount > 0
 
-    def add_login_request(self, name: str, domain: str, reason: str = "") -> int:
+    def add_login_request(self, name: str, domain: str, reason: str = "", kind: str = "login",
+                          spec: dict | None = None) -> int:
+        """A form request. spec: webform.make_spec's form; None = a plain login (username, password)."""
         cur = self.conn.execute(
-            "INSERT INTO login_requests(name, domain, reason, created_at) VALUES(?, ?, ?, ?)",
-            (name, domain, reason, self._now()),
+            "INSERT INTO login_requests(name, domain, reason, kind, spec, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (name, domain, reason, kind, json.dumps(spec or {}, ensure_ascii=False), self._now()),
         )
         return cur.lastrowid  # type: ignore[return-value]
+
+    def set_login_request_form_message(self, rid: int, message_id: int) -> None:
+        self.conn.execute("UPDATE login_requests SET form_message_id = ? WHERE id = ?", (message_id, rid))
+
+    def take_result(self, rid: int) -> dict:
+        """A form's non-sensitive values, read once: erased from the database right away."""
+        row = self.conn.execute("SELECT result FROM login_requests WHERE id = ?", (rid,)).fetchone()
+        self.conn.execute("UPDATE login_requests SET result = NULL WHERE id = ?", (rid,))
+        return json.loads(row["result"]) if row and row["result"] else {}
 
     def login_request(self, rid: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM login_requests WHERE id = ?", (rid,)).fetchone()
@@ -595,10 +613,11 @@ class Store:
     def set_login_request_message(self, rid: int, message_id: int) -> None:
         self.conn.execute("UPDATE login_requests SET message_id = ? WHERE id = ?", (message_id, rid))
 
-    def finish_login_request(self, rid: int, status: str) -> bool:
-        """pending -> saved | cancelled | expired, once."""
+    def finish_login_request(self, rid: int, status: str, result: dict | None = None) -> bool:
+        """pending -> saved | cancelled | expired, once. result: the non-sensitive values (take_result)."""
         cur = self.conn.execute(
-            "UPDATE login_requests SET status = ? WHERE id = ? AND status = 'pending'", (status, rid)
+            "UPDATE login_requests SET status = ?, result = ? WHERE id = ? AND status = 'pending'",
+            (status, json.dumps(result, ensure_ascii=False) if result else None, rid)
         )
         return cur.rowcount > 0
 
