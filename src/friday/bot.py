@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import mimetypes
@@ -1844,6 +1845,11 @@ class Friday(WatchBot):
                 await self._send_login_request(int(row["text"]))
             elif row["kind"] == "login_expired":  # request_login / request_code gave up waiting
                 await self._close_login_request(int(row["text"]), "⌛ 시간이 지나 요청이 끝났어요")
+            elif row["kind"] == "html":  # show_tree: already escaped, too long ones split as plain text
+                if len(row["text"]) <= TELEGRAM_LIMIT:
+                    await self.app.bot.send_message(self.owner, row["text"], parse_mode="HTML")  # type: ignore[union-attr]
+                else:
+                    await self.say(html.unescape(re.sub(r"<[^>]+>", "", row["text"])))
             elif row["text"]:
                 await self.say(row["text"])
             self.store.mark_sent(row["id"])

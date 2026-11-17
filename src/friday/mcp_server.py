@@ -412,6 +412,26 @@ def list_projects() -> str:
     return "\n".join(lines) or f"No projects in {cfg.code_dir} yet."
 
 
+@server.tool()
+def show_tree(project: str, path: str = "", depth: int = 2) -> str:
+    """Show the user a project's folder structure in Telegram: a monospace tree without ignored,
+    build and dependency files, with the branch and last commit. project: a name from
+    list_projects; path: a subfolder to open; depth: levels to unfold (1-4, default 2). The user
+    sees the tree itself, so don't repeat it: end your turn with "-" unless you have more to say."""
+    from . import tree
+
+    root = (cfg.code_dir / project.strip()).resolve() if project.strip() else None
+    if not root or "/" in project.strip() or root.parent != cfg.code_dir.resolve() or not root.is_dir():
+        return "Name one of these projects:\n" + list_projects()
+    sub = path.strip().strip("/")
+    target = (root / sub).resolve()
+    if not target.is_relative_to(root) or not target.is_dir():
+        return f"No folder '{path}' in {root.name}."
+    plain, msg = tree.show(root, str(target.relative_to(root)) if sub else "", depth)
+    store.queue("html", text=msg)
+    return "Sent to the user:\n" + plain
+
+
 PROPOSAL_KINDS = {"task": "due", "reminder": "when", "event": "start"}  # kind -> its main time field
 
 

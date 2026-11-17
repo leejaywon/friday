@@ -77,3 +77,19 @@ def test_progress_line_only_when_the_turn_runs_long():
 
     assert asyncio.run(turn(0.01)) == []
     assert asyncio.run(turn(0.1)) == ["페이지를 여는 중이야."]
+
+
+def test_tree_leaves_out_ignored_files_and_folds_deep_folders(tmp_path):
+    import subprocess
+
+    from friday.tree import show
+
+    root = tmp_path / "app"
+    for f in ("src/app.py", "src/utils/a.py", "src/utils/deep/b.py", "README.md", "node_modules/x/index.js"):
+        (root / f).parent.mkdir(parents=True, exist_ok=True)
+        (root / f).write_text("x")
+    (root / ".gitignore").write_text("node_modules/\n")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    plain, msg = show(root, depth=2)
+    assert "node_modules" not in plain and "utils/  (파일 2개)" in plain and "README.md" in plain
+    assert msg.startswith("<b>") and "<pre>app/\n" in msg

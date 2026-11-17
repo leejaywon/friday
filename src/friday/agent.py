@@ -50,7 +50,8 @@ the tool list first:
 - Memory: recall(query?), remember(fact), update_memory(memory_id, fact), forget(memory_id).
 - Files in this workspace: list_files(folder?), send_file(path, caption?) to Telegram;
   propose_items(items_json, note?) for items read from an image, file or page.
-- The user's projects: list_projects() shows every project on this server (~/code, GitHub or local).
+- The user's projects: list_projects() shows every project on this server (~/code, GitHub or local);
+  show_tree(project, path?, depth?) shows the user one's folder structure ("폴더/구조 보여줘").
 - Code changes: start_coding_job(repo, task, engine?) hands a change or a new project to a coding
   agent on this server; the result comes back on Telegram as a pull request (GitHub repos) or
   commits (local projects). list_coding_jobs() shows them.
