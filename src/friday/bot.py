@@ -375,6 +375,9 @@ class Friday(WatchBot):
         on = set(json.loads(self.store.get("toolsets") or "[]"))
         return on | {"browser"} if self.cfg.browser_enabled else on
 
+    def _last_shown(self) -> int:
+        return self.store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM outbox WHERE kind = 'html'").fetchone()[0]
+
     def _last_proposal(self) -> int:
         return self.store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM proposals").fetchone()[0]
 
@@ -406,6 +409,7 @@ class Friday(WatchBot):
             typing = asyncio.create_task(self._keep_typing(chat_id))
             note = ProgressNote(lambda t: self._quiet(self.say(plain_text(t), chat_id)), PROGRESS_AFTER)
             requests, proposal, used = self._followups(), self._last_proposal(), set()
+            shown = self._last_shown()
             try:
                 thread = self._current_thread()
                 prompt = self._wrap(text, files or [], thread is None)
@@ -435,7 +439,9 @@ class Friday(WatchBot):
             if thread and not self._followups() and result.input_tokens > MAX_TURN_INPUT_TOKENS:
                 self._continue_fresh()
         if result.text:
-            if self._worth_sending(result.text, made_request, self._last_proposal() > proposal):
+            # A one-liner next to a proposal or a tree (show_tree) only says it was sent.
+            listed = self._last_proposal() > proposal or self._last_shown() > shown
+            if self._worth_sending(result.text, made_request, listed):
                 await self.say(plain_text(result.text), chat_id)
         elif result.errors or not made_request:
             detail = "; ".join(result.errors) or "no reply"
