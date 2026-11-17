@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS proposals (      -- items read from an image/file, wa
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS watches (        -- "이러면 알려줘": a condition an agent checks periodically (watches.py)
+CREATE TABLE IF NOT EXISTS watches (        -- "tell me when X": a condition an agent checks periodically (watches.py)
     id              INTEGER PRIMARY KEY,
     title           TEXT NOT NULL,
     check_prompt    TEXT NOT NULL,          -- complete instruction for the unattended checking agent
@@ -707,7 +707,7 @@ class Store:
         )
         return cur.rowcount > 0
 
-    # --- watches ("이러면 알려줘", see watches.py) ----------------------------
+    # --- watches ("tell me when X", see watches.py) ----------------------------
 
     WATCH_FIELDS = ("status", "checking", "last_checked_at", "next_check_at", "last_state",
                     "last_fingerprint", "last_error", "fail_count")

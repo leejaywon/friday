@@ -80,10 +80,10 @@ def parse_code_args(args: list[str], default_engine: str) -> tuple[str, str, str
     if args and args[0].lower() in ("claude", "codex"):
         engine = args.pop(0).lower()
     if len(args) < 2:
-        raise ValueError("사용법: /code [claude|codex] <repo> <할 일>")
+        raise ValueError("Usage: /code [claude|codex] <repo> <task>")
     repo, task = args[0], " ".join(args[1:]).strip()
     if not REPO_ARG.match(repo):
-        raise ValueError(f"'{repo}'는 저장소 이름이 아니에요. ~/code 의 폴더 이름이나 owner/name 으로 써주세요.")
+        raise ValueError(f"'{repo}' isn't a repo name. Use a folder name in ~/code or owner/name.")
     return engine, repo, task
 
 
@@ -471,11 +471,11 @@ class Runner:
 
         ahead = int(await self.git("rev-list", "--count", f"origin/{pl.base}..HEAD", cwd=pl.workdir) or 0)
         if not ahead:
-            return Outcome("done", res.text or "변경 없음.")
+            return Outcome("done", res.text or "No changes.")
         stat = await self.git("diff", "--shortstat", f"origin/{pl.base}..HEAD", cwd=pl.workdir)
         if not self.cfg.github_code_token:
-            return Outcome("done", f"{res.text}\n\n{stat}\n{pl.workdir} 의 {pl.branch} 에 커밋했지만 "
-                                   "푸시하지 않았어요: GITHUB_CODE_TOKEN 이 없어요.")
+            return Outcome("done", f"{res.text}\n\n{stat}\nCommitted to {pl.branch} in {pl.workdir} but "
+                                   "didn't push: GITHUB_CODE_TOKEN isn't set.")
         await self.git("push", "-q", "-f", f"https://github.com/{pl.slug}.git", f"HEAD:refs/heads/{pl.branch}",
                        cwd=pl.workdir, timeout=600, auth=True)
         pr = await self.gh.open_pr(
@@ -483,15 +483,15 @@ class Runner:
             body=f"{job['task']}\n\n---\n{res.text}\n\nRequested through Friday (job #{jid}, {job['engine']}).",
         )
         self.store.update_job(jid, pr_number=pr["number"], pr_url=pr["html_url"])
-        note = "" if sha else " (이번에는 새 변경 없음)"
+        note = "" if sha else " (no new changes this time)"
         return Outcome("review", f"{res.text}\n\n{stat}{note}\n{pr['html_url']}")
 
     def local_outcome(self, job, pl: Place, text: str, sha: str | None) -> Outcome:
         commits = ((job["commits"] or "") + (" " + sha if sha else "")).split()
         self.store.update_job(job["id"], commits=" ".join(commits) or None)
         if not sha:
-            return Outcome("done", (text or "변경 없음.") + "\n\n(이번에는 바뀐 파일이 없어요.)", undo=bool(commits))
-        return Outcome("done", f"{text}\n\n{pl.workdir} 의 {pl.branch} 에 {sha[:8]} 커밋함.", undo=True)
+            return Outcome("done", (text or "No changes.") + "\n\n(No files changed this time.)", undo=bool(commits))
+        return Outcome("done", f"{text}\n\nCommitted {sha[:8]} to {pl.branch} in {pl.workdir}.", undo=True)
 
     async def commit(self, workdir: Path, message: str) -> str | None:
         """Commit everything that changed; the new commit's sha, or None if nothing did."""

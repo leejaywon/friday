@@ -13,7 +13,7 @@ from .jobs import github_slug
 # Skipped in folders that aren't git repos (git repos use their .gitignore).
 JUNK = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
         ".next", ".turbo", ".cache", "dist", "build", "target", "coverage", ".idea", ".vscode", ".DS_Store"}
-MAX_ENTRIES = 15  # per folder; the rest become "… 외 N개"
+MAX_ENTRIES = 15  # per folder; the rest become "… N more"
 MAX_LINES = 80
 
 
@@ -59,26 +59,26 @@ def _render(node: dict, depth: int, prefix: str = "") -> list[str]:
         child = node[name]
         label = name
         if child is not None and depth <= 1:
-            label += f"  (파일 {_count(child)}개)"
+            label += f"  ({_count(child)} files)"
         lines.append(prefix + ("└── " if last else "├── ") + label)
         if child is not None and depth > 1:
             lines += _render(child, depth - 1, prefix + ("    " if last else "│   "))
     if rest > 0:
-        lines.append(prefix + f"└── … 외 {rest}개")
+        lines.append(prefix + f"└── … {rest} more")
     return lines
 
 
 def summary(root: Path) -> str:
-    """'main · 커밋 12개 · 수정 중 2개 · 최근: 2026-11-17 Fix login' (empty if not a git repo)."""
+    """'main · 12 commits · 2 changed · last: 2026-11-17 Fix login' (empty if not a git repo)."""
     if not (root / ".git").exists():
         return ""
     parts = [_git(root, "rev-parse", "--abbrev-ref", "HEAD") or "no branch"]
     if count := _git(root, "rev-list", "--count", "HEAD"):
-        parts.append(f"커밋 {count}개")
+        parts.append(f"{count} commits")
     if changed := len(_git(root, "status", "--porcelain").splitlines()):
-        parts.append(f"수정 중 {changed}개")
+        parts.append(f"{changed} changed")
     if last := _git(root, "log", "-1", "--format=%cs %s"):
-        parts.append("최근: " + last[:70])
+        parts.append("last: " + last[:70])
     return " · ".join(parts)
 
 
@@ -88,10 +88,10 @@ def show(project_dir: Path, sub: str = "", depth: int = 2) -> tuple[str, str]:
     paths = files(root)
     lines = _render(_nest(paths), max(1, min(depth, 4)))
     if len(lines) > MAX_LINES:
-        lines = lines[:MAX_LINES] + [f"… {len(lines) - MAX_LINES}줄 더 (하위 폴더를 지정해 보세요)"]
+        lines = lines[:MAX_LINES] + [f"… {len(lines) - MAX_LINES} more lines (try a subfolder)"]
     title = project_dir.name + "/" + (sub.strip("/") + "/" if sub else "")
     head = summary(project_dir)
-    body = "\n".join([title, *lines]) if paths else title + "\n(비어 있음)"
+    body = "\n".join([title, *lines]) if paths else title + "\n(empty)"
     slug = github_slug(_git(project_dir, "remote", "get-url", "origin"))
     link = f"https://github.com/{slug}" + (f"/tree/HEAD/{sub.strip('/')}" if sub else "") if slug else ""
     plain = "\n".join(x for x in (head, body, link) if x)

@@ -1,4 +1,4 @@
-"""Watch rules ("이러면 알려줘"): a condition Friday checks periodically, telling the owner only
+"""Watch rules ("tell me when X"): a condition Friday checks periodically, telling the owner only
 when it is newly met.
 
 The chat agent creates one with the add_watch MCP tool (the owner approves it on Telegram first).
@@ -70,13 +70,13 @@ def next_check(every: str, after: datetime, tz: str) -> datetime:
 
 def describe_every(every: str) -> str:
     if every.startswith("daily "):
-        return f"매일 {every[6:]}"
+        return f"daily at {every[6:]}"
     minutes = int(every[:-1])
     if minutes % 1440 == 0:
-        return f"{minutes // 1440}일마다"
+        return f"every {minutes // 1440} d"
     if minutes % 60 == 0:
-        return f"{minutes // 60}시간마다"
-    return f"{minutes}분마다"
+        return f"every {minutes // 60} h"
+    return f"every {minutes} min"
 
 
 @dataclass
@@ -128,8 +128,8 @@ def record_check(store, wid: int, text: str, error: str, now: datetime, tz: str)
         store.update_watch(wid, checking=0, last_checked_at=tu.to_utc_iso(now), last_error=why, fail_count=fails,
                            next_check_at=tu.to_utc_iso(max(regular, now + timedelta(minutes=30) * 2 ** (fails - 1))))
         if fails >= MAX_FAILS and store.set_watch_status(wid, "paused", only_from="active"):
-            return Step(note=f"⚠️ '{w['title']}' 확인이 {fails}번 연속 실패해서 일시중지했어요: {short(why, 200)}\n"
-                             "/watches 에서 다시 켜거나 지울 수 있어요.")
+            return Step(note=f"⚠️ Paused '{w['title']}' after {fails} failed checks in a row: {short(why, 200)}\n"
+                             "Resume or delete it in /watches.")
         return Step()
     state = json.dumps({"triggered": verdict.triggered, "summary": verdict.summary,
                         "fingerprint": verdict.fingerprint}, ensure_ascii=False)
@@ -139,7 +139,7 @@ def record_check(store, wid: int, text: str, error: str, now: datetime, tz: str)
     if notify:
         fields["last_fingerprint"] = verdict.fingerprint
     store.update_watch(wid, **fields)
-    return Step(notify=f"🔔 {w['title']}\n{verdict.summary or '조건이 충족됐어요.'}" if notify else None)
+    return Step(notify=f"🔔 {w['title']}\n{verdict.summary or 'The condition is met.'}" if notify else None)
 
 
 def check_prompt(w, now_local: str) -> str:
@@ -175,15 +175,15 @@ def describe(w, tz: str) -> str:
     """One watch for /watches and list_watches."""
     line = f"#{w['id']} {w['title']} · {describe_every(w['every'])}"
     if w["status"] == "active":
-        line += f" · 다음 {tu.local_str(tu.from_iso(w['next_check_at']), tz)}"
+        line += f" · next {tu.local_str(tu.from_iso(w['next_check_at']), tz)}"
     if w["expires_at"]:
-        line += f" · {tu.local_str(tu.from_iso(w['expires_at']), tz)}까지"
+        line += f" · until {tu.local_str(tu.from_iso(w['expires_at']), tz)}"
     if w["toolsets"]:
         line += f" [{w['toolsets']}]"
     if w["last_error"]:
         line += f"\n   ⚠️ {short(w['last_error'], 100)}"
     elif w["last_state"]:
-        line += f"\n   마지막: {short(json.loads(w['last_state']).get('summary') or '-', 100)}"
+        line += f"\n   last: {short(json.loads(w['last_state']).get('summary') or '-', 100)}"
     return line
 
 
@@ -212,7 +212,7 @@ class WatchBot:
             return 30
         if w["expires_at"] and tu.from_iso(w["expires_at"]) <= now:
             if self.store.set_watch_status(w["id"], "done", only_from="active"):
-                await self._quiet(self.say(f"⌛ 감시 기간이 끝났어요: {w['title']}"))
+                await self._quiet(self.say(f"⌛ Stopped watching (end date reached): {w['title']}"))
             return 1
         self.store.update_watch(w["id"], checking=1)
         self._watch_task = asyncio.create_task(self._watch_check(w), name=f"watch-{w['id']}")
@@ -240,8 +240,8 @@ class WatchBot:
         step = record_check(self.store, wid, text, error, tu.now_utc(), self.tz)
         if step.notify:
             buttons = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ 그만 보기", callback_data=f"w:s:{wid}"),
-                InlineKeyboardButton("⏸ 일시중지", callback_data=f"w:p:{wid}"),
+                InlineKeyboardButton("✅ Stop watching", callback_data=f"w:s:{wid}"),
+                InlineKeyboardButton("⏸ Pause", callback_data=f"w:p:{wid}"),
             ]])
             await self._quiet(self.app.bot.send_message(self.owner, step.notify[:4000], reply_markup=buttons))
         if step.note:
@@ -250,14 +250,14 @@ class WatchBot:
     def _watches_view(self) -> tuple[str, InlineKeyboardMarkup | None]:
         rows = self.store.watches()
         if not rows:
-            return "감시 중인 항목이 없어요. \"이캠퍼스에 새 공지 올라오면 알려줘\"처럼 말해 주세요.", None
+            return "Nothing is being watched. Say something like \"tell me when my course site posts a new notice\".", None
         lines, buttons = [], []
         for w in rows:
             lines.append(("⏸ " if w["status"] == "paused" else "🔔 ") + describe(w, self.tz))
-            toggle = (InlineKeyboardButton(f"▶️ #{w['id']} 다시 켜기", callback_data=f"wl:r:{w['id']}")
+            toggle = (InlineKeyboardButton(f"▶️ #{w['id']} Resume", callback_data=f"wl:r:{w['id']}")
                       if w["status"] == "paused" else
-                      InlineKeyboardButton(f"⏸ #{w['id']} 일시중지", callback_data=f"wl:p:{w['id']}"))
-            buttons.append([toggle, InlineKeyboardButton(f"🗑 #{w['id']} 삭제", callback_data=f"wl:d:{w['id']}")])
+                      InlineKeyboardButton(f"⏸ #{w['id']} Pause", callback_data=f"wl:p:{w['id']}"))
+            buttons.append([toggle, InlineKeyboardButton(f"🗑 #{w['id']} Delete", callback_data=f"wl:d:{w['id']}")])
         return "\n".join(lines)[:4000], InlineKeyboardMarkup(buttons)
 
     async def cmd_watches(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -276,15 +276,15 @@ class WatchBot:
             await q.answer("Unknown watch")
             return
         if action in ("s", "d"):  # stop / delete: the watch ends (kept as 'done' for the record)
-            ok, label = self.store.set_watch_status(wid, "done"), "✅ 그만 볼게요" if action == "s" else "🗑 삭제했어요"
+            ok, label = self.store.set_watch_status(wid, "done"), "✅ Stopped watching" if action == "s" else "🗑 Deleted"
             ok = ok and w["status"] != "done"
         elif action == "p":
-            ok, label = self.store.set_watch_status(wid, "paused", only_from="active"), "⏸ 일시중지했어요"
+            ok, label = self.store.set_watch_status(wid, "paused", only_from="active"), "⏸ Paused"
         else:  # resume: check soon, with a clean failure count
-            ok, label = self.store.set_watch_status(wid, "active", only_from="paused"), "▶️ 다시 켰어요"
+            ok, label = self.store.set_watch_status(wid, "active", only_from="paused"), "▶️ Resumed"
             if ok:
                 self.store.update_watch(wid, fail_count=0, last_error=None, next_check_at=tu.to_utc_iso(tu.now_utc()))
-        await q.answer(label if ok else "이미 처리됨")
+        await q.answer(label if ok else "Already done")
         if where == "wl":  # the /watches list: show it again
             text, buttons = self._watches_view()
             await self._quiet(q.edit_message_text(text, reply_markup=buttons))

@@ -37,6 +37,6 @@ def test_three_failures_in_a_row_pause_the_watch_once(store):
     assert store.watch(wid)["next_check_at"] == "2026-11-17T03:30:00+00:00"  # backed off past the 15m interval
     assert wt.record_check(store, wid, "no json here", "", NOW, TZ).note is None
     third = wt.record_check(store, wid, '{"triggered": false, "error": "site down"}', "", NOW, TZ)
-    assert "3번 연속 실패" in third.note and "site down" in third.note
+    assert "3 failed checks in a row" in third.note and "site down" in third.note
     assert store.watch(wid)["status"] == "paused"
     assert wt.record_check(store, wid, "", "again", NOW, TZ) == wt.Step()  # paused: no second message

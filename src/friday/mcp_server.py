@@ -193,7 +193,7 @@ def cancel_reminder(reminder_id: int) -> str:
 @server.tool()
 def reschedule_reminder(reminder_id: int, when: str) -> str:
     """Move a reminder to a new ISO 8601 time. For a repeating reminder this also moves the series.
-    A one-off that already went off is re-armed, so "30분 미뤄줘" is this one call."""
+    A one-off that already went off is re-armed, so "push it back 30 minutes" is this one call."""
     tz = _tz()
     dt = tu.parse_when(when, tz)
     if dt < tu.now_utc() - timedelta(minutes=1):
@@ -229,11 +229,11 @@ def calendar_delete_event(event_id: str) -> str:
 
 @server.tool()
 def add_task(title: str, due: str = "", remind: str = "", notes: str = "") -> str:
-    """Add a to-do: something the user has to get done, optionally by a deadline ("까지", "by").
+    """Add a to-do: something the user has to get done, optionally by a deadline ("by Friday").
 
-    title: short description, e.g. '보고서 마무리'.
+    title: short description, e.g. 'finish the report'.
     due: ISO 8601 deadline, e.g. '2026-11-18T15:00'. Empty if there is no deadline.
-        Use the vague-time defaults from your instructions for words like 저녁까지 or 오늘 중.
+        Use the vague-time defaults from your instructions for words like "by evening" or "today".
     remind: ISO 8601 time for a heads-up before the deadline. Leave empty for the default
         (09:00 on the due day, or 1 hour before); 'none' for no heads-up.
     notes: optional details.
@@ -296,8 +296,8 @@ def cancel_task(task_id: int) -> str:
 @server.tool()
 def remember(fact: str) -> str:
     """Save a lasting fact about the user (preferences, people, routines) for future conversations.
-    Start it with a few topic words so it's easy to find later, e.g. "커피 취향: 아메리카노" or
-    "엄마 생일: 3월 5일".
+    Start it with a few topic words so it's easy to find later, e.g. "coffee: americano, no sugar" or
+    "mom's birthday: March 5".
 
     Call recall first: if a memory on the same subject exists, use update_memory instead so old
     and new facts don't contradict each other. Never use this for passwords, keys, card or ID numbers.
@@ -320,7 +320,7 @@ def update_memory(memory_id: int, fact: str) -> str:
 def recall(query: str = "") -> str:
     """Saved memories. With up to 50 saved, all of them (newest first); otherwise up to 20 best
     keyword matches for query, or the 20 newest when it's empty or nothing matches (then try
-    other words too, e.g. 엄마 / 어머니 / mom)."""
+    other words too, e.g. mom / mother)."""
     total = store.memory_count()
     if not total:
         return "No memories saved yet."
@@ -582,8 +582,8 @@ async def _may_fill(name: str, login, host: str, run_id: int = 0, watch_id: int 
         if store.watch_allows_login(watch_id, name):
             return None
         return f"'{name}' isn't pre-approved for this watch; report it as an error."
-    status = await _ask("login", f"🔑 '{name}' 로그인 정보를 {host} 에 입력할까요?\n"
-                                 "(허용하면 이 사이트에서는 다음부터 묻지 않아요. /logins 에서 되돌릴 수 있어요)")
+    status = await _ask("login", f"🔑 Type the login '{name}' into {host}?\n"
+                                 "(If you allow it, I won't ask again on this site. Undo it in /logins.)")
     if status != "approved":
         return NOT_APPROVED[status]
     try:
@@ -775,7 +775,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
     5 minutes. Go on only if this returns 'approved'.
 
     summary: what exactly you're about to do, in the user's language, e.g.
-        '자료구조 과제 3 제출: report.pdf 첨부 후 제출 버튼 누름'.
+        'Data structures HW 3: attach report.pdf, then press Submit'.
     """
     shot = cfg.files_dir / "browser" / f"approval-{tu.now_utc():%Y%m%d-%H%M%S}.png"
     try:
@@ -795,7 +795,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
 @server.tool()
 async def schedule_browser_run(when: str, instructions: str, mode: str, logins: str = "") -> str:
     """Schedule browser work for later, only when the user's own message asks for it (e.g.
-    "내일 9시에 이캠퍼스에서 과제 제출해줘"). The user approves the plan on Telegram first; that
+    "tomorrow at 9, hand in the assignment on the course site"). The user approves the plan on Telegram first; that
     also approves the listed logins for that run. At the time, a fresh agent does the work and
     Friday reports the result.
 
@@ -821,10 +821,10 @@ async def schedule_browser_run(when: str, instructions: str, mode: str, logins: 
     known = {n for n, _ in Vault(cfg.vault_dir).names()}
     if unknown := [n for n in names if n not in known]:
         return f"Not scheduled: no saved login named {', '.join(unknown)}. list_logins shows them."
-    how = {"approve": "준비 후 제출 전에 확인 요청", "auto": "확인 없이 자동 제출"}[mode]
+    how = {"approve": "prepare it, then ask you before submitting", "auto": "submit without asking"}[mode]
     status = await _ask("schedule", (
-        f"🗓 {tu.local_str(dt, tz)}에 브라우저 작업을 예약할까요?\n\n{instructions.strip()}\n\n"
-        f"로그인: {', '.join(names) or '없음'}\n방식: {how}"
+        f"🗓 Schedule a browser run for {tu.local_str(dt, tz)}?\n\n{instructions.strip()}\n\n"
+        f"Logins: {', '.join(names) or 'none'}\nMode: {how}"
     ))
     if status != "approved":
         return NOT_APPROVED[status]
@@ -832,19 +832,20 @@ async def schedule_browser_run(when: str, instructions: str, mode: str, logins: 
     return f"Scheduled browser run #{rid} for {tu.local_str(dt, tz)}. The user can see or cancel it with /runs."
 
 
-# --- watches ("이러면 알려줘", see watches.py) ----------------------------------
+# --- watches ("tell me when X", see watches.py) ----------------------------------
 
 
 @server.tool()
 async def add_watch(title: str, check: str, every: str, until: str = "", toolsets: str = "", logins: str = "") -> str:
     """Watch for a condition and tell the user when it is newly met, only when the user's own
-    message asks for it ("이캠퍼스에 새 공지 올라오면 알려줘", "PR에 리뷰 달리거나 CI 실패하면 알려줘",
-    "12월 20일 KTX 좌석 나오면 알려줘"). A plain time ("내일 9시에 알려줘") is a reminder instead.
+    message asks for it ("tell me when the course site posts a notice", "tell me if my PR gets a review
+    or CI fails", "tell me when a train seat opens up on Dec 20"). A plain time ("remind me at 9
+    tomorrow") is a reminder instead.
     The user approves the watch on Telegram first; that also approves the listed logins for its
     checks. Then a fresh agent checks it every interval, observing only, and Friday messages the
     user when it is triggered with something new.
 
-    title: a few words the user will recognize, e.g. '이캠퍼스 새 공지'.
+    title: a few words the user will recognize, e.g. 'course site notices'.
     check: the complete instruction for that unattended agent, which can't see this chat: where to
         look (URL, repo, route and date), what counts as the condition being met, and for "new"
         things, what to compare (e.g. the newest notice's title and date). Same language as the user.
@@ -890,11 +891,11 @@ async def add_watch(title: str, check: str, every: str, until: str = "", toolset
                 " (request_login adds one).")
     if store.active_watch_count() >= wt.MAX_ACTIVE:
         return f"Not added: {wt.MAX_ACTIVE} watches are already active. list_watches shows them; cancel one first."
-    end = f", {tu.local_str(expires, tz)}까지" if expires else ""
+    end = f", until {tu.local_str(expires, tz)}" if expires else ""
     status = await _ask("watch", (
-        f"🔔 이 조건을 지켜볼까요?\n\n{title}\n{check}\n\n"
-        f"확인: {wt.describe_every(every)}{end}\n도구: {', '.join(sets) or '없음'}\n"
-        f"로그인: {', '.join(names) or '없음'}\n(확인만 하고 제출·전송·구매는 하지 않아요)"
+        f"🔔 Watch for this?\n\n{title}\n{check}\n\n"
+        f"Checks: {wt.describe_every(every)}{end}\nTools: {', '.join(sets) or 'none'}\n"
+        f"Logins: {', '.join(names) or 'none'}\n(It only looks: no submitting, sending or buying.)"
     ))
     if status != "approved":
         return NOT_APPROVED[status]
@@ -912,7 +913,7 @@ def list_watches() -> str:
 
 @server.tool()
 def cancel_watch(watch_id: int) -> str:
-    """Stop a watch for good (the user can also tap 그만 보기 or use /watches)."""
+    """Stop a watch for good (the user can also tap Stop watching or use /watches)."""
     w = store.watch(watch_id)
     if not w or w["status"] in ("done", "failed"):
         return f"No active or paused watch #{watch_id}."

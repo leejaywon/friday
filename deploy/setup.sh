@@ -260,10 +260,13 @@ env_file() {
     return
   fi
 
+  local zone
+  zone=$(get_env FRIDAY_TZ)
+  [[ -n "$zone" ]] || zone=$(readlink /etc/localtime 2>/dev/null | sed 's#.*zoneinfo/##')  # this Mac's
   while :; do
-    ask value "Your timezone" "$(get_env FRIDAY_TZ)"
+    ask value "Your timezone" "$zone"
     [[ -f "/usr/share/zoneinfo/$value" ]] && break
-    info "Unknown timezone. Use a name like Asia/Seoul, Europe/Paris or America/New_York."
+    info "Unknown timezone. Use a name like Europe/Paris, America/New_York or Asia/Seoul."
   done
   [[ "$value" != "$(get_env FRIDAY_TZ)" ]] && set_env FRIDAY_TZ "$value"
   ok "timezone $value"

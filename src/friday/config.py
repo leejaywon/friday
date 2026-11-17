@@ -150,7 +150,7 @@ def _int_list(raw: str) -> tuple[int, ...]:
 
 def load_config() -> Config:
     load_dotenv(env_file(), override=False)
-    tz = os.environ.get("FRIDAY_TZ", "Asia/Seoul")
+    tz = (os.environ.get("FRIDAY_TZ") or "UTC").strip()
     ZoneInfo(tz)  # fail fast on a typo
     data_dir = Path(os.environ.get("FRIDAY_DATA_DIR") or PROJECT_ROOT / "data").expanduser().resolve()
     transcribe_key = os.environ.pop("TRANSCRIBE_API_KEY", "").strip()

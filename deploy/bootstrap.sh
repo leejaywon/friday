@@ -53,7 +53,7 @@ sudo -u "$APP_USER" -H bash -lc 'test -x ~/.local/bin/claude || curl -fsSL https
 
 echo "== browser: Playwright's Chromium for Friday (deploy/friday-browser.service)"
 PLAYWRIGHT=1.65.0  # keep in step with playwright in pyproject.toml
-apt-get install -yq fonts-noto-cjk libatomic1   # Korean in screenshots; Node bundled with the playwright package
+apt-get install -yq fonts-noto-cjk libatomic1   # CJK text in screenshots; Node bundled with the playwright package
 npx -y "playwright@$PLAYWRIGHT" install-deps chromium
 sudo -u "$APP_USER" -H bash -lc "npx -y playwright@$PLAYWRIGHT install chromium"
 # Like bwrap above: let this Chromium create user namespaces for its own sandbox, which matters

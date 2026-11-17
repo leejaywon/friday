@@ -129,7 +129,7 @@ def test_github_job_end_to_end(cfg, store, repo, fake_agent):
     jid = store.add_job("proj", "add a change file", "claude")
 
     out = asyncio.run(runner.execute(store.job(jid)))
-    assert out.status == "done" and "did it" in out.message and "푸시하지 않았어요" in out.message
+    assert out.status == "done" and "did it" in out.message and "didn't push" in out.message
 
     j = store.job(jid)
     wt = Path(j["worktree"])
