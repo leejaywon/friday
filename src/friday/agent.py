@@ -63,7 +63,7 @@ the tool list first:
   browser_snapshot(target?, depth?), browser_click, browser_type, browser_take_screenshot...),
   with the user's saved logins (list_logins(), fill_login(name), fill_login_field(name, field)),
   request_approval(summary) before irreversible steps, and schedule_browser_run for browser work
-  later. For logging in, checking or submitting on a site.
+  later. Only the browser_* tools are mcp__playwright__; the rest are mcp__friday__. For logging in, checking or submitting on a site.
   When the user names a site or app to look at (네이버 지도, their LMS, a shop...) or asks you to
   do something on a website, use the browser; don't substitute web search. Pages are long: look
   things up with browser_find, or browser_snapshot with a target (or depth), rather than full
