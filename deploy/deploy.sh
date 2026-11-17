@@ -32,13 +32,20 @@ main() {
     echo "Google Chrome Stable is missing. Run the browser setup in deploy/bootstrap.sh as root first." >&2
     return 1
   fi
+  for audio_tool in pulseaudio pactl ffmpeg ffprobe; do
+    if ! command -v "$audio_tool" >/dev/null; then
+      echo "Missing $audio_tool. Install pulseaudio pulseaudio-utils ffmpeg as root first." >&2
+      return 1
+    fi
+  done
   npm install -s --no-fund --no-audit --prefix ~/.local/share/friday/playwright-mcp \
     "$(grep -o '@playwright/mcp@[0-9.]*' src/friday/browser.py)"
   mkdir -p ~/.config/systemd/user
-  cp deploy/friday.service deploy/friday-browser.service \
+  cp deploy/friday.service deploy/friday-browser.service deploy/friday-audio.service \
     deploy/friday-mcp.service deploy/friday-playwright-mcp.service ~/.config/systemd/user/
   systemctl --user daemon-reload
   systemctl --user enable -q friday.service
+  systemctl --user enable -q --now friday-audio.service
   # Started if it isn't running, not restarted: that would interrupt a browser run in progress.
   # Browser binary/unit changes require an explicit restart after backing up its stopped profile.
   systemctl --user enable -q --now friday-browser.service

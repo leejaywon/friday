@@ -56,7 +56,7 @@ if [[ $(dpkg --print-architecture) != amd64 ]]; then
   echo "Friday's Google Chrome package requires an amd64 server." >&2
   exit 1
 fi
-apt-get install -yq fonts-noto-cjk libatomic1
+apt-get install -yq fonts-noto-cjk libatomic1 pulseaudio pulseaudio-utils ffmpeg
 if ! dpkg-query -W -f='${Status}' google-chrome-stable 2>/dev/null | grep -q 'install ok installed'; then
   chrome_deb=$(mktemp --suffix=.deb)
   curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o "$chrome_deb"

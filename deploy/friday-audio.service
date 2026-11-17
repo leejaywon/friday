@@ -1,0 +1,15 @@
+[Unit]
+Description=Friday's private browser audio output (PulseAudio)
+
+[Service]
+Type=notify
+RuntimeDirectory=friday-audio
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/pulseaudio --daemonize=no --exit-idle-time=-1 --use-pid-file=no --log-target=journal -n \
+  --load="module-native-protocol-unix socket=%t/friday-audio/native" \
+  --load="module-null-sink sink_name=friday_browser rate=48000 channels=2"
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

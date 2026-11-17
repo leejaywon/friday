@@ -23,6 +23,9 @@ A personal assistant that lives on your own server and talks to you over Telegra
 - **Browser**: shared headless Google Chrome on the server, with H.264/AAC playback and an
   encrypted login vault. It asks you on Telegram before the first login on each site and before
   anything irreversible, and can do browser work at a scheduled time (e.g. submit a form).
+- **Browser audio**: ask Friday to record the browser, save the M4A, or transcribe and explain
+  a lecture using your existing Groq/speech-to-text connection. Capture is on demand; recordings
+  stay on the server until you request a file or transcription.
 - **Watches**: "tell me when that website posts a new notice": Friday checks on a schedule and
   messages you only when something new matches.
 - **Coding jobs**: ask for a change to a project on the server; Claude Code or Codex does it in a
@@ -210,6 +213,40 @@ ssh friday 'cd ~/friday && .venv/bin/python deploy/check-browser.py'
 It opens and closes a test tab, serves generated samples on a temporary loopback port, and
 returns a nonzero exit code if H.264, AAC or combined playback fails. It does not require a
 speaker and does not read login cookies.
+
+### Browser audio recording
+
+`friday-audio.service` runs a private PulseAudio server with the `friday_browser` null sink.
+Chrome alone is configured to send output there; FFmpeg records its monitor source. Microphone
+input and other applications' default audio outputs are not captured. All audible Chrome tabs
+share that sink, so pause unrelated tabs before recording. Muted/paused media produces silence.
+
+Examples to send Friday:
+
+- "Record this lecture for 50 minutes."
+- "Stop the browser recording and send me the audio file."
+- "Transcribe the recording and explain the main points in Korean."
+- "What did the lecturer say about regularization?"
+
+The tools are `start_browser_recording`, `stop_browser_recording`, `browser_recording_status`,
+`list_browser_recordings`, `transcribe_browser_recording` and `read_browser_transcript`.
+Recording defaults to 60 minutes with a hard maximum of 120, and runs in its own systemd user
+unit so chat/MCP restarts don't interrupt it. No audio is recorded automatically. Recordings
+are saved under `files/browser-audio/<id>/` in the workspace: `recording.m4a`, five-minute M4A
+parts and (when requested) `transcript.txt`. `/files` and `send_file` can retrieve saved files.
+Call status after an automatic stop to finalize the combined M4A.
+
+Transcription uses the existing `TRANSCRIBE_*` configuration. It sends up to three five-minute
+parts per tool call, caches successful parts for retries, and skips near-silent parts. Repeat
+until `remaining_parts` is zero; the read tool pages through longer transcripts. Friday uses
+the text as source material for explanations and identifies partial recordings. Saving a
+recording alone does not trigger an upload or transcription. A recording/transcript remains
+on disk until the owner removes it; no automatic cleanup or retention deadline is applied.
+
+On older servers install `pulseaudio pulseaudio-utils ffmpeg` as root before deploying. Back up
+the stopped browser profile, then restart `friday-browser.service` once to apply its PulseAudio
+environment; normal deployments leave an already running browser alone. The existing Chrome
+profile and logins are retained.
 
 If you hit your ChatGPT plan's limits, `ssh -t friday 'codex login --with-api-key'` switches Codex
 to an OpenAI API key (`codex login --device-auth` switches back).

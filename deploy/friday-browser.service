@@ -1,7 +1,8 @@
 [Unit]
 Description=Friday's shared headless browser (Google Chrome, DevTools on 127.0.0.1:9222)
-After=network-online.target
+After=network-online.target friday-audio.service
 Wants=network-online.target
+Requires=friday-audio.service
 
 # Google Chrome Stable (deploy/bootstrap.sh installs it, with the AppArmor profile its sandbox
 # needs and a policy that blocks file:// pages). The profile in ~/friday-data/browser keeps
@@ -9,6 +10,8 @@ Wants=network-online.target
 # (src/friday/browser.py CDP_PORT) gives full control
 # of the logged-in browser, so it listens on 127.0.0.1 only.
 [Service]
+Environment=PULSE_SERVER=unix:%t/friday-audio/native
+Environment=PULSE_SINK=friday_browser
 ExecStart=/usr/bin/google-chrome-stable \
   --headless --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
   --user-data-dir=%h/friday-data/browser --restore-last-session --no-first-run --no-default-browser-check \
