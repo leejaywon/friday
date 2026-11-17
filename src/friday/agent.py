@@ -1,4 +1,5 @@
-"""Runs `codex exec` for one chat turn, resuming the chat's Codex thread when there is one."""
+"""Runs `codex exec` for one Codex turn, resuming the thread when there is one. Chat turns go
+to a long-lived `codex app-server` first (codex_server.py), with this as the fallback."""
 
 from __future__ import annotations
 
@@ -154,10 +155,6 @@ def instructions(cfg: Config) -> str:
     return cfg.instructions_path.read_text().rstrip() + "\n\n" + CAPABILITIES + "\n" + HARD_RULES + "\n" + VAGUE_TIMES
 
 
-def _toml_str(value: str) -> str:
-    return json.dumps(value)  # a JSON string is a valid TOML basic string
-
-
 GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 CODE_TOKEN_VAR = "FRIDAY_GITHUB_READ_TOKEN"
 
@@ -189,6 +186,123 @@ def available_toolsets(cfg: Config) -> list[str]:
     return [t for t, on in (("browser", cfg.browser_enabled), ("github", bool(github_read_token_var(cfg)))) if on]
 
 
+def codex_overrides(
+    cfg: Config,
+    run_id: int | None = None,
+    toolsets: frozenset[str] | set[str] = frozenset(),
+    chat: bool = False,
+    http: tuple[bool, bool] = (True, True),
+    watch_id: int | None = None,
+) -> dict[str, object]:
+    """Friday's Codex config for a run, as dotted config keys -> values: `-c key=value` for
+    `codex exec` (codex_args), a thread's `config` for `codex app-server` (codex_server.py).
+    The model and effort are not in it: they are per turn.
+
+    watch_id: a watch check (watches.py): read-only GitHub, no tools that change or ask anything.
+    toolsets: the optional ones to attach (TOOLSETS). chat: a Telegram chat turn, where
+    requests to the user don't wait for the answer (Friday continues the thread when it comes).
+    http: whether (Friday's, Playwright's) MCP servers are reached over their local HTTP
+    services (mcp_http) rather than started for this run on stdio."""
+    browser_on = "browser" in toolsets and cfg.browser_enabled
+    o: dict[str, object] = {
+        # No skills list: Friday uses none.
+        "skills.include_instructions": False,
+        # Codex reads the timezone from /etc/localtime (TZ is ignored), so it would tell the
+        # model the server's; the [Now: …] line in each message (bot._wrap) has the user's.
+        "include_environment_context_time": False,
+    }
+    if http[0]:
+        headers = {}
+        if run_id:  # a scheduled browser run: fill_login may use that run's pre-approved logins
+            headers[mcp_http.RUN_HEADER] = str(run_id)
+        elif watch_id:  # a watch check: likewise its watch's logins, and it never asks
+            headers[mcp_http.WATCH_HEADER] = str(watch_id)
+        elif chat:
+            headers[mcp_http.CHAT_HEADER] = "1"
+        o["mcp_servers.friday.url"] = mcp_http.url(mcp_http.friday_port())
+        o["mcp_servers.friday.bearer_token_env_var"] = mcp_http.TOKEN_VAR
+        o["mcp_servers.friday.http_headers"] = headers
+    else:
+        env = {"FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir), "FRIDAY_TZ": cfg.default_tz}
+        if run_id:
+            env["FRIDAY_RUN_ID"] = str(run_id)
+        elif watch_id:
+            env["FRIDAY_WATCH_ID"] = str(watch_id)
+        elif chat:
+            env["FRIDAY_CHAT"] = "1"
+        o["mcp_servers.friday.command"] = sys.executable
+        o["mcp_servers.friday.args"] = ["-m", "friday.mcp_server"]
+        o["mcp_servers.friday.env"] = env
+    hidden = ([] if browser_on else FRIDAY_BROWSER_TOOLS) + (["use_tools"] if run_id else [])
+    if watch_id:
+        hidden = list(dict.fromkeys(hidden + WATCH_HIDDEN_TOOLS))
+    if hidden:
+        o["mcp_servers.friday.disabled_tools"] = hidden
+    o.update({
+        # Friday's own tools run without a prompt; there is nobody at a terminal to approve them.
+        "mcp_servers.friday.default_tools_approval_mode": "approve",
+        # fill_login and request_approval may wait up to 5 minutes for the user's tap.
+        "mcp_servers.friday.tool_timeout_sec": 400,
+        "approval_policy": "never",
+        # Shell commands: write only in the workspace, no network, and no reading the vault, the
+        # browser's cookies or Friday's other secrets (MCP servers run outside this sandbox).
+        "permissions": {"friday-chat": {
+            "extends": ":workspace", "filesystem": {str(p): "deny" for p in browser.private_paths(cfg)}}},
+        "default_permissions": "friday-chat",
+        "web_search": cfg.web_search,
+        # Shell commands never get the tokens (GitHub's, Friday's MCP token), only Codex does.
+        "shell_environment_policy.exclude": ["*TOKEN*", "*KEY*", "*SECRET*"],
+    })
+    token_var = github_read_token_var(cfg)
+    if token_var and "github" in toolsets:
+        # GitHub's hosted MCP server. With only the coding token it is always read-only: chat reads,
+        # and changes go through coding jobs.
+        o["mcp_servers.github.url"] = GITHUB_MCP_URL
+        o["mcp_servers.github.bearer_token_env_var"] = token_var
+        o["mcp_servers.github.default_tools_approval_mode"] = "approve"
+        if cfg.github_readonly or token_var == CODE_TOKEN_VAR or watch_id:  # watch checks only read
+            o["mcp_servers.github.http_headers"] = {"X-MCP-Readonly": "true"}
+    if browser_on:
+        # The shared browser (deploy/friday-browser.service) through the Playwright MCP server.
+        if http[1]:
+            o["mcp_servers.playwright.url"] = mcp_http.url(mcp_http.playwright_port())
+            o["mcp_servers.playwright.startup_timeout_sec"] = 20
+        else:
+            pw = browser.playwright_mcp_command(cfg)
+            o["mcp_servers.playwright.command"] = pw[0]
+            o["mcp_servers.playwright.args"] = pw[1:]
+            o["mcp_servers.playwright.startup_timeout_sec"] = 60  # npx (no deploy.sh install) may download first
+        o["mcp_servers.playwright.disabled_tools"] = browser.BLOCKED_TOOLS
+        o["mcp_servers.playwright.default_tools_approval_mode"] = "approve"
+    extra = mcp_config.load(cfg.mcp_config)
+    if extra.problems:
+        log.warning("mcp.toml: %s", "; ".join(extra.problems))
+    o.update(extra.values)
+    return o
+
+
+# Codex features Friday uses none of; they cost ~6k tokens a turn (ChatGPT apps, plugins).
+DISABLED_FEATURES = ["--disable", "apps", "--disable", "plugins"]
+
+
+def mcp_endpoints(toolsets: frozenset[str] | set[str]) -> tuple[bool, bool]:
+    """codex_overrides' http: are the local MCP services (deploy/friday-mcp.service,
+    friday-playwright-mcp.service) up? Otherwise Codex starts the servers itself."""
+    return (mcp_http.listening(mcp_http.friday_port()),
+            "browser" in toolsets and mcp_http.listening(mcp_http.playwright_port()))
+
+
+def codex_env(cfg: Config, tz: str = "", http: bool = True) -> dict[str, str]:
+    """Codex's environment: the owner's timezone (for the agent's shell commands, `date`) and
+    the tokens only Codex gets (the shells don't: shell_environment_policy)."""
+    env = {**os.environ, "TZ": tz or cfg.default_tz}
+    if http:
+        env[mcp_http.TOKEN_VAR] = mcp_http.token(cfg)
+    if github_read_token_var(cfg) == CODE_TOKEN_VAR:
+        env[CODE_TOKEN_VAR] = cfg.github_code_token
+    return env
+
+
 def codex_args(
     cfg: Config,
     thread_id: str | None,
@@ -201,109 +315,20 @@ def codex_args(
     http: tuple[bool, bool] = (True, True),
     watch_id: int | None = None,
 ) -> list[str]:
-    """watch_id: a watch check (watches.py): read-only GitHub, no tools that change or ask anything.
-    toolsets: the optional ones to attach (TOOLSETS). chat: a Telegram chat turn, where
-    requests to the user don't wait for the answer (Friday continues the thread when it comes).
-    http: whether (Friday's, Playwright's) MCP servers are reached over their local HTTP
-    services (mcp_http) rather than started for this run on stdio."""
-    browser_on = "browser" in toolsets and cfg.browser_enabled
-    if http[0]:
-        headers = {}
-        if run_id:  # a scheduled browser run: fill_login may use that run's pre-approved logins
-            headers[mcp_http.RUN_HEADER] = str(run_id)
-        elif watch_id:  # a watch check: likewise its watch's logins, and it never asks
-            headers[mcp_http.WATCH_HEADER] = str(watch_id)
-        elif chat:
-            headers[mcp_http.CHAT_HEADER] = "1"
-        overrides = [
-            f"mcp_servers.friday.url={_toml_str(mcp_http.url(mcp_http.friday_port()))}",
-            f"mcp_servers.friday.bearer_token_env_var={_toml_str(mcp_http.TOKEN_VAR)}",
-            f"mcp_servers.friday.http_headers={mcp_config.toml_value(headers)}",
-        ]
-    else:
-        env = {"FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir), "FRIDAY_TZ": cfg.default_tz}
-        if run_id:
-            env["FRIDAY_RUN_ID"] = str(run_id)
-        elif watch_id:
-            env["FRIDAY_WATCH_ID"] = str(watch_id)
-        elif chat:
-            env["FRIDAY_CHAT"] = "1"
-        overrides = [
-            f"mcp_servers.friday.command={_toml_str(sys.executable)}",
-            'mcp_servers.friday.args=["-m", "friday.mcp_server"]',
-            f"mcp_servers.friday.env={mcp_config.toml_value(env)}",
-        ]
-    hidden = ([] if browser_on else FRIDAY_BROWSER_TOOLS) + (["use_tools"] if run_id else [])
-    if watch_id:
-        hidden = list(dict.fromkeys(hidden + WATCH_HIDDEN_TOOLS))
-    if hidden:
-        overrides.append(f"mcp_servers.friday.disabled_tools={mcp_config.toml_value(hidden)}")
-    overrides += [
-        # Friday's own tools run without a prompt; there is nobody at a terminal to approve them.
-        'mcp_servers.friday.default_tools_approval_mode="approve"',
-        # fill_login and request_approval may wait up to 5 minutes for the user's tap.
-        "mcp_servers.friday.tool_timeout_sec=400",
-        'approval_policy="never"',
-        # Shell commands: write only in the workspace, no network, and no reading the vault, the
-        # browser's cookies or Friday's other secrets (MCP servers run outside this sandbox).
-        "permissions={friday-chat=" + mcp_config.toml_value({
-            "extends": ":workspace", "filesystem": {str(p): "deny" for p in browser.private_paths(cfg)}}) + "}",
-        'default_permissions="friday-chat"',
-        f"web_search={_toml_str(cfg.web_search)}",
-        # Shell commands never get the tokens (GitHub's, Friday's MCP token), only Codex does.
-        'shell_environment_policy.exclude=["*TOKEN*", "*KEY*", "*SECRET*"]',
-    ]
-    token_var = github_read_token_var(cfg)
-    if token_var and "github" in toolsets:
-        # GitHub's hosted MCP server. With only the coding token it is always read-only: chat reads,
-        # and changes go through coding jobs.
-        overrides += [
-            f"mcp_servers.github.url={_toml_str(GITHUB_MCP_URL)}",
-            f"mcp_servers.github.bearer_token_env_var={_toml_str(token_var)}",
-            'mcp_servers.github.default_tools_approval_mode="approve"',
-        ]
-        if cfg.github_readonly or token_var == CODE_TOKEN_VAR or watch_id:  # watch checks only read
-            overrides.append('mcp_servers.github.http_headers={"X-MCP-Readonly" = "true"}')
-    if browser_on:
-        # The shared browser (deploy/friday-browser.service) through the Playwright MCP server.
-        if http[1]:
-            overrides += [
-                f"mcp_servers.playwright.url={_toml_str(mcp_http.url(mcp_http.playwright_port()))}",
-                "mcp_servers.playwright.startup_timeout_sec=20",
-            ]
-        else:
-            pw = browser.playwright_mcp_command(cfg)
-            overrides += [
-                f"mcp_servers.playwright.command={_toml_str(pw[0])}",
-                f"mcp_servers.playwright.args={mcp_config.toml_value(pw[1:])}",
-                "mcp_servers.playwright.startup_timeout_sec=60",  # npx (no deploy.sh install) may download first
-            ]
-        overrides += [
-            f"mcp_servers.playwright.disabled_tools={mcp_config.toml_value(browser.BLOCKED_TOOLS)}",
-            'mcp_servers.playwright.default_tools_approval_mode="approve"',
-        ]
-    extra = mcp_config.load(cfg.mcp_config)
-    if extra.problems:
-        log.warning("mcp.toml: %s", "; ".join(extra.problems))
-    overrides += extra.overrides
+    """The `codex exec` command line for a run (see codex_overrides)."""
+    overrides = codex_overrides(cfg, run_id, toolsets, chat, http, watch_id)
     model = model or cfg.codex_model
     effort = effort or cfg.codex_effort
     if model:
-        overrides.append(f"model={_toml_str(model)}")
+        overrides["model"] = model
     if effort:
-        overrides.append(f"model_reasoning_effort={_toml_str(effort)}")
-
+        overrides["model_reasoning_effort"] = effort
     args = [cfg.codex_bin, "exec"]
     if thread_id:
         args += ["resume", thread_id]
-    # No ChatGPT apps, plugins or skills list: Friday uses none, and they cost ~6k tokens a turn.
-    args += ["--json", "--skip-git-repo-check", "--disable", "apps", "--disable", "plugins",
-             "-c", "skills.include_instructions=false",
-             # Codex reads the timezone from /etc/localtime (TZ is ignored), so it would tell the
-             # model the server's; the [Now: …] line in each message (bot._wrap) has the user's.
-             "-c", "include_environment_context_time=false"]
-    for o in overrides:
-        args += ["-c", o]
+    args += ["--json", "--skip-git-repo-check", *DISABLED_FEATURES]
+    for k, v in overrides.items():
+        args += ["-c", f"{k}={mcp_config.toml_value(v)}"]
     for img in images:
         args += ["-i", str(img)]
     return args + ["-"]  # prompt comes from stdin
@@ -366,16 +391,9 @@ async def run_codex(
     tz: str = "",
 ) -> AgentResult:
     """tz: the owner's timezone (Store.tz), for the agent's shell commands (`date`)."""
-    # The local MCP services (deploy/friday-mcp.service, friday-playwright-mcp.service) when they
-    # are up; otherwise Codex starts the servers itself, as before they existed.
-    http = (mcp_http.listening(mcp_http.friday_port()),
-            "browser" in toolsets and mcp_http.listening(mcp_http.playwright_port()))
+    http = mcp_endpoints(toolsets)
     args = codex_args(cfg, thread_id, images or [], model, effort, run_id, toolsets, chat, http, watch_id=watch_id)
-    env = {**os.environ, "TZ": tz or cfg.default_tz}
-    if http[0]:
-        env[mcp_http.TOKEN_VAR] = mcp_http.token(cfg)
-    if github_read_token_var(cfg) == CODE_TOKEN_VAR:
-        env[CODE_TOKEN_VAR] = cfg.github_code_token
+    env = codex_env(cfg, tz, http[0])
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=cfg.workspace,

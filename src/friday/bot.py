@@ -40,6 +40,7 @@ from . import botapi, browser, gcal, mcp_config
 from . import timeutil as tu
 from . import workspace as wsfiles
 from .agent import AgentResult, instructions, run_codex
+from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
 from .jobs import JobError, Outcome, Runner, github_slug, parse_code_args, short
@@ -83,6 +84,9 @@ MAX_CONTINUATIONS = 2
 CANCEL_TEXT = "취소"
 # A one-line reply that only says a request was sent; the user sees the request itself.
 REQUEST_ECHO = re.compile(r"보냈|보낼게|요청|입력|폼|양식|sent|request|form|fill in|enter", re.I)
+# Before the message when a chat turn is retried with `codex exec` after the app-server died mid-turn.
+RETRY_NOTE = ("[Your previous attempt at this message was cut off by an error after you had started using tools. "
+              "Check what was already done (e.g. list_reminders, list_tasks) before doing anything again.]\n")
 VOICE_NOTE = "[The user sent this as a voice message; it was transcribed automatically and may contain recognition errors.]\n"
 HELP = """\
 편하게 한국어나 영어로 말해주세요. 할 일과 마감, 리마인더, Google 캘린더 일정, 기억해 둘 것,
@@ -159,6 +163,8 @@ class Friday(WatchBot):
         ensure_dirs(cfg)
         self.store = Store(cfg.db_path)
         self.agent_lock = asyncio.Lock()
+        # Chat turns' Codex: one app-server process, started on the first message (codex_server.py)
+        self.codex = CodexServer(cfg) if cfg.codex_server else None
         self.app: Application | None = None
         self._tasks: list[asyncio.Task] = []
         self.runner = Runner(cfg, self.store)
@@ -247,6 +253,8 @@ class Friday(WatchBot):
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self.codex:
+            await self.codex.close()
         self.store.close()
 
     @staticmethod
@@ -357,17 +365,7 @@ class Friday(WatchBot):
                 for step in range(MAX_CONTINUATIONS + 1):
                     toolsets = self._toolsets()
                     try:
-                        result = await run_codex(
-                            self.cfg,
-                            prompt,
-                            thread,
-                            (images or []) if step == 0 else [],
-                            model=self.store.get("model") or "",
-                            effort=self.store.get("effort") or "",
-                            toolsets=toolsets,
-                            chat=True,
-                            tz=self.tz,
-                        )
+                        result = await self._codex_turn(prompt, thread, (images or []) if step == 0 else [], toolsets)
                     except Exception as e:  # e.g. codex binary missing
                         log.exception("codex run failed")
                         result = AgentResult("", thread, [repr(e)])
@@ -393,6 +391,19 @@ class Friday(WatchBot):
             detail = "; ".join(result.errors) or "no reply"
             await self.say(f"Codex 오류: {detail[:1500]}\n계속 이러면 /new 를 보내주세요.", chat_id)
         await self.outbox_loop()
+
+    async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str]) -> AgentResult:
+        """One chat turn: in the app-server, or with `codex exec` when it is off or failed."""
+        kw = dict(model=self.store.get("model") or "", effort=self.store.get("effort") or "", toolsets=toolsets,
+                  tz=self.tz)
+        if self.codex:
+            try:
+                return await self.codex.run(prompt, thread, images, **kw)
+            except CodexServerError as e:
+                log.warning("codex app-server failed, retrying with codex exec: %s", e)
+                if e.partial:
+                    prompt = RETRY_NOTE + prompt
+        return await run_codex(self.cfg, prompt, thread, images, chat=True, **kw)
 
     @staticmethod
     def _worth_sending(text: str, made_request: bool, made_proposal: bool = False) -> bool:

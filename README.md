@@ -2,7 +2,7 @@
 
 A personal assistant that lives on your VPS and talks to you over Telegram (iPhone and Mac).
 
-- **Chat** in Korean or English. Codex answers using your ChatGPT plan (`codex exec`).
+- **Chat** in Korean or English. Codex answers using your ChatGPT plan (`codex app-server`).
 - **Reminders** that always arrive: a scheduler on the server sends them, independent of the AI.
   Repeats are supported ("every weekday at 9").
 - **Google Calendar**: read and add events, heads-up before meetings, morning brief.
@@ -24,12 +24,20 @@ Everything (code, SQLite database, files) stays on your server. The bot polls Te
 inbound ports are open apart from SSH.
 
 ```
-iPhone / Mac ── Telegram ──► friday bot (systemd) ──► codex exec ──► friday MCP tools ──► SQLite
-                                     │                     │                             ▲
+iPhone / Mac ── Telegram ──► friday bot (systemd) ──► codex app-server ──► friday MCP tools ──► SQLite
+                                     │                     │                                   ▲
                                      │                     └──► Playwright MCP ──► Chromium (systemd)
                                      └── reminder / calendar / brief / browser-run loops ┘
 Claude iPhone app ──► claude remote-control (tmux, systemd)
 ```
+
+Chat messages go to one long-lived `codex app-server` process that the bot starts with the first
+message and keeps the conversation's Codex thread loaded in, so a short reply takes a couple of
+seconds instead of starting Codex for every message. If it can't start or dies mid-turn, the bot
+restarts it on the next message and answers the current one with `codex exec` instead (also used
+for scheduled browser runs, watch checks and `friday ask`). The bot restarts the app-server when
+Codex is upgraded or your timezone changes. `FRIDAY_CODEX_SERVER=false` in `.env.server` turns it
+off (always `codex exec`).
 
 ## Quick start
 

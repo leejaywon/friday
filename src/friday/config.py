@@ -58,6 +58,9 @@ class Config:
     transcribe_timeout_seconds: float = 120.0
     # The shared browser (deploy/friday-browser.service) for the chat agent. Env: FRIDAY_BROWSER
     browser_enabled: bool = True
+    # Chat turns in one long-lived `codex app-server` (codex_server.py) rather than a `codex exec`
+    # per message; exec stays the fallback. Env: FRIDAY_CODEX_SERVER
+    codex_server: bool = True
     # From my.telegram.org: set = the bot talks to the local Bot API server (botapi.py,
     # deploy/friday-botapi.service), for files up to 2 GB. Env: TELEGRAM_API_ID, TELEGRAM_API_HASH
     telegram_api_id: str = ""
@@ -215,6 +218,7 @@ def load_config() -> Config:
         file_download_wait_seconds=float(os.environ.get("FILE_DOWNLOAD_WAIT_SECONDS", "10")),
         transcribe_timeout_seconds=float(os.environ.get("TRANSCRIBE_TIMEOUT_SECONDS", "120")),
         browser_enabled=os.environ.get("FRIDAY_BROWSER", "true").strip().lower() not in ("0", "false", "no", "off"),
+        codex_server=os.environ.get("FRIDAY_CODEX_SERVER", "true").strip().lower() not in ("0", "false", "no", "off"),
         telegram_api_id=os.environ.get("TELEGRAM_API_ID", "").strip(),
         telegram_api_hash=os.environ.pop("TELEGRAM_API_HASH", "").strip(),
         form_url=_form_url(),

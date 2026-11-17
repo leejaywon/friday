@@ -1,4 +1,4 @@
-"""Extra MCP servers from ~/friday-data/mcp.toml, turned into `codex -c` overrides.
+"""Extra MCP servers from ~/friday-data/mcp.toml, turned into Codex config overrides.
 
 The file is read on every Codex run, so editing it needs no restart. It lives outside the
 workspace, so Friday itself can't change it.
@@ -35,9 +35,14 @@ _OWN_KEYS = {"enabled", "approve", "env_from"}
 
 @dataclass
 class ExtraServers:
-    overrides: list[str] = field(default_factory=list)
+    values: dict[str, object] = field(default_factory=dict)  # dotted config key -> value
     names: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+
+    @property
+    def overrides(self) -> list[str]:
+        """As `codex -c` arguments."""
+        return [f"{k}={toml_value(v)}" for k, v in self.values.items()]
 
 
 def toml_value(v) -> str:
@@ -96,9 +101,11 @@ def load(path: Path) -> ExtraServers:
             settings["default_tools_approval_mode"] = "approve"
 
         try:
-            out.overrides += [f"mcp_servers.{name}.{k}={toml_value(v)}" for k, v in settings.items()]
+            for v in settings.values():
+                toml_value(v)  # fails on values TOML can't hold
         except ValueError as e:
             out.problems.append(f"{name}: {e}")
             continue
+        out.values.update({f"mcp_servers.{name}.{k}": v for k, v in settings.items()})
         out.names.append(name)
     return out

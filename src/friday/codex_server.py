@@ -1,0 +1,411 @@
+"""Chat turns in one long-lived `codex app-server` process instead of a `codex exec` per turn.
+
+`codex exec resume` starts Codex, reloads the thread and reconnects the MCP servers on every
+message (~6 s before the model even starts). The app-server keeps the chat's thread loaded, so a
+short reply takes ~2 s. It speaks newline-delimited JSON-RPC on stdin/stdout: initialize, then
+thread/start or thread/resume (with the same config codex_args passes as `-c`, see
+agent.codex_overrides), then turn/start per message; the reply streams back as notifications.
+
+A thread's MCP servers (and their HTTP headers) are fixed while it is loaded, and resuming a
+loaded thread ignores new config. So when a turn needs a different config (the agent turned on a
+toolset with use_tools, a local MCP service went down, mcp.toml changed), the thread is
+unsubscribed, unloaded (thread_unload_delay_secs after that) and resumed with the new config.
+
+Failures of the server itself (it can't start, it died, it broke the protocol) raise
+CodexServerError, and the caller falls back to `codex exec` (agent.run_codex). Failures of the
+turn (model errors, timeouts) come back in AgentResult.errors, as from run_codex.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import signal
+import time
+from collections import deque
+from pathlib import Path
+
+from .agent import DISABLED_FEATURES, AgentResult, codex_env, codex_overrides, mcp_endpoints
+from .config import Config
+
+log = logging.getLogger(__name__)
+
+UNLOAD_DELAY_SECONDS = 1  # how long the server keeps an unsubscribed thread loaded
+UNLOAD_WAIT_SECONDS = 15  # waiting for that before giving up and restarting the server
+REQUEST_TIMEOUT = 30
+THREAD_TIMEOUT = 120  # thread/start and thread/resume connect the thread's MCP servers
+INTERRUPT_WAIT_SECONDS = 15
+VERSION_CHECK_SECONDS = 600  # how often `codex --version` is compared with the running server's
+RETRY_START_AFTER = 600  # after the server failed to start, use `codex exec` for this long
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Items that aren't tool calls; any other item means the turn has started doing things.
+NOT_TOOLS = {"userMessage", "agentMessage", "reasoning", "plan", "hookPrompt", "contextCompaction"}
+
+
+class CodexServerError(Exception):
+    """The app-server failed, not the turn. partial: the failed turn had already called tools."""
+
+    def __init__(self, message: str, partial: bool = False):
+        super().__init__(message)
+        self.partial = partial
+
+
+def _version(text: str) -> str:
+    m = re.search(r"\d+\.\d+\.\d+\S*", text or "")
+    return m.group(0) if m else ""
+
+
+class CodexServer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.proc: asyncio.subprocess.Process | None = None
+        self.version = ""  # what the running server reported in initialize
+        self._env: tuple = ()  # what the running server was started with (TZ)
+        self._reader: asyncio.Task | None = None
+        self._err_reader: asyncio.Task | None = None
+        self._stderr: deque[str] = deque(maxlen=20)
+        self._next_id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._turns: dict[str, asyncio.Queue] = {}  # thread id -> notifications for its running turn
+        self._closed: dict[str, asyncio.Event] = {}  # thread id -> set by thread/closed
+        self._loaded: dict[str, dict] = {}  # thread id -> the config it was loaded with
+        self._lock = asyncio.Lock()  # one turn at a time
+        self._checked_at = 0.0
+        self._broken_until = 0.0
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None and bool(self._reader) and not self._reader.done()
+
+    # --- process --------------------------------------------------------------
+
+    async def _start(self, tz: str) -> None:
+        args = [self.cfg.codex_bin, "app-server", *DISABLED_FEATURES,
+                "-c", f"thread_unload_delay_secs={UNLOAD_DELAY_SECONDS}"]
+        self._stderr.clear()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *args, cwd=self.cfg.workspace, env=codex_env(self.cfg, tz),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                limit=1 << 24,  # one JSON line can hold a whole tool result
+                start_new_session=True,  # its own process group: stop() also ends its MCP servers
+            )
+        except OSError as e:
+            raise CodexServerError(f"can't start codex app-server: {e}") from e
+        self._env = (tz, self.cfg.codex_bin)
+        self._reader = asyncio.create_task(self._read(self.proc), name="codex-app-server")
+        self._err_reader = asyncio.create_task(self._read_stderr(self.proc), name="codex-app-server-stderr")
+        try:
+            init = await self._request("initialize", {
+                "clientInfo": {"name": "friday", "title": "Friday", "version": "1"},
+                "capabilities": {"experimentalApi": True}})
+        except CodexServerError:
+            await self._stop()
+            raise
+        self._notify("initialized")
+        self.version = _version(init.get("userAgent", ""))
+        self._checked_at = time.monotonic()
+        log.info("codex app-server started (pid %s, %s)", self.proc.pid, init.get("userAgent"))
+
+    async def _stop(self) -> None:
+        proc, self.proc = self.proc, None
+        self._loaded.clear()
+        if proc and proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except TimeoutError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                await proc.wait()
+        for t in (self._reader, self._err_reader):
+            if t:
+                t.cancel()
+        self._fail_all(CodexServerError("codex app-server stopped"))
+
+    async def close(self) -> None:
+        """Stop the server (Friday is shutting down)."""
+        await self._stop()
+
+    async def installed_version(self) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            self.cfg.codex_bin, "--version", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), 20)
+        return _version(out.decode(errors="replace"))
+
+    async def _ensure(self, tz: str) -> None:
+        """A running server for this turn: restarted if it died, the timezone changed or Codex
+        was upgraded since it started."""
+        if self.running:
+            restart = ""
+            if self._env != (tz, self.cfg.codex_bin):
+                restart = "settings changed"
+            elif time.monotonic() - self._checked_at > VERSION_CHECK_SECONDS:
+                self._checked_at = time.monotonic()
+                try:
+                    installed = await self.installed_version()
+                except (OSError, TimeoutError) as e:
+                    installed = ""
+                    log.warning("codex --version failed: %s", e)
+                if installed and installed != self.version:
+                    restart = f"codex {self.version} -> {installed}"
+            if not restart:
+                return
+            log.info("restarting codex app-server: %s", restart)
+            await self._stop()
+        elif self.proc:
+            await self._stop()  # it died: clean up before starting again
+        if time.monotonic() < self._broken_until:
+            raise CodexServerError("codex app-server failed to start recently")
+        try:
+            await self._start(tz)
+        except CodexServerError:
+            self._broken_until = time.monotonic() + RETRY_START_AFTER
+            raise
+
+    # --- JSON-RPC -----------------------------------------------------------------
+
+    def _send(self, obj: dict) -> None:
+        if not self.running:
+            raise CodexServerError("codex app-server is not running")
+        self.proc.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode())  # type: ignore[union-attr]
+
+    def _notify(self, method: str, params: dict | None = None) -> None:
+        self._send({"method": method, **({"params": params} if params is not None else {})})
+
+    async def _request(self, method: str, params: dict, timeout: float = REQUEST_TIMEOUT) -> dict:
+        self._next_id += 1
+        rid = self._next_id
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[rid] = fut
+        try:
+            self._send({"id": rid, "method": method, "params": params})
+            msg = await asyncio.wait_for(fut, timeout)
+        except TimeoutError:
+            raise CodexServerError(f"codex app-server didn't answer {method} within {timeout}s") from None
+        finally:
+            self._pending.pop(rid, None)
+        if "error" in msg:
+            raise CodexServerError(f"{method}: {msg['error'].get('message') or msg['error']}")
+        return msg.get("result") or {}
+
+    async def _read(self, proc: asyncio.subprocess.Process) -> None:
+        try:
+            while line := await proc.stdout.readline():  # type: ignore[union-attr]
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    log.debug("codex app-server: %s", line[:200])
+                    continue
+                if "method" in msg and "id" in msg:
+                    self._answer(msg)
+                elif "id" in msg:
+                    fut = self._pending.get(msg["id"])
+                    if fut and not fut.done():
+                        fut.set_result(msg)
+                else:
+                    self._route(msg)
+        except (ValueError, OSError) as e:  # e.g. a line over the limit
+            log.warning("codex app-server output unreadable: %s", e)
+        try:
+            code = await asyncio.wait_for(proc.wait(), 2)
+        except TimeoutError:
+            code = "output closed"  # _ensure stops it before the next turn
+        tail = " | ".join(list(self._stderr)[-2:])
+        if self.proc is proc:
+            log.warning("codex app-server exited (%s): %s", code, tail)
+            self._loaded.clear()
+            self._fail_all(CodexServerError(f"codex app-server exited ({code})" + (f": {tail}" if tail else "")))
+
+    async def _read_stderr(self, proc: asyncio.subprocess.Process) -> None:
+        while line := await proc.stderr.readline():  # type: ignore[union-attr]
+            text = ANSI.sub("", line.decode(errors="replace")).rstrip()
+            if text:
+                self._stderr.append(text[:300])
+                log.debug("codex app-server stderr: %s", text)
+
+    def _fail_all(self, err: CodexServerError) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(err)
+        for q in self._turns.values():
+            q.put_nowait(err)
+
+    def _answer(self, msg: dict) -> None:
+        """Requests from the server. With approval_policy="never" none should ask for approval;
+        anything that does is declined, as nobody is at a terminal to answer."""
+        method = msg["method"]
+        if method == "currentTime/read":
+            reply = {"id": msg["id"], "result": {"currentTimeAt": int(time.time())}}
+        else:
+            log.warning("codex app-server asked %s; declined", method)
+            reply = {"id": msg["id"], "error": {"code": -32601, "message": "not supported by Friday"}}
+        try:
+            self._send(reply)
+        except CodexServerError:
+            pass
+
+    def _route(self, msg: dict) -> None:
+        params = msg.get("params") or {}
+        tid = params.get("threadId")
+        if msg.get("method") == "thread/closed" and tid:
+            self._loaded.pop(tid, None)
+            if ev := self._closed.get(tid):
+                ev.set()
+        if tid and (q := self._turns.get(tid)):
+            q.put_nowait(msg)
+
+    # --- threads ------------------------------------------------------------------
+
+    async def _unload(self, tid: str, wait: bool) -> None:
+        """Unsubscribe from a thread; with wait, until the server has unloaded it."""
+        ev = self._closed[tid] = asyncio.Event()
+        try:
+            r = await self._request("thread/unsubscribe", {"threadId": tid})
+            self._loaded.pop(tid, None)
+            if wait and r.get("status") == "unsubscribed":
+                try:
+                    await asyncio.wait_for(ev.wait(), UNLOAD_WAIT_SECONDS)
+                except TimeoutError:
+                    # Resuming it now would keep the old config: start over instead.
+                    log.warning("codex app-server didn't unload thread %s; restarting it", tid)
+                    tz = self._env[0]
+                    await self._stop()
+                    await self._start(tz)
+        finally:
+            self._closed.pop(tid, None)
+
+    async def _open(self, thread_id: str | None, config: dict, model: str) -> str:
+        """The thread to run the turn in, loaded with this config."""
+        if thread_id and thread_id in self._loaded:
+            if self._loaded[thread_id] == config:
+                return thread_id
+            log.info("reloading thread %s with new config", thread_id)
+            await self._unload(thread_id, wait=True)
+        for other in [t for t in self._loaded if t != thread_id]:  # one chat thread loaded at a time
+            await self._unload(other, wait=False)
+        params: dict = {"cwd": str(self.cfg.workspace), "config": config}
+        if model:
+            params["model"] = model
+        if thread_id:
+            r = await self._request("thread/resume", {**params, "threadId": thread_id, "excludeTurns": True},
+                                    THREAD_TIMEOUT)
+        else:
+            r = await self._request("thread/start", {**params, "ephemeral": False}, THREAD_TIMEOUT)
+        tid = (r.get("thread") or {}).get("id") or thread_id
+        if not tid:
+            raise CodexServerError("codex app-server returned no thread id")
+        self._loaded[tid] = config
+        return tid
+
+    # --- turns --------------------------------------------------------------------
+
+    async def run(
+        self,
+        prompt: str,
+        thread_id: str | None = None,
+        images: list[Path] | None = None,
+        model: str = "",
+        effort: str = "",
+        toolsets: frozenset[str] | set[str] = frozenset(),
+        tz: str = "",
+        chat: bool = True,
+    ) -> AgentResult:
+        """One turn, like agent.run_codex. Raises CodexServerError when the server fails."""
+        async with self._lock:
+            try:
+                await self._ensure(tz or self.cfg.default_tz)
+                config = codex_overrides(self.cfg, toolsets=toolsets, chat=chat, http=mcp_endpoints(toolsets))
+                model = model or self.cfg.codex_model
+                tid = await self._open(thread_id, config, model)
+                return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort)
+            except CodexServerError:
+                # The caller retries with `codex exec`, which writes to the thread on disk: the
+                # next turn here starts over and reloads it rather than using a stale copy.
+                await self._stop()
+                raise
+
+    async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str) -> AgentResult:
+        q: asyncio.Queue = asyncio.Queue()
+        self._turns[tid] = q
+        messages: list[str] = []
+        errors: list[str] = []
+        servers: set[str] = set()
+        tokens, partial, turn_id = 0, False, ""
+        try:
+            params: dict = {"threadId": tid, "input": [{"type": "localImage", "path": str(p)} for p in images]
+                            + [{"type": "text", "text": prompt, "text_elements": []}]}
+            if model:
+                params["model"] = model
+            if effort:
+                params["effort"] = effort
+            turn_id = (await self._request("turn/start", params)).get("turn", {}).get("id", "")
+            deadline = time.monotonic() + self.cfg.codex_timeout_seconds
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), max(0.0, deadline - time.monotonic()))
+                except TimeoutError:
+                    await self._interrupt(tid, turn_id, q)
+                    return AgentResult("", tid, [f"Codex took longer than {self.cfg.codex_timeout_seconds}s and was stopped."],
+                                       servers, tokens)
+                if isinstance(msg, CodexServerError):
+                    raise CodexServerError(str(msg), partial)
+                method, p = msg.get("method"), msg.get("params") or {}
+                if p.get("turnId") not in (None, turn_id) and method != "turn/completed":
+                    continue
+                item = p.get("item") or {}
+                if method == "item/started" and item.get("type") not in NOT_TOOLS:
+                    partial = True
+                elif method == "item/completed" and item.get("type") == "agentMessage":
+                    messages.append(item.get("text", ""))
+                elif method == "item/completed" and item.get("type") == "mcpToolCall":
+                    servers.add(item.get("server") or "")
+                elif method == "thread/tokenUsage/updated":
+                    # The last model request's input: the context size (as agent.last_request_tokens).
+                    tokens = int(((p.get("tokenUsage") or {}).get("last") or {}).get("inputTokens") or tokens)
+                elif method == "error" and not p.get("willRetry"):
+                    errors.append(str((p.get("error") or {}).get("message") or "error"))
+                elif method == "turn/completed":
+                    turn = p.get("turn") or {}
+                    if turn.get("id") not in (None, "", turn_id):
+                        continue
+                    status = turn.get("status")
+                    err = str((turn.get("error") or {}).get("message") or "")
+                    if status == "failed" and err not in errors:
+                        errors.append(err or "turn failed")
+                    elif status == "interrupted":
+                        errors.append(err or "the turn was interrupted")
+                    break
+        except asyncio.CancelledError:  # e.g. Friday is stopping: don't leave the turn running
+            if turn_id:
+                try:
+                    self._send({"id": 0, "method": "turn/interrupt", "params": {"threadId": tid, "turnId": turn_id}})
+                except CodexServerError:
+                    pass
+            raise
+        finally:
+            self._turns.pop(tid, None)
+        if errors:
+            log.warning("codex errors: %s", errors)
+        return AgentResult((messages[-1] if messages else "").strip(), tid, errors, servers, tokens)
+
+    async def _interrupt(self, tid: str, turn_id: str, q: asyncio.Queue) -> None:
+        """Stop a turn that ran too long; restart the server if it doesn't stop."""
+        try:
+            await self._request("turn/interrupt", {"threadId": tid, "turnId": turn_id})
+            end = time.monotonic() + INTERRUPT_WAIT_SECONDS
+            while True:
+                msg = await asyncio.wait_for(q.get(), max(0.0, end - time.monotonic()))
+                if isinstance(msg, CodexServerError) or msg.get("method") == "turn/completed":
+                    return
+        except (CodexServerError, TimeoutError):
+            log.warning("codex app-server didn't stop turn %s; restarting it", turn_id)
+            await self._stop()

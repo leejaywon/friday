@@ -12,6 +12,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("FRIDAY_ENV", str(tmp_path / "none.env"))
     monkeypatch.setenv("FRIDAY_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("FRIDAY_TZ", "Asia/Seoul")
+    monkeypatch.setenv("FRIDAY_CODEX_SERVER", "false")  # tests that want it use a fake (test_codex_server.py)
     for k in ("GITHUB_TOKEN", "GITHUB_CODE_TOKEN", "TRANSCRIBE_API_KEY", "TRANSCRIBE_PROVIDER",
               "CODEX_TIMEOUT_SECONDS", "CODEX_TIMEOUT_S", "CODE_JOB_TIMEOUT_SECONDS", "CODE_JOB_TIMEOUT_S"):
         monkeypatch.delenv(k, raising=False)
