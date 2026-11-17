@@ -22,6 +22,7 @@ from mcp.server.mcpserver import Context
 
 from . import browser, gcal, mcp_http
 from . import timeutil as tu
+from . import watches as wt
 from . import workspace as wsfiles
 from .config import ensure_dirs, load_config
 from .db import Store
@@ -37,7 +38,16 @@ cfg = load_config()
 ensure_dirs(cfg)
 store = Store(cfg.db_path)
 
-server = MCPServer(
+class _PlainServer(MCPServer):
+    """Tools return their text only. By default a `-> str` tool also returns it as structured
+    output, and Codex keeps both copies in the conversation."""
+
+    def add_tool(self, fn, **kwargs) -> None:
+        kwargs["structured_output"] = kwargs.get("structured_output") or False
+        super().add_tool(fn, **kwargs)
+
+
+server = _PlainServer(
     "friday",
     instructions=(
         "Personal assistant tools. Times are ISO 8601; a time without an offset is read as the "
@@ -67,30 +77,36 @@ def _run_id(ctx: Context | None) -> int:
     return int(raw) if raw.isdigit() else 0
 
 
+def _watch_id(ctx: Context | None) -> int:
+    """The watch whose check this call belongs to (watches.py), or 0."""
+    raw = _context(ctx, mcp_http.WATCH_HEADER, "FRIDAY_WATCH_ID")
+    return int(raw) if raw.isdigit() else 0
+
+
 def _in_chat(ctx: Context | None) -> bool:
     """A Telegram chat turn: requests to the user return at once and the bot continues the
     thread with the answer. Scheduled runs (nobody chatting) and other clients wait instead."""
     return bool(_context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")) and not _run_id(ctx)
 
 
-TOOLSETS = ("browser", "github")
+TOOLSETS = ("github",)  # the browser is always attached in chat (bot.Friday._toolsets)
 
 
 @server.tool()
 def use_tools(toolset: str, reason: str = "") -> str:
-    """Turn on an optional toolset for the rest of this conversation (see your instructions):
-    'browser' (a real browser with the user's saved logins, approvals and scheduled browser runs)
-    or 'github' (the user's GitHub repos, issues and pull requests). The tools are attached
-    right after this turn and you are continued automatically: call this as soon as you know you
-    need them, then end your turn, writing nothing but "-".
+    """Turn on the 'github' toolset (the user's GitHub repos, issues and pull requests) for the
+    rest of this conversation. The tools are attached right after this turn and you are
+    continued automatically: call this as soon as you know you need them, then end your turn,
+    writing nothing but "-". The browser needs no turning on: its tools are already there.
 
     reason: a few words on what you need them for.
     """
     name = toolset.strip().lower()
+    if name == "browser":
+        return ("The browser tools (mcp__playwright__*) are already attached" if cfg.browser_enabled
+                else "The browser is turned off on this server (FRIDAY_BROWSER=false).")
     if name not in TOOLSETS:
         return f"Unknown toolset '{toolset}'. Toolsets: {', '.join(TOOLSETS)}."
-    if name == "browser" and not cfg.browser_enabled:
-        return "The browser is turned off on this server (FRIDAY_BROWSER=false)."
     if name == "github" and not (cfg.github_token_set or cfg.github_code_token):
         return "GitHub isn't connected (no GITHUB_TOKEN on the server)."
     on = set(json.loads(store.get("toolsets") or "[]"))
@@ -102,7 +118,7 @@ def use_tools(toolset: str, reason: str = "") -> str:
 
 @server.tool()
 def current_time() -> str:
-    """The current date, time and the user's timezone. Call this before working out relative times."""
+    """The current date, time and the user's timezone, when the message has no [Now: …] line."""
     tz = _tz()
     return f"{tu.local_str(tu.now_utc(), tz)} ({tz})"
 
@@ -137,13 +153,24 @@ def add_reminder(text: str, when: str, repeat: str = "", skip_dates: str = "") -
         return REFUSAL
     tz = _tz()
     dt = tu.parse_when(when, tz)
-    if not repeat and dt < tu.now_utc() - timedelta(minutes=1):
+    now = tu.now_utc()
+    if not repeat and dt < now - timedelta(minutes=1):
         return f"Not scheduled: {tu.local_str(dt, tz)} is in the past."
     try:
-        r = store.add_reminder(text, dt, tz, repeat or None, tu.parse_dates(skip_dates))
+        skip = tu.parse_dates(skip_dates)
+        if repeat:  # models tend to pass the current time as the start of a series
+            start = dt.astimezone(ZoneInfo(tz)).replace(tzinfo=None)
+            tu.validate_rrule(repeat, start)
+            first = tu.next_occurrence(repeat, start, tz, dt, skip, inclusive=True)
+            if first and first <= now + timedelta(minutes=1):
+                return (f"Not scheduled: the first alert would be now ({tu.local_str(first, tz)}). Give the start "
+                        "date and time of the series (its first alert, e.g. the coming Tuesday 09:00) as when.")
+        r = store.add_reminder(text, dt, tz, repeat or None, skip)
     except ValueError as e:
         return f"Not scheduled: {e}"
-    return f"Scheduled #{r.id} '{r.text}'. Next alerts: {'; '.join(r.preview(tz))}"
+    if not r.rrule:
+        return f"Scheduled #{r.id} '{r.text}' for {r.preview(tz)[0]}."
+    return f"Scheduled #{r.id} '{r.text}'. Next 3 alerts (tell the user): {'; '.join(r.preview(tz))}"
 
 
 @server.tool()
@@ -165,10 +192,14 @@ def cancel_reminder(reminder_id: int) -> str:
 
 @server.tool()
 def reschedule_reminder(reminder_id: int, when: str) -> str:
-    """Move a reminder to a new ISO 8601 time. For a repeating reminder this also moves the series."""
+    """Move a reminder to a new ISO 8601 time. For a repeating reminder this also moves the series.
+    A one-off that already went off is re-armed, so "30분 미뤄줘" is this one call."""
     tz = _tz()
-    ok = store.reschedule_reminder(reminder_id, tu.parse_when(when, tz))
-    return "Rescheduled." if ok else "No active reminder with that id."
+    dt = tu.parse_when(when, tz)
+    if dt < tu.now_utc() - timedelta(minutes=1):
+        return f"Not rescheduled: {tu.local_str(dt, tz)} is in the past."
+    r = store.reschedule_reminder(reminder_id, dt)
+    return f"Rescheduled #{r.id} '{r.text}': next {'; '.join(r.preview(tz))}." if r else "No reminder with that id."
 
 
 @server.tool()
@@ -265,6 +296,8 @@ def cancel_task(task_id: int) -> str:
 @server.tool()
 def remember(fact: str) -> str:
     """Save a lasting fact about the user (preferences, people, routines) for future conversations.
+    Start it with a few topic words so it's easy to find later, e.g. "커피 취향: 아메리카노" or
+    "엄마 생일: 3월 5일".
 
     Call recall first: if a memory on the same subject exists, use update_memory instead so old
     and new facts don't contradict each other. Never use this for passwords, keys, card or ID numbers.
@@ -285,13 +318,21 @@ def update_memory(memory_id: int, fact: str) -> str:
 
 @server.tool()
 def recall(query: str = "") -> str:
-    """Search saved memories. Returns up to 20 best keyword matches; an empty query returns the
-    20 newest. Try a second query with other words (e.g. 엄마 / 어머니 / mom) if the first finds nothing."""
-    rows = store.memories(query)
+    """Saved memories. With up to 50 saved, all of them (newest first); otherwise up to 20 best
+    keyword matches for query, or the 20 newest when it's empty or nothing matches (then try
+    other words too, e.g. 엄마 / 어머니 / mom)."""
     total = store.memory_count()
-    if not rows:
-        return f"Nothing found ({total} memories saved)."
-    body = "\n".join(f"#{r['id']} {r['text']}" for r in rows)
+    if not total:
+        return "No memories saved yet."
+    head = ""
+    if total <= 50:
+        rows = store.memories("", 50)
+    else:
+        rows = store.memories(query) if query.strip() else []
+        if not rows:
+            head = f"No match for '{query}'; the newest memories:\n" if query.strip() else ""
+            rows = store.memories("")
+    body = head + "\n".join(f"#{r['id']} {r['text']}" for r in rows)
     return body + (f"\n({len(rows)} of {total} memories shown)" if total > len(rows) else "")
 
 
@@ -443,7 +484,8 @@ def propose_items(items_json: str, note: str = "") -> str:
     Use this instead of add_task / add_reminder / calendar_create_event whenever the items come
     from an image, file, document or web page and the user hasn't asked you to add them. Friday
     sends the user a numbered list with "add all" / "ignore" buttons; nothing is added until
-    they tap. Don't repeat the list in your reply: say in a sentence what you found.
+    they tap. Don't repeat the list or announce it: end your turn writing nothing but "-",
+    unless you have something else to tell the user.
 
     items_json: a JSON array. Each item is an object:
         {"kind": "task", "title": "...", "due": "2026-11-20T23:59", "remind": optional ISO or "none"}
@@ -465,7 +507,8 @@ def propose_items(items_json: str, note: str = "") -> str:
         return f"Not proposed: {e}"
     pid = store.add_proposal(items, note.strip())
     store.queue("proposal", text=str(pid))
-    return f"Proposed {len(items)} item(s) as #P{pid}; the user will tap to confirm. Nothing is added yet."
+    return (f"Proposed {len(items)} item(s) as #P{pid}; the user sees the list and taps to confirm. Nothing is "
+            "added yet. End your turn writing nothing but \"-\" unless you have something else to say.")
 
 
 # --- browser ----------------------------------------------------------------
@@ -509,11 +552,16 @@ def list_logins() -> str:
     return "\n".join(lines) or "No saved logins."
 
 
-async def _may_fill(name: str, login, host: str, run_id: int = 0) -> str | None:
+async def _may_fill(name: str, login, host: str, run_id: int = 0, watch_id: int = 0) -> str | None:
     """None if the login may be typed on host: trusted there (approved once, or typed in for it),
-    pre-approved for this run, or approved now on Telegram. Otherwise the refusal to return."""
+    pre-approved for this run or watch, or approved now on Telegram. Otherwise the refusal to return.
+    A watch check never asks: only its pre-approved logins work there."""
     if domain_allowed(host, login.trusted) or (run_id and store.run_allows_login(run_id, name)):
         return None
+    if watch_id:
+        if store.watch_allows_login(watch_id, name):
+            return None
+        return f"'{name}' isn't pre-approved for this watch; report it as an error."
     status = await _ask("login", f"🔑 '{name}' 로그인 정보를 {host} 에 입력할까요?\n"
                                  "(허용하면 이 사이트에서는 다음부터 묻지 않아요. /logins 에서 되돌릴 수 있어요)")
     if status != "approved":
@@ -552,7 +600,7 @@ async def fill_login(name: str, ctx: Context | None = None) -> str:
         return f"The browser isn't reachable ({type(e).__name__})."
     if not ok:
         return f"Wrong site: {host} (open the login form on https://{login.domains[0]} first)"
-    if refusal := await _may_fill(name, login, host, _run_id(ctx)):
+    if refusal := await _may_fill(name, login, host, _run_id(ctx), _watch_id(ctx)):
         return refusal
     try:
         return await browser.fill_login(login)
@@ -581,7 +629,7 @@ async def fill_login_field(name: str, field: str, ctx: Context | None = None) ->
         return f"Wrong site: {host} (open https://{login.domains[0]} first)"
     if state == "no_input":
         return f"No input has focus on {host}: click the field first, then call fill_login_field again."
-    if refusal := await _may_fill(name, login, host, _run_id(ctx)):
+    if refusal := await _may_fill(name, login, host, _run_id(ctx), _watch_id(ctx)):
         return refusal
     try:
         return await browser.fill_focused(login.domains, login.extra[field], field)
@@ -762,6 +810,94 @@ async def schedule_browser_run(when: str, instructions: str, mode: str, logins: 
         return NOT_APPROVED[status]
     rid = store.add_scheduled_run(dt, instructions.strip(), mode, names)
     return f"Scheduled browser run #{rid} for {tu.local_str(dt, tz)}. The user can see or cancel it with /runs."
+
+
+# --- watches ("이러면 알려줘", see watches.py) ----------------------------------
+
+
+@server.tool()
+async def add_watch(title: str, check: str, every: str, until: str = "", toolsets: str = "", logins: str = "") -> str:
+    """Watch for a condition and tell the user when it is newly met, only when the user's own
+    message asks for it ("이캠퍼스에 새 공지 올라오면 알려줘", "PR에 리뷰 달리거나 CI 실패하면 알려줘",
+    "12월 20일 KTX 좌석 나오면 알려줘"). A plain time ("내일 9시에 알려줘") is a reminder instead.
+    The user approves the watch on Telegram first; that also approves the listed logins for its
+    checks. Then a fresh agent checks it every interval, observing only, and Friday messages the
+    user when it is triggered with something new.
+
+    title: a few words the user will recognize, e.g. '이캠퍼스 새 공지'.
+    check: the complete instruction for that unattended agent, which can't see this chat: where to
+        look (URL, repo, route and date), what counts as the condition being met, and for "new"
+        things, what to compare (e.g. the newest notice's title and date). Same language as the user.
+        It always ends by reporting JSON (triggered, summary, fingerprint); you don't need to say so.
+    every: '30m', '2h', '1d' or 'daily 09:00'; at least 15 minutes. Pick what the thing needs
+        (seats: 15-30m, notices: 1-2h, slow things: daily).
+    until: optional ISO 8601 end, e.g. the train's date or a deadline; empty = until cancelled.
+    toolsets: comma-separated, what the checks need: 'browser' (websites) and/or 'github'
+        (GitHub-only watches: just 'github', no browser).
+    logins: comma-separated saved login names (list_logins) the checks may use, or empty.
+    """
+    tz, now = _tz(), tu.now_utc()
+    title, check = " ".join(title.split())[:80], check.strip()
+    if not title or not check:
+        return "Not added: title and check are required."
+    if looks_secret(check) or looks_secret(title):
+        return REFUSAL
+    try:
+        every = wt.parse_every(every)
+    except ValueError as e:
+        return f"Not added: {e}"
+    expires = None
+    if until.strip():
+        try:
+            expires = tu.parse_when(until, tz)
+        except ValueError:
+            return f"Not added: '{until}' isn't an ISO 8601 time."
+        if expires <= now:
+            return f"Not added: {tu.local_str(expires, tz)} is in the past."
+    sets = sorted({t.strip().lower() for t in toolsets.split(",") if t.strip()})
+    if bad := [t for t in sets if t not in wt.TOOLSETS]:
+        return f"Not added: unknown toolset {', '.join(bad)} (use browser and/or github)."
+    if "browser" in sets and not cfg.browser_enabled:
+        return "Not added: the browser is turned off on this server (FRIDAY_BROWSER=false)."
+    if "github" in sets and not (cfg.github_token_set or cfg.github_code_token):
+        return "Not added: GitHub isn't connected (no GITHUB_TOKEN on the server)."
+    names = [n.strip() for n in logins.split(",") if n.strip()]
+    if names and "browser" not in sets:
+        return "Not added: logins need the 'browser' toolset."
+    known = {n for n, _ in Vault(cfg.vault_dir).names()}
+    if unknown := [n for n in names if n not in known]:
+        return (f"Not added: no saved login named {', '.join(unknown)}. Saved: {', '.join(sorted(known)) or 'none'}"
+                " (request_login adds one).")
+    if store.active_watch_count() >= wt.MAX_ACTIVE:
+        return f"Not added: {wt.MAX_ACTIVE} watches are already active. list_watches shows them; cancel one first."
+    end = f", {tu.local_str(expires, tz)}까지" if expires else ""
+    status = await _ask("watch", (
+        f"🔔 이 조건을 지켜볼까요?\n\n{title}\n{check}\n\n"
+        f"확인: {wt.describe_every(every)}{end}\n도구: {', '.join(sets) or '없음'}\n"
+        f"로그인: {', '.join(names) or '없음'}\n(확인만 하고 제출·전송·구매는 하지 않아요)"
+    ))
+    if status != "approved":
+        return NOT_APPROVED[status]
+    wid = store.add_watch(title, check, every, now, sets, names, expires)
+    return (f"Watch #{wid} added: checking {wt.describe_every(every)}{end}, starting now. "
+            "The user can see, pause or delete it with /watches.")
+
+
+@server.tool()
+def list_watches() -> str:
+    """Active and paused watches: id, title, interval, next check and the last result."""
+    rows = store.watches()
+    return "\n".join(("[paused] " if w["status"] == "paused" else "") + wt.describe(w, _tz()) for w in rows) or "No watches."
+
+
+@server.tool()
+def cancel_watch(watch_id: int) -> str:
+    """Stop a watch for good (the user can also tap 그만 보기 or use /watches)."""
+    w = store.watch(watch_id)
+    if not w or w["status"] in ("done", "failed"):
+        return f"No active or paused watch #{watch_id}."
+    store.set_watch_status(watch_id, "done")
+    return f"Stopped watch #{watch_id} ({w['title']})."
 
 
 @server.tool()

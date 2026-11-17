@@ -24,7 +24,6 @@ iPhone and MacBook, and you run on their own server.
 - Keep replies short and easy to read on a phone. Plain text, no tables, no headings.
 - Use the friday tools for reminders, Google Calendar, memory and sending files. Never say a
   reminder or event is set unless the tool call succeeded.
-- Call current_time before working out dates like "tomorrow" or "next Friday".
 - Files the user sends are saved under files/inbox/. You may read and write files in this workspace.
 - When the user shares a lasting fact or preference, save it with remember. When a request may
   depend on what you know about them, call recall first.
@@ -36,20 +35,41 @@ iPhone and MacBook, and you run on their own server.
 # Appended to every new conversation, so the agent knows its tools even when the user-editable
 # FRIDAY.md predates them.
 CAPABILITIES = """\
-What you can do (use it; don't say you can't or don't know when a tool covers it):
-- Reminders, tasks, Google Calendar, memory, files in this workspace, sending files to Telegram.
-- The user's projects: list_projects shows every project on this server (~/code, GitHub or local).
-- Code changes: start_coding_job hands a change or a new project to a coding agent on this server;
-  the result comes back on Telegram as a pull request (GitHub repos) or commits (local projects).
+What you can do (use it; don't say you can't or don't know when a tool covers it). Your tools are
+mcp__friday__<name> and mcp__playwright__<name> (browser). Call them directly with the arguments
+below (? = optional; times are ISO 8601 local, e.g. 2026-11-18T09:00), without looking them up in
+the tool list first:
+- Reminders: add_reminder(text, when, repeat?, skip_dates?), list_reminders(),
+  reschedule_reminder(reminder_id, when) (also re-arms one that already fired),
+  cancel_reminder(reminder_id).
+- To-dos: add_task(title, due?, remind?, notes?), list_tasks(include_done?),
+  update_task(task_id, title?, due?, remind?, notes?), complete_task(task_id), cancel_task(task_id).
+- Google Calendar: calendar_events(start, end), calendar_create_event(title, start, end,
+  description?, location?), calendar_delete_event(event_id).
+- Memory: recall(query?), remember(fact), update_memory(memory_id, fact), forget(memory_id).
+- Files in this workspace: list_files(folder?), send_file(path, caption?) to Telegram;
+  propose_items(items_json, note?) for items read from an image, file or page.
+- The user's projects: list_projects() shows every project on this server (~/code, GitHub or local).
+- Code changes: start_coding_job(repo, task, engine?) hands a change or a new project to a coding
+  agent on this server; the result comes back on Telegram as a pull request (GitHub repos) or
+  commits (local projects). list_coding_jobs() shows them.
+- Settings: set_timezone(timezone), set_model(model?, effort?).
 - Web search for anything current.
-- Optional toolsets, off until you turn one on with use_tools (then end your turn; you are
-  continued with the tools attached, and they stay on for this conversation):
-  - browser: a real browser (playwright tools) on any website, with the user's saved logins
-    (list_logins, fill_login, fill_login_field), request_approval before irreversible steps, and
-    schedule_browser_run for browser work later. For logging in, checking or submitting on a site.
-    When the user names a site or app to look at (네이버 지도, their LMS, a shop...) or asks you to
-    do something on a website, turn on the browser and use it; don't substitute web search.
-  - github: the user's GitHub repos, issues and pull requests (read).
+- Watches: "알려줘 when/if X" that needs checking something periodically (a site, GitHub, seats)
+  is add_watch (list_watches, cancel_watch); a plain time stays a reminder. Email isn't connected:
+  say so and offer what you can (e.g. a watch on the webmail site in the browser).
+- Browser: a real browser on any website (browser_navigate(url), browser_find(text),
+  browser_snapshot(target?, depth?), browser_click, browser_type, browser_take_screenshot...),
+  with the user's saved logins (list_logins(), fill_login(name), fill_login_field(name, field)),
+  request_approval(summary) before irreversible steps, and schedule_browser_run for browser work
+  later. For logging in, checking or submitting on a site.
+  When the user names a site or app to look at (네이버 지도, their LMS, a shop...) or asks you to
+  do something on a website, use the browser; don't substitute web search. Pages are long: look
+  things up with browser_find, or browser_snapshot with a target (or depth), rather than full
+  snapshots.
+- GitHub (the user's repos, issues and pull requests, read): off until you call
+  use_tools("github"); then end your turn, writing nothing but "-", and you are continued with
+  the tools attached for the rest of this conversation.
 Before asking the user for something (a URL, a site, a name, a detail), look for it yourself:
 recall, list_projects, list_files, web search, the browser. Ask only if that fails.
 When a request is clear, do it rather than asking for confirmation. If something needs a tool
@@ -77,6 +97,9 @@ Non-negotiable rules:
   coding agent can't see this chat, so write the task in full: what to change and every detail
   the user gave.
 - Telegram shows plain text: no Markdown. Write links as bare URLs, e.g. "source: https://xe.com".
+- The date and time: use the [Now: …] line at the top of the user's message; call current_time
+  only if it's missing. This replaces any instruction above to call current_time first.
+- Watch checks only observe: never submit, send, post, buy, book, change settings or delete in one.
 
 Requests to the user (request_form, request_login, request_code, request_approval): in chat they
 return at once. Then end your turn, writing nothing but "-" unless you have something else to
@@ -102,7 +125,8 @@ Reminders, tasks and calendar:
   A meeting or appointment with other people or a place is a calendar event.
 - When the user says they finished something, find it with list_tasks and complete_task it.
 - If a time or repeat pattern is truly ambiguous (a start date for "격주", "가끔"), ask instead of guessing.
-- After adding a repeating reminder, tell the user the next alerts from the tool result.
+- A repeating reminder's `when` is the first alert of the series (e.g. the coming Tuesday 09:00),
+  never the current time. After adding one, tell the user the next 3 alerts from the tool result.
 - Deadlines, to-dos or events read from images, files or web pages: propose them with
   propose_items instead of adding them, unless the user's own message asks you to add them.
 """
@@ -113,6 +137,10 @@ class AgentResult:
     text: str
     thread_id: str | None
     errors: list[str] = field(default_factory=list)
+    mcp_servers: set[str] = field(default_factory=set)  # MCP servers whose tools the turn called
+    # The context size: the turn's last model request (last_request_tokens), else the total
+    # over all its requests, which is all --json reports.
+    input_tokens: int = 0
 
     @property
     def ok(self) -> bool:
@@ -142,11 +170,19 @@ def github_read_token_var(cfg: Config) -> str | None:
     return CODE_TOKEN_VAR if cfg.github_code_token else None
 
 
-# Optional toolsets, attached only when the conversation turned them on (use_tools) because
-# loading their tools into every turn is slow. Friday's own tools for the browser are hidden
-# with it.
+# Optional toolsets. Chat always attaches the browser (Codex defers MCP tool definitions, so it
+# costs ~10 tokens a turn); GitHub only once the conversation turned it on (use_tools). Friday's
+# own tools for the browser are hidden without it.
 TOOLSETS = ("browser", "github")
 FRIDAY_BROWSER_TOOLS = ["fill_login", "fill_login_field", "list_logins", "request_approval", "schedule_browser_run"]
+# Hidden during a watch check (watches.py), which only observes and has nobody to ask.
+WATCH_HIDDEN_TOOLS = [
+    "use_tools", "add_watch", "cancel_watch", "schedule_browser_run", "request_approval", "request_form",
+    "request_login", "request_code", "start_coding_job", "send_file", "set_model", "set_timezone",
+    "add_reminder", "cancel_reminder", "reschedule_reminder", "add_task", "update_task", "complete_task",
+    "cancel_task", "remember", "update_memory", "forget", "calendar_create_event", "calendar_delete_event",
+    "propose_items",
+]
 
 
 def available_toolsets(cfg: Config) -> list[str]:
@@ -163,8 +199,10 @@ def codex_args(
     toolsets: frozenset[str] | set[str] = frozenset(),
     chat: bool = False,
     http: tuple[bool, bool] = (True, True),
+    watch_id: int | None = None,
 ) -> list[str]:
-    """toolsets: the optional ones to attach (TOOLSETS). chat: a Telegram chat turn, where
+    """watch_id: a watch check (watches.py): read-only GitHub, no tools that change or ask anything.
+    toolsets: the optional ones to attach (TOOLSETS). chat: a Telegram chat turn, where
     requests to the user don't wait for the answer (Friday continues the thread when it comes).
     http: whether (Friday's, Playwright's) MCP servers are reached over their local HTTP
     services (mcp_http) rather than started for this run on stdio."""
@@ -173,6 +211,8 @@ def codex_args(
         headers = {}
         if run_id:  # a scheduled browser run: fill_login may use that run's pre-approved logins
             headers[mcp_http.RUN_HEADER] = str(run_id)
+        elif watch_id:  # a watch check: likewise its watch's logins, and it never asks
+            headers[mcp_http.WATCH_HEADER] = str(watch_id)
         elif chat:
             headers[mcp_http.CHAT_HEADER] = "1"
         overrides = [
@@ -184,6 +224,8 @@ def codex_args(
         env = {"FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir), "FRIDAY_TZ": cfg.default_tz}
         if run_id:
             env["FRIDAY_RUN_ID"] = str(run_id)
+        elif watch_id:
+            env["FRIDAY_WATCH_ID"] = str(watch_id)
         elif chat:
             env["FRIDAY_CHAT"] = "1"
         overrides = [
@@ -192,6 +234,8 @@ def codex_args(
             f"mcp_servers.friday.env={mcp_config.toml_value(env)}",
         ]
     hidden = ([] if browser_on else FRIDAY_BROWSER_TOOLS) + (["use_tools"] if run_id else [])
+    if watch_id:
+        hidden = list(dict.fromkeys(hidden + WATCH_HIDDEN_TOOLS))
     if hidden:
         overrides.append(f"mcp_servers.friday.disabled_tools={mcp_config.toml_value(hidden)}")
     overrides += [
@@ -218,7 +262,7 @@ def codex_args(
             f"mcp_servers.github.bearer_token_env_var={_toml_str(token_var)}",
             'mcp_servers.github.default_tools_approval_mode="approve"',
         ]
-        if cfg.github_readonly or token_var == CODE_TOKEN_VAR:
+        if cfg.github_readonly or token_var == CODE_TOKEN_VAR or watch_id:  # watch checks only read
             overrides.append('mcp_servers.github.http_headers={"X-MCP-Readonly" = "true"}')
     if browser_on:
         # The shared browser (deploy/friday-browser.service) through the Playwright MCP server.
@@ -252,7 +296,12 @@ def codex_args(
     args = [cfg.codex_bin, "exec"]
     if thread_id:
         args += ["resume", thread_id]
-    args += ["--json", "--skip-git-repo-check"]
+    # No ChatGPT apps, plugins or skills list: Friday uses none, and they cost ~6k tokens a turn.
+    args += ["--json", "--skip-git-repo-check", "--disable", "apps", "--disable", "plugins",
+             "-c", "skills.include_instructions=false",
+             # Codex reads the timezone from /etc/localtime (TZ is ignored), so it would tell the
+             # model the server's; the [Now: …] line in each message (bot._wrap) has the user's.
+             "-c", "include_environment_context_time=false"]
     for o in overrides:
         args += ["-c", o]
     for img in images:
@@ -261,22 +310,46 @@ def codex_args(
 
 
 def parse_events(lines: list[str]) -> AgentResult:
-    thread_id, messages, errors = None, [], []
+    thread_id, messages, errors, servers, tokens = None, [], [], set(), 0
     for line in lines:
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue
         kind = ev.get("type")
+        item = ev.get("item") or {}
         if kind == "thread.started":
             thread_id = ev.get("thread_id")
-        elif kind == "item.completed" and ev.get("item", {}).get("type") == "agent_message":
-            messages.append(ev["item"].get("text", ""))
+        elif kind == "item.completed" and item.get("type") == "agent_message":
+            messages.append(item.get("text", ""))
+        elif kind == "item.completed" and item.get("type") == "mcp_tool_call":
+            servers.add(item.get("server") or "")
+        elif kind == "turn.completed":
+            tokens += int((ev.get("usage") or {}).get("input_tokens") or 0)
         elif kind == "turn.failed":
             errors.append(str(ev.get("error", {}).get("message", "turn failed")))
         elif kind == "error":
             errors.append(str(ev.get("message", "error")))
-    return AgentResult(text=(messages[-1] if messages else "").strip(), thread_id=thread_id, errors=errors)
+    return AgentResult(text=(messages[-1] if messages else "").strip(), thread_id=thread_id, errors=errors,
+                       mcp_servers=servers, input_tokens=tokens)
+
+
+def last_request_tokens(thread_id: str) -> int:
+    """Input tokens of the thread's last model request, from Codex's session log; 0 if unreadable."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    logs = sorted((home / "sessions").glob(f"*/*/*/rollout-*{thread_id}.jsonl"))
+    if not logs:
+        return 0
+    with logs[-1].open("rb") as fh:
+        fh.seek(max(0, fh.seek(0, 2) - 262_144))
+        tail = fh.read().decode(errors="replace").splitlines()
+    for line in reversed(tail):
+        if '"token_count"' in line:
+            try:
+                return int(json.loads(line)["payload"]["info"]["last_token_usage"]["input_tokens"])
+            except (ValueError, KeyError, TypeError):
+                continue
+    return 0
 
 
 async def run_codex(
@@ -289,13 +362,16 @@ async def run_codex(
     run_id: int | None = None,
     toolsets: frozenset[str] | set[str] = frozenset(),
     chat: bool = False,
+    watch_id: int | None = None,
+    tz: str = "",
 ) -> AgentResult:
+    """tz: the owner's timezone (Store.tz), for the agent's shell commands (`date`)."""
     # The local MCP services (deploy/friday-mcp.service, friday-playwright-mcp.service) when they
     # are up; otherwise Codex starts the servers itself, as before they existed.
     http = (mcp_http.listening(mcp_http.friday_port()),
             "browser" in toolsets and mcp_http.listening(mcp_http.playwright_port()))
-    args = codex_args(cfg, thread_id, images or [], model, effort, run_id, toolsets, chat, http)
-    env = {**os.environ}
+    args = codex_args(cfg, thread_id, images or [], model, effort, run_id, toolsets, chat, http, watch_id=watch_id)
+    env = {**os.environ, "TZ": tz or cfg.default_tz}
     if http[0]:
         env[mcp_http.TOKEN_VAR] = mcp_http.token(cfg)
     if github_read_token_var(cfg) == CODE_TOKEN_VAR:
@@ -320,6 +396,8 @@ async def run_codex(
 
     result = parse_events(out.decode(errors="replace").splitlines())
     result.thread_id = result.thread_id or thread_id
+    if result.thread_id:
+        result.input_tokens = last_request_tokens(result.thread_id) or result.input_tokens
     if proc.returncode != 0 and not result.text:
         tail = err.decode(errors="replace").strip().splitlines()[-5:]
         result.errors.append(f"codex exited {proc.returncode}: " + " | ".join(tail))

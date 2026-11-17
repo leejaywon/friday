@@ -22,6 +22,7 @@ from .config import Config
 
 TOKEN_VAR = "FRIDAY_MCP_TOKEN"  # matches the "*TOKEN*" shell_environment_policy exclusion
 RUN_HEADER = "X-Friday-Run"
+WATCH_HEADER = "X-Friday-Watch"  # a watch check (watches.py)
 CHAT_HEADER = "X-Friday-Chat"
 
 

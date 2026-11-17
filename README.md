@@ -336,6 +336,7 @@ takes the bot back 10 minutes after the switch.
 | `/jobs` | recent coding jobs and their pull requests |
 | `/stop <id>` | stop a running coding job |
 | `/runs` | scheduled browser runs and their results; `/runs cancel <id>` cancels one |
+| `/watches` | what Friday is watching for you: ⏸ pause, ▶️ resume, 🗑 delete |
 | `/login <name> <domain>` | save a website login: tap 📝 입력하기 (the form), or reply to Friday's message with the username and password |
 | `/logins` | saved website logins: 🔒 ask again before use, 🗑 delete |
 | `/files [folder]` | the newest files in Friday's workspace (what you sent, what Friday made), with size and date; tap one for 📤 get or 🗑 delete (asks first); 📂 browses folders |
@@ -386,6 +387,20 @@ logins it may use, and pick 🧭 (ask before the final submit) or 🤖 (submit w
 that time a fresh agent does the work and sends you the result and a screenshot of the last page.
 `/runs` lists runs; `/runs cancel <id>` cancels a pending or running one. The browser can't open
 `file://` pages, and its control port listens on the server's localhost only.
+
+**Watches** ("이러면 알려줘"): say what to watch in plain words, e.g. "이캠퍼스에 새 공지 올라오면
+알려줘", "friday 레포 PR에 리뷰 달리거나 CI 실패하면 알려줘" or "12월 20일 오전 서울→부산 KTX 좌석 나오면
+알려줘". Friday sends a 🔔 approval with what it will check, how often (at least every 15 minutes,
+to spare your ChatGPT plan; e.g. 30m, 2h, daily 09:00), until when, and which tools and saved
+logins it may use. Once you tap ✅, a fresh agent checks right away and then on that interval, one
+check at a time and never alongside a scheduled browser run. Checks only look: no submitting,
+sending, buying or posting, GitHub is read-only, and the only logins are the ones you approved
+for the watch (a GitHub-only watch doesn't use the browser). You get "🔔 title + what changed"
+only when the condition is met with something new, with ✅ 그만 보기 / ⏸ 일시중지 buttons. After 3
+failed checks in a row the watch pauses and Friday tells you once; a watch with an end date stops
+with a short note. Up to 10 watches can be active; `/watches` lists them. Email isn't connected
+yet, so for "교수님 메일 답장 없으면" Friday says so and offers what it can (e.g. a watch on your
+webmail in the browser).
 
 **GitHub**: create a fine-grained token at https://github.com/settings/personal-access-tokens
 with access to the repos you want and read-only permissions (Contents, Issues, Pull requests,

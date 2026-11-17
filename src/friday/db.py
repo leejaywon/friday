@@ -132,6 +132,26 @@ CREATE TABLE IF NOT EXISTS proposals (      -- items read from an image/file, wa
     status     TEXT NOT NULL DEFAULT 'pending',  -- pending | accepted | dismissed
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS watches (        -- "이러면 알려줘": a condition an agent checks periodically (watches.py)
+    id              INTEGER PRIMARY KEY,
+    title           TEXT NOT NULL,
+    check_prompt    TEXT NOT NULL,          -- complete instruction for the unattended checking agent
+    every           TEXT NOT NULL,          -- '30m' (minutes) | 'daily 09:00' (watches.parse_every)
+    toolsets        TEXT NOT NULL DEFAULT '',  -- comma-separated: browser, github
+    logins          TEXT NOT NULL DEFAULT '',  -- vault names fill_login may use unasked during a check
+    status          TEXT NOT NULL DEFAULT 'active',  -- active | paused | done | failed
+    checking        INTEGER NOT NULL DEFAULT 0,      -- 1 while a check runs (fill_login's pre-approval)
+    last_checked_at TEXT,
+    next_check_at   TEXT NOT NULL,          -- UTC ISO
+    last_state      TEXT,                   -- JSON of the last check's result, shown to the next check
+    last_fingerprint TEXT,                  -- of the last notification: the same one isn't sent twice
+    last_error      TEXT,
+    fail_count      INTEGER NOT NULL DEFAULT 0,      -- failed checks in a row
+    expires_at      TEXT,                   -- UTC ISO, NULL = until cancelled
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS watches_due ON watches(status, next_check_at);
 """
 
 JOB_FIELDS = (
@@ -343,19 +363,29 @@ class Store:
         )
         return cur.rowcount > 0
 
-    def reschedule_reminder(self, rid: int, when: datetime) -> bool:
+    def reschedule_reminder(self, rid: int, when: datetime) -> Reminder | None:
+        """Move a reminder (or series) to `when`. A one-off that already fired is re-armed."""
         r = self.reminder(rid)
-        if not r or r.status != "active":
-            return False
+        if not r or not (r.status == "active" or (r.status == "done" and not r.rrule)):
+            return None
         start_local = when.astimezone(ZoneInfo(r.tz)).replace(tzinfo=None)
         first = when
         if r.rrule:
             first = tu.next_occurrence(r.rrule, start_local, r.tz, when, r.skip_dates, inclusive=True) or when
         self.conn.execute(
-            "UPDATE reminders SET next_at = ?, start_local = ? WHERE id = ?",
+            "UPDATE reminders SET next_at = ?, start_local = ?, status = 'active' WHERE id = ?",
             (tu.to_utc_iso(first), start_local.isoformat(), rid),
         )
-        return True
+        return self.reminder(rid)
+
+    def next_alert_at(self) -> datetime | None:
+        """The soonest pending reminder, task heads-up or task deadline, for the reminder loop."""
+        row = self.conn.execute(
+            "SELECT MIN(t) FROM (SELECT MIN(next_at) AS t FROM reminders WHERE status = 'active'"
+            " UNION ALL SELECT MIN(remind_at) FROM tasks WHERE status = 'open'"
+            " UNION ALL SELECT MIN(due_at) FROM tasks WHERE status = 'open' AND due_notified = 0)"
+        ).fetchone()
+        return tu.from_iso(row[0]) if row and row[0] else None
 
     # --- tasks -------------------------------------------------------------
 
@@ -680,3 +710,60 @@ class Store:
             "INSERT OR IGNORE INTO notified_events(event_id, start) VALUES(?, ?)", (event_id, start)
         )
         return cur.rowcount > 0
+
+    # --- watches ("이러면 알려줘", see watches.py) ----------------------------
+
+    WATCH_FIELDS = ("status", "checking", "last_checked_at", "next_check_at", "last_state",
+                    "last_fingerprint", "last_error", "fail_count")
+
+    def add_watch(self, title: str, check: str, every: str, next_at: datetime, toolsets: list[str] | tuple[str, ...] = (),
+                  logins: list[str] | tuple[str, ...] = (), expires_at: datetime | None = None) -> int:
+        """A watch the owner approved; creating it is also their approval of its logins for its checks."""
+        cur = self.conn.execute(
+            "INSERT INTO watches(title, check_prompt, every, toolsets, logins, next_check_at, expires_at, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (title, check, every, ",".join(toolsets), ",".join(logins), tu.to_utc_iso(next_at),
+             tu.to_utc_iso(expires_at) if expires_at else None, self._now()),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def watch(self, wid: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM watches WHERE id = ?", (wid,)).fetchone()
+
+    def watches(self, statuses: tuple[str, ...] = ("active", "paused")) -> list[sqlite3.Row]:
+        marks = ",".join("?" * len(statuses))
+        return self.conn.execute(
+            f"SELECT * FROM watches WHERE status IN ({marks}) ORDER BY status, next_check_at, id", statuses
+        ).fetchall()
+
+    def active_watch_count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM watches WHERE status = 'active'").fetchone()[0]
+
+    def next_due_watch(self, now: datetime) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM watches WHERE status = 'active' AND next_check_at <= ? ORDER BY next_check_at, id LIMIT 1",
+            (tu.to_utc_iso(now),),
+        ).fetchone()
+
+    def update_watch(self, wid: int, **fields) -> None:
+        bad = set(fields) - set(self.WATCH_FIELDS)
+        if bad:
+            raise ValueError(f"unknown watch fields: {bad}")
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        self.conn.execute(f"UPDATE watches SET {cols} WHERE id = ?", (*fields.values(), wid))
+
+    def set_watch_status(self, wid: int, status: str, only_from: str | None = None) -> bool:
+        sql, args = "UPDATE watches SET status = ? WHERE id = ?", [status, wid]
+        if only_from:
+            sql += " AND status = ?"
+            args.append(only_from)
+        return self.conn.execute(sql, args).rowcount > 0
+
+    def watch_allows_login(self, wid: int, name: str) -> bool:
+        """fill_login's pre-approval: only while that watch's check runs, only for its logins."""
+        w = self.watch(wid)
+        return bool(w and w["status"] == "active" and w["checking"] and name in w["logins"].split(","))
+
+    def clear_watch_checks(self) -> None:
+        """No check is running (e.g. after a restart): no watch keeps its login pre-approval live."""
+        self.conn.execute("UPDATE watches SET checking = 0 WHERE checking = 1")

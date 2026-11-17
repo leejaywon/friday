@@ -49,6 +49,7 @@ from .models import summary as models_summary
 from .models import switch as switch_model
 from .transcribe import TranscriptionError, model_for, transcribe
 from .vault import Vault, check
+from .watches import WatchBot
 from .webform import FormKey, check_values, form_url, login_spec
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ log = logging.getLogger(__name__)
 TELEGRAM_LIMIT = 4000
 FILES_PAGE = 8  # entries per /files page
 IDLE_NEW_THREAD = timedelta(hours=6)  # start a fresh Codex thread after this much silence
+# Also start one (carrying the last exchange) once the context is this big (AgentResult.input_tokens).
+# Not after every browser turn: follow-ups ("거기 일요일엔?") need what the page said.
+MAX_TURN_INPUT_TOKENS = 60_000
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILES_ONLY = (
     "(The user sent only the files above, with no message. Look at them. If it's clear what they "
@@ -81,45 +85,46 @@ CANCEL_TEXT = "취소"
 REQUEST_ECHO = re.compile(r"보냈|보낼게|요청|입력|폼|양식|sent|request|form|fill in|enter", re.I)
 VOICE_NOTE = "[The user sent this as a voice message; it was transcribed automatically and may contain recognition errors.]\n"
 HELP = """\
-Talk to me normally, in Korean or English. I can keep your to-dos and deadlines, set reminders,
-check and add Google Calendar events, remember things about you, and work with files you send.
-Voice messages work too: I transcribe them and answer what you said.
+편하게 한국어나 영어로 말해주세요. 할 일과 마감, 리마인더, Google 캘린더 일정, 기억해 둘 것,
+보내준 파일을 챙겨요. 음성 메시지도 받아 적어서 답해요.
 
-/today - today's events, tasks and reminders
-/tasks - open to-dos and deadlines
-/reminders - upcoming reminders
-/new - start a fresh conversation
-/model [name] [effort] - show or change the Codex model, e.g. /model gpt-6-sol high
-/code [claude|codex] <repo> <task> - have a coding agent change a repo and open a pull request.
-  Reply to the job's messages to give it more instructions.
-/jobs - recent coding jobs
-/stop <id> - stop a coding job
-/runs - scheduled browser runs; /runs cancel <id> to cancel one
-/login <name> <domain> - save a website login for the browser (you reply with it; I delete the message)
-/logins - saved website logins: ask again before use, or delete
-/tz [Area/City] - show or change your timezone
-/files [folder] - browse my files: tap one to get or delete it
-/backup - send the database file
-/status - health check"""
+/today - 오늘 일정, 할 일, 리마인더
+/tasks - 남은 할 일과 마감
+/reminders - 예정된 리마인더
+/new - 새 대화 시작
+/model [name] [effort] - Codex 모델 보기/바꾸기, 예: /model gpt-6-sol high
+/code [claude|codex] <repo> <할 일> - 코딩 에이전트가 저장소를 고치고 풀 리퀘스트를 열어요.
+  작업 메시지에 답장하면 추가 지시가 돼요.
+/jobs - 최근 코딩 작업
+/stop <번호> - 코딩 작업 중지
+/runs - 예약된 브라우저 작업; /runs cancel <번호> 로 취소
+/watches - things I check for you ("이러면 알려줘"): pause, resume or delete
+/login <이름> <도메인> - 브라우저용 사이트 로그인 저장 (답장으로 보내면 메시지는 지워요)
+/logins - 저장된 로그인: 다시 묻게 하거나 삭제
+/tz [Area/City] - 시간대 보기/바꾸기
+/files [폴더] - 파일 보기: 눌러서 받기·삭제
+/backup - 데이터베이스 파일 받기
+/status - 상태 확인"""
 
 # The menu Telegram shows when you type "/".
 COMMANDS = [
-    ("today", "Today's events, tasks and reminders"),
-    ("tasks", "Open to-dos and deadlines"),
-    ("reminders", "Upcoming reminders"),
-    ("model", "Show or change the Codex model"),
-    ("code", "Coding job: /code [claude|codex] <repo> <task>"),
-    ("jobs", "Recent coding jobs"),
-    ("stop", "Stop a coding job"),
-    ("runs", "Scheduled browser runs"),
-    ("login", "Save a website login: /login <name> <domain>"),
-    ("logins", "Saved website logins"),
-    ("new", "Start a fresh conversation"),
-    ("tz", "Show or change your timezone"),
-    ("files", "Browse files: get or delete them"),
-    ("status", "Health check"),
-    ("backup", "Send the database file"),
-    ("help", "What Friday can do"),
+    ("today", "오늘 일정, 할 일, 리마인더"),
+    ("tasks", "남은 할 일과 마감"),
+    ("reminders", "예정된 리마인더"),
+    ("model", "Codex 모델 보기/바꾸기"),
+    ("code", "코딩 작업: /code [claude|codex] <repo> <할 일>"),
+    ("jobs", "최근 코딩 작업"),
+    ("stop", "코딩 작업 중지"),
+    ("runs", "예약된 브라우저 작업"),
+    ("watches", "Watches: what I check for you"),
+    ("login", "사이트 로그인 저장: /login <이름> <도메인>"),
+    ("logins", "저장된 로그인"),
+    ("new", "새 대화 시작"),
+    ("tz", "시간대 보기/바꾸기"),
+    ("files", "파일 보기: 받기·삭제"),
+    ("status", "상태 확인"),
+    ("backup", "데이터베이스 파일 받기"),
+    ("help", "Friday가 할 수 있는 것"),
 ]
 
 
@@ -133,12 +138,22 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     return chunks + ([rest] if rest else [])
 
 
+MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
+MD_BOLD = re.compile(r"\*\*(.+?)\*\*", re.S)
+
+
+def plain_text(text: str) -> str:
+    """Telegram gets plain text: Markdown links become "text url" and **bold** loses its stars."""
+    text = MD_LINK.sub(lambda m: m[2] if m[1].strip() == m[2] else f"{m[1]} {m[2]}", text)
+    return MD_BOLD.sub(r"\1", text)
+
+
 def safe_name(name: str) -> str:
     name = re.sub(r"[^\w.\-가-힣 ]+", "_", name).strip(" .") or "file"
     return name[:120]
 
 
-class Friday:
+class Friday(WatchBot):
     def __init__(self, cfg: Config):
         self.cfg = cfg
         ensure_dirs(cfg)
@@ -198,6 +213,7 @@ class Friday:
         app.add_handler(CallbackQueryHandler(self.on_submission_button, pattern=r"^sub:(remind|approve|auto):\d+:\d+$"))
         app.add_handler(CommandHandler("files", self.cmd_files, filters=me))
         app.add_handler(CallbackQueryHandler(self.on_files_button, pattern=r"^fs:(r|[dfgxy]:\d{1,6}(:\d{1,4})?)$"))
+        self._watch_handlers(app, me)  # /watches and its buttons (watches.py)
         app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, self.on_text))
         app.add_handler(MessageHandler(me & (filters.LOCATION | filters.VENUE), self.on_location))
         attachments = filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.VOICE
@@ -221,13 +237,13 @@ class Friday:
         except Exception:
             log.exception("browser runs startup failed")
         for loop in (self.reminder_loop, self.outbox_loop, self.calendar_loop, self.brief_loop, self.job_loop,
-                     self.browser_run_loop):
+                     self.browser_run_loop, self.watch_loop):
             self._tasks.append(asyncio.create_task(self._forever(loop), name=loop.__name__))
         log.info("Friday started; tz=%s, allowed=%s", self.tz, self.cfg.allowed_user_ids)
 
     async def _on_stop(self, app: Application) -> None:
         # A running job stays 'running' in the database; the next start marks it failed and says so.
-        tasks = self._tasks + [t for t in (self._job_runner, self._run_task) if t]
+        tasks = self._tasks + [t for t in (self._job_runner, self._run_task, self._watch_task) if t]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -274,7 +290,16 @@ class Friday:
             head.append("[Files the user sent, saved in the workspace: " + ", ".join(files) + "]")
         has_image = any(Path(f).suffix.lower() in IMAGE_SUFFIXES for f in files)
         body = "\n".join(head) + "\n\n" + (text or (IMAGES_ONLY if has_image else FILES_ONLY))
-        return f"{instructions(self.cfg)}\n---\n{body}" if new_thread else body
+        if not new_thread:
+            return body
+        context = []
+        if mems := self.store.memories("", 20):
+            context.append("[What you know about the user (saved memories, newest first; recall has more):\n"
+                           + "\n".join(f"#{m['id']} {short(m['text'], 120)}" for m in mems) + "]")
+        if carry := self.store.get("carry"):
+            self.store.delete("carry")
+            context.append(carry)
+        return "\n".join([f"{instructions(self.cfg)}\n---", *context, body])
 
     def _current_thread(self) -> str | None:
         last = self.store.get("last_message_at")
@@ -284,12 +309,25 @@ class Friday:
 
     def _reset_thread(self) -> None:
         """A fresh conversation: no Codex thread, and the optional toolsets off again."""
+        for key in ("thread_id", "toolsets", "carry"):
+            self.store.delete(key)
+
+    def _continue_fresh(self, said: str, replied: str) -> None:
+        """Go on in a new Codex thread that starts with a note of the last exchange (_wrap)."""
+        note = f"the user said «{short(' '.join(said.split()) or '(only files)', 300)}»"
+        if replied.strip(" .\"'`-—"):
+            note += f" and you replied «{short(' '.join(replied.split()), 300)}»"
+        self.store.set("carry", f"[Continuing this conversation in a fresh context. Last exchange: {note}.]")
         self.store.delete("thread_id")
-        self.store.delete("toolsets")
 
     def _toolsets(self) -> set[str]:
-        """Optional toolsets this conversation turned on (mcp_server.use_tools)."""
-        return set(json.loads(self.store.get("toolsets") or "[]"))
+        """Toolsets for a chat turn: the browser, and those this conversation turned on
+        (mcp_server.use_tools)."""
+        on = set(json.loads(self.store.get("toolsets") or "[]"))
+        return on | {"browser"} if self.cfg.browser_enabled else on
+
+    def _last_proposal(self) -> int:
+        return self.store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM proposals").fetchone()[0]
 
     def _followups(self) -> set[str]:
         """Requests to the owner the chat agent didn't wait for (mcp_server._follow_up)."""
@@ -312,7 +350,7 @@ class Friday:
         attached, at most MAX_CONTINUATIONS times; only the last turn's reply is sent."""
         async with self.agent_lock:
             typing = asyncio.create_task(self._keep_typing(chat_id))
-            requests = self._followups()
+            requests, proposal, used = self._followups(), self._last_proposal(), set()
             try:
                 thread = self._current_thread()
                 prompt = self._wrap(text, files or [], thread is None)
@@ -328,10 +366,12 @@ class Friday:
                             effort=self.store.get("effort") or "",
                             toolsets=toolsets,
                             chat=True,
+                            tz=self.tz,
                         )
                     except Exception as e:  # e.g. codex binary missing
                         log.exception("codex run failed")
                         result = AgentResult("", thread, [repr(e)])
+                    used |= result.mcp_servers
                     thread = result.thread_id or thread
                     if thread:
                         self.store.set("thread_id", thread)
@@ -343,22 +383,27 @@ class Friday:
             finally:
                 typing.cancel()
             made_request = bool(self._followups() - requests)
+            # Not while a request is open: its answer continues this thread.
+            if thread and not self._followups() and result.input_tokens > MAX_TURN_INPUT_TOKENS:
+                self._continue_fresh(text, result.text)
         if result.text:
-            if self._worth_sending(result.text, made_request):
-                await self.say(result.text, chat_id)
+            if self._worth_sending(result.text, made_request, self._last_proposal() > proposal):
+                await self.say(plain_text(result.text), chat_id)
         elif result.errors or not made_request:
             detail = "; ".join(result.errors) or "no reply"
-            await self.say(f"Codex failed: {detail[:1500]}\nIf this keeps happening, send /new.", chat_id)
+            await self.say(f"Codex 오류: {detail[:1500]}\n계속 이러면 /new 를 보내주세요.", chat_id)
         await self.outbox_loop()
 
     @staticmethod
-    def _worth_sending(text: str, made_request: bool) -> bool:
+    def _worth_sending(text: str, made_request: bool, made_proposal: bool = False) -> bool:
         """Not "-" (the agent's "nothing to add"), and not a one-liner that only says a request
-        was sent when the turn sent one (the user sees the request itself)."""
+        was sent when the turn sent one, or any one-liner next to a proposal (the user sees the
+        request or the list itself)."""
         t = text.strip()
         if t.strip(" .\"'`") in ("", "-", "—"):
             return False
-        return not (made_request and "\n" not in t and len(t) <= 120 and REQUEST_ECHO.search(t))
+        one_line = "\n" not in t and len(t) <= 120
+        return not (one_line and (made_proposal or (made_request and REQUEST_ECHO.search(t))))
 
     async def _keep_typing(self, chat_id: int) -> None:
         while True:
@@ -468,17 +513,21 @@ class Friday:
         await self.ask(update.effective_chat.id, self._reply_context(msg) + msg.text)
 
     async def on_location(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """A shared location (or venue): remembered for this conversation and passed to the agent,
-        so "this cafe" or "near me" can be answered. Live-location updates arrive as edits and are
+        """A shared location (or venue): remembered for 3 hours and passed to the agent with the
+        next messages (_wrap), so "this cafe" or "near me" can be answered; on its own it gets a 👍,
+        not a turn. Live-location updates arrive as edits and are
         ignored; the first position is enough for a question."""
         msg = update.message
         loc = msg.venue.location if msg.venue else msg.location
         where = f"{loc.latitude:.6f},{loc.longitude:.6f}"
         place = f" ({msg.venue.title}, {msg.venue.address})" if msg.venue else ""
-        self.store.set("last_location", json.dumps({"at": tu.to_utc_iso(tu.now_utc()), "where": where}))
+        self.store.set("last_location", json.dumps({"at": tu.to_utc_iso(tu.now_utc()), "where": where + place}))
+        if not msg.caption:  # usually the question follows; _wrap adds the location to it
+            await self._quiet(self.app.bot.set_message_reaction(msg.chat_id, msg.message_id, "👍"))  # type: ignore[union-attr]
+            return
         note = (f"[The user shared their location: {where}{place}. Map link: "
                 f"https://maps.google.com/?q={where}. Use it for anything about where they are.]")
-        await self.ask(msg.chat_id, self._reply_context(msg) + note + "\n" + (msg.caption or ""))
+        await self.ask(msg.chat_id, self._reply_context(msg) + note + "\n" + msg.caption)
 
     def _keyboard_request(self):
         """The newest pending form request whose keyboard ([📝 입력하기] [취소]) is showing."""
@@ -520,8 +569,8 @@ class Friday:
             if ext in IMAGE_SUFFIXES and Path(name).suffix.lower() not in IMAGE_SUFFIXES:
                 name += ext  # an image sent as a file without its extension: still show it as an image
         if media.file_size and media.file_size > botapi.download_limit(self.cfg):
-            await msg.reply_text("Telegram only lets bots download files up to 20 MB. Copy bigger files with scp."
-                                 if not self.cfg.local_botapi else "That's over 2 GB, more than Telegram lets bots download.")
+            await msg.reply_text("텔레그램 봇은 20MB까지만 받을 수 있어요. 더 큰 파일은 scp로 복사해주세요."
+                                 if not self.cfg.local_botapi else "2GB가 넘어서 텔레그램 봇이 받을 수 없어요.")
             return
 
         day_dir = self.cfg.files_dir / "inbox" / datetime.now(ZoneInfo(self.tz)).strftime("%Y-%m-%d")
@@ -562,8 +611,8 @@ class Friday:
         if not self.cfg.transcription_on:
             self.store.set("pending_files", json.dumps(self._take_pending_files() + [rel]))
             await msg.reply_text(
-                f"Saved {rel}. I can't listen to audio yet: set TRANSCRIBE_API_KEY on the server "
-                "to have voice messages transcribed."
+                f"{rel} 에 저장했어요. 아직 음성을 들을 수 없어요: 서버에 TRANSCRIBE_API_KEY 를 설정하면 "
+                "음성 메시지를 받아 적어요."
             )
             return
 
@@ -580,13 +629,13 @@ class Friday:
         except TranscriptionError as e:
             log.warning("Transcription of %s failed: %s", rel, e)
             self.store.set("pending_files", json.dumps(self._take_pending_files() + [rel]))
-            await msg.reply_text(f"Saved {rel}, but transcribing it failed ({e}). Type what you said instead?")
+            await msg.reply_text(f"{rel} 에 저장했지만 받아 적지 못했어요 ({e}). 글로 보내주시겠어요?")
             return
         finally:
             typing.cancel()
 
         if not text:
-            await msg.reply_text("I couldn't make out any words in that recording.")
+            await msg.reply_text("녹음에서 말을 알아듣지 못했어요.")
             return
         transcript = dest.with_name(dest.name + ".txt")
         transcript.write_text(text + "\n", encoding="utf-8")
@@ -619,11 +668,11 @@ class Friday:
 
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         self._reset_thread()
-        await update.message.reply_text("Started a fresh conversation. Memories, tasks and reminders are kept.")
+        await update.message.reply_text("새 대화를 시작했어요. 기억, 할 일, 리마인더는 그대로예요.")
 
     async def cmd_reminders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         rs = self.store.active_reminders()
-        await self.say("\n".join(r.describe(self.tz) for r in rs) or "No upcoming reminders.", update.effective_chat.id)
+        await self.say("\n".join(r.describe(self.tz) for r in rs) or "예정된 리마인더가 없어요.", update.effective_chat.id)
 
     async def cmd_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         now, zone = tu.now_utc(), ZoneInfo(self.tz)
@@ -631,10 +680,10 @@ class Friday:
         for t in self.store.open_tasks():
             due = ""
             if t.due_at:
-                due = ("⚠️ overdue " if t.due_at < now else "") + f"{t.due_at.astimezone(zone):%a %m/%d %H:%M}  "
+                due = ("⚠️ 지남 " if t.due_at < now else "") + f"{t.due_at.astimezone(zone):%a %m/%d %H:%M}  "
             lines.append(f"#{t.id} {due}{t.title}")
-        text = "\n".join(lines) or "No open tasks. 🎉"
-        await self.say(text + ("\n\nSay \"#3 다 했어\" or \"finished the report\" to tick one off." if lines else ""),
+        text = "\n".join(lines) or "남은 할 일이 없어요. 🎉"
+        await self.say(text + ("\n\n\"#3 다 했어\", \"보고서 끝냈어\"처럼 말하면 완료로 바꿔요." if lines else ""),
                        update.effective_chat.id)
 
     async def on_task_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -646,19 +695,19 @@ class Friday:
         t = self.store.task(int(tid))
         if action == "done":
             ok = self.store.complete_task(int(tid))
-            await q.answer("Done ✅" if ok else "Already closed")
+            await q.answer("완료 ✅" if ok else "이미 끝난 할 일이에요")
             if t:
                 await q.edit_message_text(f"✅ {t.title}")
         else:  # snooze an hour
             ok = bool(self.store.update_task(int(tid), remind=tu.now_utc() + timedelta(hours=1)))
-            await q.answer("I'll remind you in 1 hour" if ok else "Already closed")
+            await q.answer("1시간 뒤에 다시 알려드릴게요" if ok else "이미 끝난 할 일이에요")
             if t and ok:
-                await q.edit_message_text(f"⏳ {t.title} (reminding again in 1 hour)")
+                await q.edit_message_text(f"⏳ {t.title} (1시간 뒤 다시 알림)")
 
     async def _send_task_alert(self, text: str, t: Task) -> None:
         buttons = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Done", callback_data=f"task:done:{t.id}"),
-            InlineKeyboardButton("⏳ 1 hour", callback_data=f"task:snooze:{t.id}"),
+            InlineKeyboardButton("✅ 완료", callback_data=f"task:done:{t.id}"),
+            InlineKeyboardButton("⏳ 1시간 뒤", callback_data=f"task:snooze:{t.id}"),
         ]])
         await self.app.bot.send_message(self.owner, text, reply_markup=buttons)  # type: ignore[union-attr]
 
@@ -670,10 +719,10 @@ class Friday:
             try:
                 ZoneInfo(ctx.args[0])
             except Exception:
-                await update.message.reply_text("Unknown timezone. Use a name like Asia/Seoul or Europe/Paris.")
+                await update.message.reply_text("모르는 시간대예요. Asia/Seoul, Europe/Paris 같은 이름으로 써주세요.")
                 return
             self.store.set("tz", ctx.args[0])
-        await update.message.reply_text(f"Timezone: {self.tz}. Now: {tu.local_str(tu.now_utc(), self.tz)}")
+        await update.message.reply_text(f"시간대: {self.tz}. 지금: {tu.local_str(tu.now_utc(), self.tz)}")
 
     def _model_summary(self) -> str:
         return models_summary(self.store, self.cfg.codex_model, self.cfg.codex_effort)
@@ -698,7 +747,7 @@ class Friday:
             self.store.conn.backup(dst)
             dst.close()
             with copy.open("rb") as fh:
-                await update.message.reply_document(fh, filename=copy.name, caption="Friday database backup")
+                await update.message.reply_document(fh, filename=copy.name, caption="Friday 데이터베이스 백업")
 
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         proc = await asyncio.create_subprocess_exec(
@@ -746,16 +795,17 @@ class Friday:
             return
         jid = self.store.add_job(repo, task, engine)
         busy = self._running_job_id()
-        note = f" It starts after job #{busy}." if busy else ""
-        msg = await update.message.reply_text(f"🛠 Queued job #{jid}: {repo} ({engine})…{note}")
+        note = f" 작업 #{busy}이 끝나면 시작해요." if busy else ""
+        msg = await update.message.reply_text(f"🛠 작업 #{jid} 대기 중: {repo} ({engine})…{note}")
         self.store.link_job_message(msg.message_id, jid)
+        self.store.set(f"job_queued_msg:{jid}", str(msg.message_id))  # _run_job edits it into "started"
 
     async def cmd_jobs(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines = []
         for j in self.store.recent_jobs(10):
             line = f"#{j['id']} {j['status']} {j['repo']} ({j['engine']}) – {short(j['task'], 50)}"
             lines.append(line + (f" – {j['pr_url']}" if j["pr_url"] else ""))
-        await self.say("\n".join(lines) or "No coding jobs yet. Start one with /code <repo> <task>.",
+        await self.say("\n".join(lines) or "아직 코딩 작업이 없어요. /code <repo> <할 일> 로 시작해요.",
                        update.effective_chat.id)
 
     async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -765,30 +815,31 @@ class Friday:
             jid = self._running_job_id()
         job = self.store.job(jid) if jid else None
         if not job:
-            await update.message.reply_text("Usage: /stop <job id>. /jobs lists them.")
+            await update.message.reply_text("사용법: /stop <작업 번호>. 목록은 /jobs")
             return
         if job["status"] == "queued":
             self.store.update_job(jid, status="cancelled", followup=None)
-            await update.message.reply_text(f"⏹ Cancelled job #{jid} before it started.")
+            await update.message.reply_text(f"⏹ 작업 #{jid}을 시작 전에 취소했어요.")
         elif job["status"] == "running" and jid == self._running_job_id() and self._job_exec:
             # _run_job sees the cancellation, kills the agent's processes and reports it.
             self._job_exec.cancel()
         elif job["status"] == "running":  # not ours to cancel (shouldn't happen); don't leave it stuck
             self.store.update_job(jid, status="cancelled")
-            await update.message.reply_text(f"⏹ Marked job #{jid} cancelled.")
+            await update.message.reply_text(f"⏹ 작업 #{jid}을 취소로 표시했어요.")
         else:
-            await update.message.reply_text(f"Job #{jid} isn't running; it's {job['status']}.")
+            await update.message.reply_text(f"작업 #{jid}은 실행 중이 아니에요 (상태: {job['status']}).")
 
     async def _job_followup(self, msg, job) -> None:
         jid, status = job["id"], job["status"]
         if status in ("queued", "running"):
-            await msg.reply_text(f"Job #{jid} is still {status}. Reply again when it's done, or /stop {jid}.")
+            await msg.reply_text(f"작업 #{jid}은 아직 {status} 상태예요. 끝나면 다시 답장하거나 /stop {jid}")
         elif status in ("review", "done", "failed"):
             self.store.update_job(jid, followup=msg.text, status="queued")
-            sent = await msg.reply_text(f"↩️ Follow-up queued for #{jid}")
+            sent = await msg.reply_text(f"↩️ 작업 #{jid} 후속 지시 대기 중")
             self.store.link_job_message(sent.message_id, jid)
+            self.store.set(f"job_queued_msg:{jid}", str(sent.message_id))
         else:
-            await msg.reply_text(f"Job #{jid} is {status}. Start a new one with /code {job['repo']} <task>.")
+            await msg.reply_text(f"작업 #{jid}은 {status} 상태예요. 새 작업은 /code {job['repo']} <할 일>")
 
     async def on_job_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -799,10 +850,10 @@ class Friday:
         jid = int(raw)
         job = self.store.job(jid)
         if not job:
-            await q.answer("Unknown job")
+            await q.answer("없는 작업이에요")
             return
         if jid in self._job_busy:
-            await q.answer("Already on it…")
+            await q.answer("처리 중이에요…")
             return
         self._job_busy.add(jid)
         try:
@@ -811,54 +862,54 @@ class Friday:
                 return
             if action == "undo":
                 if job["status"] != "done" or not job["commits"]:
-                    await q.answer(f"Nothing to undo for job #{jid}.")
+                    await q.answer(f"작업 #{jid}은 되돌릴 게 없어요.")
                     return
-                await q.answer("Undoing…")
+                await q.answer("되돌리는 중…")
                 await self._quiet(q.edit_message_reply_markup(None))
                 await self.runner.undo(job)
                 self.store.update_job(jid, status="undone")
-                await self._job_send(jid, f"↩️ Undid job #{jid}: its changes to {job['repo']} were reverted "
-                                          "with a new commit, so the history keeps both.")
+                await self._job_send(jid, f"↩️ 작업 #{jid} 되돌림: {job['repo']}의 변경을 새 커밋으로 되돌렸어요 "
+                                          "(기록에는 둘 다 남아요).")
                 return
             if job["status"] != "review":
-                await q.answer(f"Job #{jid} is {job['status']}.")
+                await q.answer(f"작업 #{jid}은 {job['status']} 상태예요.")
                 await self._quiet(q.edit_message_reply_markup(None))
                 return
             # Answer now: merging can take longer than Telegram waits for a callback answer.
-            await q.answer("Merging…" if action == "merge" else "Closing…")
+            await q.answer("머지하는 중…" if action == "merge" else "닫는 중…")
             await self._quiet(q.edit_message_reply_markup(None))
             if action == "merge":
                 await self.runner.merge(job)
                 self.store.update_job(jid, status="merged")
                 own = self._is_own_repo(job)
                 buttons = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🚀 Deploy", callback_data=f"job:deploy:{jid}"),
+                    InlineKeyboardButton("🚀 배포", callback_data=f"job:deploy:{jid}"),
                 ]]) if own else None
-                hint = "\nDeploy to restart Friday with it." if own else ""
-                await self._job_send(jid, f"🔀 Merged #{jid}: {job['pr_url']}{hint}", buttons)
+                hint = "\n배포하면 Friday가 이 버전으로 재시작해요." if own else ""
+                await self._job_send(jid, f"🔀 #{jid} 머지함: {job['pr_url']}{hint}", buttons)
             else:
                 await self.runner.close(job)
                 self.store.update_job(jid, status="closed")
-                await self._job_send(jid, f"🗑 Closed #{jid}: pull request closed, branch deleted.")
+                await self._job_send(jid, f"🗑 #{jid} 닫음: 풀 리퀘스트를 닫고 브랜치를 지웠어요.")
         except Exception as e:
             if not isinstance(e, JobError):
                 log.exception("job button %s failed", q.data)
             detail = str(e) if isinstance(e, JobError) else f"{type(e).__name__}: {e}"
-            await self._quiet(q.answer("Failed"))  # no-op if already answered
-            await self._job_send(jid, f"❌ {action.capitalize()} #{jid} failed: {detail}")
+            await self._quiet(q.answer("실패"))  # no-op if already answered
+            await self._job_send(jid, f"❌ #{jid} {action} 실패: {detail}")
         finally:
             self._job_busy.discard(jid)
 
     async def _deploy_button(self, q, job) -> None:
         jid = job["id"]
         if job["status"] != "merged" or not self._is_own_repo(job):
-            await q.answer("Nothing to deploy.")
+            await q.answer("배포할 게 없어요.")
             return
         running = self._running_job_id()
         if running:  # the restart would kill it
-            await q.answer(f"Job #{running} is running. Deploy after it finishes, or /stop it.", show_alert=True)
+            await q.answer(f"작업 #{running}이 실행 중이에요. 끝난 뒤에 배포하거나 /stop 하세요.", show_alert=True)
             return
-        await q.answer("Deploying…")
+        await q.answer("배포하는 중…")
         unit = f"friday-deploy-{datetime.now():%Y%m%d-%H%M%S}"
         # deploy.sh restarts Friday, so it runs as its own systemd unit (outside friday.service, which
         # the restart kills), and the next start reads this flag to say it's back.
@@ -875,7 +926,7 @@ class Friday:
             raise JobError(f"couldn't start the deploy: {(err or out).strip()[-300:]}")
         text = (q.message.text if q.message and q.message.text else f"🔀 Merged #{jid}")
         await self._quiet(q.edit_message_text(
-            f"{text}\n\n🚀 Deploying… I'll say when I'm back. If I'm not: journalctl --user -u {unit}"
+            f"{text}\n\n🚀 배포하는 중… 돌아오면 알려드릴게요. 소식이 없으면: journalctl --user -u {unit}"
         ))
 
     def _is_own_repo(self, job) -> bool:
@@ -896,14 +947,14 @@ class Friday:
             try:
                 chat = json.loads(raw).get("chat")
                 _, out, _ = await run_cmd(["git", "log", "-1", "--format=%h %s"], cwd=PROJECT_ROOT, timeout=30)
-                await self.app.bot.send_message(chat or self.owner, f"🚀 Deployed: {out.strip() or '?'}")  # type: ignore[union-attr]
+                await self.app.bot.send_message(chat or self.owner, f"🚀 배포 완료: {out.strip() or '?'}")  # type: ignore[union-attr]
             finally:
                 self.store.delete("deploy_notify")
 
         for jid in self.store.fail_interrupted_jobs():
             job = self.store.job(jid)
-            await self._job_send(jid, f"⚠️ Job #{jid} ({job['repo']}) was stopped because Friday restarted.\n"
-                                      "Reply to this message with instructions to run it again.")
+            await self._job_send(jid, f"⚠️ Friday가 재시작돼서 작업 #{jid} ({job['repo']})이 멈췄어요.\n"
+                                      "다시 하려면 이 메시지에 답장으로 지시를 보내주세요.")
 
     async def _job_send(self, jid: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
         """Message the owner about a job and remember the message ids, so a reply to any of them continues it."""
@@ -939,8 +990,16 @@ class Friday:
         """Run one job and report it. Never raises (except when Friday shuts down), so the loop goes on."""
         jid = job["id"]
         head = f"#{jid} {job['repo']} ({job['engine']})"
-        what = f"follow-up: {short(job['followup'], 200)}" if job["followup"] else short(job["task"], 200)
-        await self._job_send(jid, f"🛠 Started job {head}, {what}")
+        what = f"후속 지시: {short(job['followup'], 200)}" if job["followup"] else short(job["task"], 200)
+        started = f"🛠 작업 {head} 시작: {what}"
+        queued = self.store.get(f"job_queued_msg:{jid}")  # the /code or follow-up message: edit it
+        self.store.delete(f"job_queued_msg:{jid}")
+        try:
+            if not queued:
+                raise LookupError
+            await self.app.bot.edit_message_text(started, chat_id=self.owner, message_id=int(queued))  # type: ignore[union-attr]
+        except Exception:  # no such message (a job from the chat agent), or it can't be edited
+            await self._job_send(jid, started)
         self._job_exec = asyncio.create_task(self.runner.execute(job))
         try:
             outcome = await self._job_exec
@@ -962,24 +1021,24 @@ class Friday:
             self.store.update_job(jid, status=outcome.status, error=outcome.message if failed else None)
             buttons = None
             if outcome.status == "review":
-                text = f"✅ Job {head} is ready for review:\n\n{outcome.message}"
+                text = f"✅ 작업 {head} 검토 준비됨:\n\n{outcome.message}"
                 buttons = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔀 Merge", callback_data=f"job:merge:{jid}"),
-                    InlineKeyboardButton("🗑 Close", callback_data=f"job:close:{jid}"),
+                    InlineKeyboardButton("🔀 머지", callback_data=f"job:merge:{jid}"),
+                    InlineKeyboardButton("🗑 닫기", callback_data=f"job:close:{jid}"),
                 ]])
             elif failed:
                 row = self.store.job(jid)
                 summary = row["summary"] if row else None
-                text = f"❌ Job {head} failed: {outcome.message}"
+                text = f"❌ 작업 {head} 실패: {outcome.message}"
                 if summary and summary not in outcome.message:
-                    text += f"\n\nThe agent said:\n{summary}"
+                    text += f"\n\n에이전트의 말:\n{summary}"
             else:
-                text = f"✅ Job {head} finished:\n\n{outcome.message}"
+                text = f"✅ 작업 {head} 완료:\n\n{outcome.message}"
                 if outcome.undo:  # a local project changed in place: offer to revert the job's commits
                     buttons = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("↩️ Undo", callback_data=f"job:undo:{jid}"),
+                        InlineKeyboardButton("↩️ 되돌리기", callback_data=f"job:undo:{jid}"),
                     ]])
-            await self._job_send(jid, text + "\n\nReply to this message to give it more instructions.", buttons)
+            await self._job_send(jid, text + "\n\n이 메시지에 답장하면 추가 지시를 줄 수 있어요.", buttons)
         except Exception:
             log.exception("reporting job %s failed", jid)
 
@@ -988,8 +1047,8 @@ class Friday:
             self.store.update_job(jid, status="cancelled", followup=None)
             job = self.store.job(jid)
             await self.runner.cleanup(job)  # cancelled jobs can't be resumed, so drop the worktree
-            note = f"\nIts pull request is still open: {job['pr_url']}" if job["pr_number"] else ""
-            await self._job_send(jid, f"⏹ Stopped job {head}.{note}")
+            note = f"\n풀 리퀘스트는 아직 열려 있어요: {job['pr_url']}" if job["pr_number"] else ""
+            await self._job_send(jid, f"⏹ 작업 {head} 중지됨.{note}")
         except Exception:
             log.exception("cleaning up stopped job %s failed", jid)
 
@@ -1021,7 +1080,7 @@ class Friday:
         aid = int(raw)
         a = self.store.approval(aid)
         if not a:
-            await q.answer("Unknown request")
+            await q.answer("없는 요청이에요")
             return
         # The tool stops waiting after 5 minutes (or dies with its run); a later tap mustn't count.
         # A chat request nobody waits for (followup) lasts longer; _expire_followups ends it.
@@ -1073,7 +1132,10 @@ class Friday:
                 log.error("form unavailable (%s)", type(e).__name__)
         icon = {"login": "🔑", "code": "🔢"}.get(r["kind"], "📝")
         why = f" ({spec['description']})" if spec["description"] else ""
-        head = f"🔑 {spec['title']} 정보가 필요해요{why}." if r["kind"] == "login" else f"{icon} {spec['title']}{why}"
+        head = f"{icon} {spec['title']}{why}"
+        if r["domain"]:  # always name the site, whatever the agent titled the request
+            reason = spec["description"] if spec["title"] == f"{r['domain']} 로그인" else spec["title"]
+            head = f"🔑 {r['domain']} 로그인" + (f" ({short(' '.join(reason.split()), 60)})" if reason else "")
         labels = ", ".join(f["label"] for f in fields)
         if url:  # the form page shows where each value goes (vault entry, site)
             lines = [head, f"[📝 입력하기]를 누르거나, 이 메시지에 답장으로 한 줄에 하나씩 보내도 돼요: {labels}."]
@@ -1196,10 +1258,10 @@ class Friday:
         args = ctx.args or []
         try:
             if len(args) != 2:
-                raise ValueError("usage: /login <name> <domain>, e.g. /login school lms.example.edu")
+                raise ValueError("사용법: /login <이름> <도메인>, 예: /login school lms.example.edu")
             domain = check(args[0], [args[1]])[0]
         except ValueError as e:
-            await update.message.reply_text(f"Not requested: {e}")
+            await update.message.reply_text(f"요청하지 않았어요: {e}")
             return
         await self._send_login_request(self.store.add_login_request(args[0], domain))
 
@@ -1218,10 +1280,10 @@ class Friday:
         try:
             entries = Vault(self.cfg.vault_dir).entries()
         except Exception as e:
-            await update.message.reply_text(f"The login vault can't be read ({type(e).__name__}).")
+            await update.message.reply_text(f"로그인 금고를 읽을 수 없어요 ({type(e).__name__}).")
             return
         if not entries:
-            await update.message.reply_text("No saved logins. Add one with /login <name> <domain>.")
+            await update.message.reply_text("저장된 로그인이 없어요. /login <이름> <도메인> 으로 추가해요.")
             return
         for entry in entries:
             text, buttons = self._vault_entry(*entry)
@@ -1281,12 +1343,12 @@ class Friday:
         if args[:1] == ["cancel"]:
             rid = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
             if rid and self.store.set_run_status(rid, "cancelled", only_from="pending"):
-                text = f"⏹ Cancelled run #{rid}."
+                text = f"⏹ 브라우저 작업 #{rid}을 취소했어요."
             elif rid and rid == self._running_run_id() and self.store.set_run_status(rid, "cancelled", only_from="running"):
                 self._run_task.cancel()  # type: ignore[union-attr]  # _browser_run reports it
-                text = f"⏹ Stopping run #{rid}…"
+                text = f"⏹ 브라우저 작업 #{rid}을 멈추는 중…"
             else:
-                text = "Usage: /runs cancel <id> (a pending or running run). /runs lists them."
+                text = "사용법: /runs cancel <번호> (대기 중이거나 실행 중인 작업). 목록은 /runs"
             await update.message.reply_text(text)
             return
         lines = []
@@ -1295,7 +1357,7 @@ class Friday:
             if r["status"] in ("done", "failed") and r["result"]:
                 line += f"\n   → {short(r['result'], 100)}"
             lines.append(line)
-        await self.say("\n".join(lines) + "\n\nCancel one: /runs cancel <id>" if lines else "No browser runs.",
+        await self.say("\n".join(lines) + "\n\n취소: /runs cancel <번호>" if lines else "브라우저 작업이 없어요.",
                        update.effective_chat.id)
 
     def _running_run_id(self) -> int | None:
@@ -1303,11 +1365,12 @@ class Friday:
 
     async def _runs_startup(self) -> None:
         for rid in self.store.fail_interrupted_runs():
-            await self.say(f"⚠️ Browser run #{rid} was stopped because Friday restarted. /runs shows it.")
+            await self.say(f"⚠️ Friday가 재시작돼서 브라우저 작업 #{rid}이 멈췄어요. /runs 에서 볼 수 있어요.")
 
     async def browser_run_loop(self) -> float:
-        # Polled, because schedule_browser_run (in the MCP server) adds runs too. One run at a time.
-        if self._running_run_id():
+        # Polled, because schedule_browser_run (in the MCP server) adds runs too. One run at a time,
+        # and not while a watch check (watches.py) is running: one unattended Codex run at once.
+        if self._running_run_id() or self._watch_busy():
             return 10
         run = self.store.next_due_run(tu.now_utc())
         if run and self.store.set_run_status(run["id"], "running", only_from="pending"):
@@ -1319,18 +1382,18 @@ class Friday:
         """A fresh Codex thread does the run (its run id lets fill_login use its approved logins);
         the result and a last screenshot go to the user. Never raises except on shutdown."""
         rid = run["id"]
-        await self._quiet(self.say(f"🌐 Browser run #{rid} started ({run['mode']}): {short(run['prompt'], 200)}"))
+        await self._quiet(self.say(f"🌐 브라우저 작업 #{rid} 시작 ({run['mode']}): {short(run['prompt'], 200)}"))
         prompt = instructions(self.cfg) + "\n---\n" + browser.run_prompt(run, tu.local_str(tu.now_utc(), self.tz))
         try:
             result = await run_codex(
                 replace(self.cfg, codex_timeout_seconds=browser.RUN_TIMEOUT_SECONDS), prompt,
                 model=self.store.get("model") or "", effort=self.store.get("effort") or "", run_id=rid,
-                toolsets={"browser"},
+                toolsets={"browser"}, tz=self.tz,
             )
         except asyncio.CancelledError:
             if self.store.scheduled_run(rid)["status"] != "cancelled":  # Friday is stopping: next start reports it
                 raise
-            await self._quiet(self.say(f"⏹ Stopped browser run #{rid}."))
+            await self._quiet(self.say(f"⏹ 브라우저 작업 #{rid} 중지됨."))
             return
         except Exception as e:
             log.exception("browser run %s crashed", rid)
@@ -1341,10 +1404,10 @@ class Friday:
             shot = self.cfg.files_dir / "browser" / f"run-{rid}.png"
             if await browser.screenshot(shot):
                 with shot.open("rb") as fh:
-                    await self.app.bot.send_photo(self.owner, fh, caption=f"🌐 #{rid} last page")  # type: ignore[union-attr]
+                    await self.app.bot.send_photo(self.owner, fh, caption=f"🌐 #{rid} 마지막 화면")  # type: ignore[union-attr]
         except Exception as e:
             log.info("no screenshot for run %s: %s", rid, e)
-        head = f"✅ Browser run #{rid} finished" if result.ok else f"❌ Browser run #{rid} failed"
+        head = f"✅ 브라우저 작업 #{rid} 완료" if result.ok else f"❌ 브라우저 작업 #{rid} 실패"
         await self._quiet(self.say(f"{head}:\n\n{text}"))
 
     # --- proposals (items read from an image or file, added on the user's tap)
@@ -1445,7 +1508,7 @@ class Friday:
         pid = int(raw)
         p = self.store.proposal(pid)
         if not p or p["status"] != "pending":
-            await q.answer("이미 처리했어요" if p else "Unknown proposal")
+            await q.answer("이미 처리했어요" if p else "없는 제안이에요")
             await self._quiet(q.edit_message_reply_markup(None))
             return
         if action == "dismiss":
@@ -1496,7 +1559,7 @@ class Friday:
         p = self.store.proposal(pid)
         item = p["items"][idx] if p and p["status"] == "accepted" and idx < len(p["items"]) else None
         if not item or not item.get("submission"):
-            await q.answer("Unknown item")
+            await q.answer("없는 항목이에요")
             return
         key = f"proposal_sub:{pid}:{idx}"
         if not self.store.claim_once(key, choice):
@@ -1525,7 +1588,7 @@ class Friday:
         except Exception as e:
             log.exception("scheduling a submission run failed")
             self.store.delete(key)  # let the user try again
-            await q.answer(f"Failed: {short(str(e), 150)}", show_alert=True)
+            await q.answer(f"실패: {short(str(e), 150)}", show_alert=True)
             return
         await q.answer("예약했어요")
         how = "제출 전에 승인을 받을게요" if choice == "approve" else "자동으로 제출할게요"
@@ -1686,20 +1749,23 @@ class Friday:
         for r in self.store.due_reminders(now):
             text = f"⏰ {r.text}"
             if now - r.next_at > timedelta(minutes=10):
-                text += f"\n(due {tu.local_str(r.next_at, self.tz)})"
+                text += f"\n({self._ko_time(r.next_at)} 예정이었어요)"
             await self.say(text)
             self.store.advance_reminder(r, now)
 
         zone = ZoneInfo(self.tz)
         for t in self.store.tasks_needing_nudge(now):
-            due = f"\nDue {t.due_at.astimezone(zone):%a %H:%M}" if t.due_at else ""
+            due = f"\n마감 {self._ko_time(t.due_at)}" if t.due_at else ""
             await self._send_task_alert(f"📝 {t.title}{due}", t)
             self.store.mark_task_nudged(t.id)
         for t in self.store.tasks_now_due(now):
-            await self._send_task_alert(f"⏰ Due now: {t.title}", t)
+            await self._send_task_alert(f"⏰ 지금 마감: {t.title}", t)
             self.store.mark_task_due_notified(t.id)
         await self._expire_followups()
-        return 15
+        # Sleep until the next alert, so it goes out on time; at most 15 s, since the MCP server
+        # (another process) may add an earlier one meanwhile.
+        nxt = self.store.next_alert_at()
+        return 15 if nxt is None else min(15, max(0.5, (nxt - tu.now_utc()).total_seconds() + 0.05))
 
     async def outbox_loop(self) -> float:
         for row in self.store.pending_outbox():
@@ -1732,13 +1798,13 @@ class Friday:
         except Exception as e:
             if self.store.get("gcal_error") != str(e):
                 self.store.set("gcal_error", str(e))
-                await self.say(f"Google Calendar stopped working: {e}")
+                await self.say(f"Google 캘린더가 작동하지 않아요: {e}")
             raise
         self.store.delete("gcal_error")
         for ev in events:
             if ev.start and now < ev.start <= now + lead and self.store.claim_event_notice(ev.id, ev.start.isoformat()):
                 mins = max(1, round((ev.start - now).total_seconds() / 60))
-                lines = [f"📅 In {mins} min: {ev.title}"]
+                lines = [f"📅 {mins}분 뒤: {ev.title}"]
                 if ev.location:
                     lines.append(ev.location)
                 if ev.link:
@@ -1763,33 +1829,33 @@ class Friday:
         local = datetime.now(zone)
         start = datetime.combine(local.date(), time(0), zone)
         end = start + timedelta(days=1)
-        lines = [f"☀️ {local:%a %Y-%m-%d}"]
+        lines = [f"☀️ {local:%Y-%m-%d} ({'월화수목금토일'[local.weekday()]})"]
 
         if gcal.is_connected(self.cfg.google_token):
             try:
                 events = await asyncio.to_thread(gcal.list_events, self.cfg.google_token, start, end, zone)
-                lines.append("\nCalendar:")
-                lines += [f"  {e.start:%H:%M} {e.title}" if e.start else f"  (all day) {e.title}" for e in events] or ["  nothing"]
+                lines.append("\n캘린더:")
+                lines += [f"  {e.start:%H:%M} {e.title}" if e.start else f"  (종일) {e.title}" for e in events] or ["  없음"]
             except Exception as e:
-                lines.append(f"\nCalendar unavailable: {e}")
+                lines.append(f"\n캘린더를 불러오지 못했어요: {e}")
 
         now = tu.now_utc()
         open_tasks = self.store.open_tasks()
         overdue = [t for t in open_tasks if t.due_at and t.due_at < start]
         due_today = [t for t in open_tasks if t.due_at and start <= t.due_at < end]
         if overdue:
-            lines.append("\nOverdue:")
-            lines += [f"  #{t.id} {t.title} (was due {t.due_at.astimezone(zone):%m/%d %H:%M})" for t in overdue]
-        lines.append("\nDue today:")
+            lines.append("\n지난 마감:")
+            lines += [f"  #{t.id} {t.title} (마감 {t.due_at.astimezone(zone):%m/%d %H:%M})" for t in overdue]
+        lines.append("\n오늘 마감:")
         lines += [f"  {t.due_at.astimezone(zone):%H:%M} #{t.id} {t.title}" + (" ⚠️" if t.due_at < now else "")
-                  for t in due_today] or ["  nothing"]
+                  for t in due_today] or ["  없음"]
         no_deadline = sum(1 for t in open_tasks if not t.due_at)
         if no_deadline:
-            lines.append(f"  (+{no_deadline} open without a deadline, see /tasks)")
+            lines.append(f"  (+ 마감 없는 할 일 {no_deadline}개, /tasks)")
 
         rs = self.store.active_reminders(until=end)
-        lines.append("\nReminders:")
-        lines += [f"  {r.next_at.astimezone(zone):%H:%M} {r.text}" for r in rs] or ["  none"]
+        lines.append("\n리마인더:")
+        lines += [f"  {r.next_at.astimezone(zone):%H:%M} {r.text}" for r in rs] or ["  없음"]
         return "\n".join(lines)
 
 
