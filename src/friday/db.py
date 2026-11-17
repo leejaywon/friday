@@ -177,6 +177,7 @@ MIGRATIONS = [
     # form (forms.make_spec; '{}' = a plain login), `result` the non-sensitive values handed back
     # to the agent, erased as soon as it reads them. name/domain: where sensitive values are saved.
     ("login_requests", "kind", "TEXT NOT NULL DEFAULT 'login'"),  # login | code | form
+    ("login_requests", "form_message_id", "INTEGER"),  # the message showing the Mini App keyboard
     ("login_requests", "spec", "TEXT NOT NULL DEFAULT '{}'"),
     ("login_requests", "result", "TEXT"),
 ]
@@ -679,6 +680,9 @@ class Store:
 
     def set_login_request_message(self, rid: int, message_id: int) -> None:
         self.conn.execute("UPDATE login_requests SET message_id = ? WHERE id = ?", (message_id, rid))
+
+    def set_login_request_form_message(self, rid: int, message_id: int) -> None:
+        self.conn.execute("UPDATE login_requests SET form_message_id = ? WHERE id = ?", (message_id, rid))
 
     def finish_login_request(self, rid: int, status: str, result: dict | None = None) -> bool:
         """pending -> saved | cancelled | expired, once. result: the non-sensitive values (take_result)."""

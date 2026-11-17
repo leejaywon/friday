@@ -1,6 +1,6 @@
 """Forms: what the agent asks the owner for with request_form (request_login and request_code are
-forms too). The owner answers by replying to the request message, one field per line; the bot
-deletes the reply from the chat.
+forms too). The owner fills one in in the Mini App (miniapp.py, the "form" component of site/app/)
+or replies to the request message, one field per line; the bot deletes the reply from the chat.
 
 Sensitive fields (passwords by default) go only to the vault, under the request's save_as name
 and bound to its domain if it has one; the agent gets only the other values back.
@@ -18,6 +18,7 @@ FIELD_TYPES = ("text", "password", "code", "number", "email", "url", "textarea",
                "checkbox", "date", "time")
 MAX_FIELDS = 12
 MAX_OPTIONS = 20
+MAX_SPEC_BYTES = 2000  # the spec rides in the Mini App's URL, with the ~600-character public key
 LOGIN_KEYS = ("username", "password")  # sensitive fields with these names make a vault entry a website login
 
 
@@ -49,8 +50,9 @@ def parse_fields(raw: str | list, sensitive_default: bool = False) -> list[dict]
         f = {"name": name, "label": _text(item.get("label") or name, 60), "type": kind,
              "required": bool(item.get("required", kind != "checkbox")),
              "sensitive": bool(item.get("sensitive", kind == "password" or sensitive_default))}
-        if item.get("help"):
-            f["help"] = _text(item["help"], 160)
+        for key, limit in (("placeholder", 60), ("help", 160)):
+            if item.get(key):
+                f[key] = _text(item[key], limit)
         if kind in ("select", "choice"):
             opts = item.get("options")
             if not isinstance(opts, list) or not 1 <= len(opts) <= MAX_OPTIONS:
@@ -66,12 +68,16 @@ def parse_fields(raw: str | list, sensitive_default: bool = False) -> list[dict]
     return out
 
 
-def make_spec(title: str, fields: list[dict], description: str = "", domain: str = "", save_as: str = "") -> dict:
-    """The form as stored with the request and shown in its message."""
+def make_spec(title: str, fields: list[dict], description: str = "", domain: str = "", save_as: str = "",
+              submit: str = "") -> dict:
+    """The form as stored with the request: shown in its message and by the Mini App."""
     if not fields:
         raise ValueError("a form needs at least one field")
-    spec = {"title": _text(title, 80) or "Friday", "description": _text(description, 300), "site": domain,
-            "save_as": save_as if any(f["sensitive"] for f in fields) else "", "fields": fields}
+    spec = {"kind": "form", "title": _text(title, 80) or "Friday", "description": _text(description, 300),
+            "site": domain, "save_as": save_as if any(f["sensitive"] for f in fields) else "",
+            "submit": _text(submit, 30), "fields": fields}
+    if len(json.dumps(spec, ensure_ascii=False).encode()) > MAX_SPEC_BYTES:
+        raise ValueError("the form is too big for Telegram's button: fewer fields or shorter labels, help or options")
     return spec
 
 
@@ -82,14 +88,14 @@ def login_spec(name: str, domain: str, reason: str = "", extra: list[dict] | Non
         {"name": "password", "label": "Password", "type": "password", "required": True, "sensitive": True},
         *(extra or []),
     ]
-    return make_spec(f"{domain} login", fields, (reason or "").strip(), domain, name)
+    return make_spec(f"{domain} login", fields, (reason or "").strip(), domain, name, "Save")
 
 
 def code_spec(reason: str, label: str = "Code") -> dict:
     """request_code: one code, returned to the agent."""
     field = {"name": "code", "label": _text(label, 60) or "Code", "type": "code", "required": True,
              "sensitive": False}
-    return make_spec(field["label"], [field], reason)
+    return make_spec(field["label"], [field], reason, submit="Send")
 
 
 TRUE = ("true", "1", "y", "yes", "on", "예", "네")

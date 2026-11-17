@@ -1,0 +1,150 @@
+/* Telegram's theme first (its script sets --tg-theme-*); the --fb-* values only fill in outside
+   Telegram or on clients that lack a key. Inside Telegram the root gets .light/.dark from
+   WebApp.colorScheme, so the fallbacks follow Telegram's theme rather than the OS. */
+:root {
+  color-scheme: light dark;
+  --fb-bg: #efeff4; --fb-section: #ffffff; --fb-text: #000000; --fb-hint: #8e8e93;
+  --fb-link: #2481cc; --fb-button: #2481cc; --fb-button-text: #ffffff; --fb-danger: #e53935;
+  --fb-sep: rgba(60, 60, 67, 0.2);
+}
+:root.dark {
+  --fb-bg: #000000; --fb-section: #1c1c1d; --fb-text: #ffffff; --fb-hint: #98989e;
+  --fb-link: #3e88f7; --fb-button: #3e88f7; --fb-button-text: #ffffff; --fb-danger: #eb5545;
+  --fb-sep: rgba(84, 84, 88, 0.6);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --fb-bg: #000000; --fb-section: #1c1c1d; --fb-text: #ffffff; --fb-hint: #98989e;
+    --fb-link: #3e88f7; --fb-button: #3e88f7; --fb-button-text: #ffffff; --fb-danger: #eb5545;
+    --fb-sep: rgba(84, 84, 88, 0.6);
+  }
+}
+:root {
+  --bg: var(--tg-theme-secondary-bg-color, var(--fb-bg));
+  --section: var(--tg-theme-section-bg-color, var(--tg-theme-bg-color, var(--fb-section)));
+  --text: var(--tg-theme-text-color, var(--fb-text));
+  --hint: var(--tg-theme-hint-color, var(--fb-hint));
+  --accent: var(--tg-theme-accent-text-color, var(--tg-theme-link-color, var(--fb-link)));
+  --button: var(--tg-theme-button-color, var(--fb-button));
+  --button-text: var(--tg-theme-button-text-color, var(--fb-button-text));
+  --danger: var(--tg-theme-destructive-text-color, var(--fb-danger));
+  --sep: var(--tg-theme-section-separator-color, var(--fb-sep));
+  --chip: color-mix(in srgb, var(--hint) 14%, transparent);
+  --placeholder: color-mix(in srgb, var(--hint) 78%, transparent);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body {
+  font: 17px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Apple SD Gothic Neo",
+        "Noto Sans KR", "Helvetica Neue", sans-serif;
+  -webkit-text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  word-break: keep-all; /* CJK text wraps between words, not inside them */
+}
+main {
+  max-width: 560px; margin: 0 auto;
+  padding: calc(20px + var(--tg-safe-area-inset-top, 0px) + var(--tg-content-safe-area-inset-top, 0px))
+           16px calc(24px + env(safe-area-inset-bottom));
+}
+svg { display: block; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Header */
+header { padding: 0 4px 18px; }
+h1 { margin: 0; font-size: 24px; line-height: 1.25; font-weight: 700; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.sub { margin: 6px 0 0; color: var(--hint); font-size: 15px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 100%; margin-top: 10px;
+  padding: 4px 10px 4px 8px; border-radius: 999px; background: var(--chip); color: var(--hint);
+  font-size: 13px; line-height: 18px;
+}
+.chip svg { width: 14px; height: 14px; flex: none; }
+.chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Inset-grouped section */
+.group { background: var(--section); border-radius: 12px; overflow: hidden; }
+.field { position: relative; padding: 11px 16px 12px; }
+.field + .field::before {
+  content: ""; position: absolute; top: 0; left: 16px; right: 0; height: 1px; background: var(--sep);
+}
+@media (min-resolution: 2dppx) { .field + .field::before { transform: scaleY(0.5); transform-origin: top; } }
+.label {
+  display: flex; align-items: center; gap: 4px; margin-bottom: 3px;
+  color: var(--hint); font-size: 13px; line-height: 18px; transition: color 0.15s;
+}
+.label .opt { opacity: 0.8; }
+.field:focus-within .label { color: var(--accent); }
+.field.bad .label { color: var(--danger); }
+.control { position: relative; display: flex; align-items: center; min-height: 30px; }
+
+input, select, textarea {
+  flex: 1; min-width: 0; width: 100%; margin: 0; padding: 4px 0; border: 0; border-radius: 0; outline: 0;
+  background: transparent; color: var(--text); font: inherit; font-size: 17px; line-height: 22px;
+  caret-color: var(--accent); -webkit-appearance: none; appearance: none;
+}
+::placeholder { color: var(--placeholder); opacity: 1; }
+textarea { resize: none; min-height: 44px; max-height: 40vh; }
+input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="date"], input[type="time"] { min-height: 30px; text-align: left; }
+input::-webkit-date-and-time-value { text-align: left; }
+input::-webkit-calendar-picker-indicator { opacity: 0.55; cursor: pointer; }
+input.code { font-size: 22px; font-weight: 500; letter-spacing: 0.32em; font-variant-numeric: tabular-nums; }
+input.code::placeholder { font-size: 17px; font-weight: 400; letter-spacing: normal; }
+
+select { padding-right: 28px; cursor: pointer; }
+select.empty, input.empty { color: var(--placeholder); }
+select option { color: initial; }
+.chev { position: absolute; right: -2px; color: var(--hint); pointer-events: none; }
+.chev svg { width: 20px; height: 20px; }
+
+.eye {
+  flex: none; display: grid; place-items: center; width: 40px; height: 40px; margin: -6px -10px -6px 4px;
+  padding: 0; border: 0; background: transparent; color: var(--hint); cursor: pointer; border-radius: 50%;
+}
+.eye svg { width: 22px; height: 22px; }
+.eye:focus-visible { outline: 2px solid var(--accent); }
+
+.choices { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 2px; }
+.choices button {
+  border: 0; border-radius: 999px; padding: 7px 14px; background: var(--chip); color: var(--text);
+  font: inherit; font-size: 15px; line-height: 20px; cursor: pointer; transition: background 0.15s, color 0.15s;
+}
+.choices button[aria-pressed="true"] { background: var(--button); color: var(--button-text); }
+.choices button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.switch-row { flex: 1; display: flex; align-items: center; gap: 12px; min-height: 30px; cursor: pointer; }
+.switch-row .text { flex: 1; font-size: 17px; overflow-wrap: anywhere; }
+.field.bad .switch-row .text { color: var(--danger); }
+input.switch {
+  flex: none; position: relative; width: 51px; height: 31px; padding: 0; border-radius: 16px; cursor: pointer;
+  background: color-mix(in srgb, var(--hint) 32%, transparent); transition: background 0.2s;
+}
+input.switch::before {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%;
+  background: #ffffff; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2); transition: transform 0.2s;
+}
+input.switch:checked { background: var(--button); }
+input.switch:checked::before { transform: translateX(20px); }
+input.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.help { margin-top: 4px; color: var(--hint); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
+.msg { margin-top: 4px; color: var(--danger); font-size: 13px; line-height: 1.4; }
+.msg:empty { display: none; }
+
+/* Notices */
+.error { margin: 12px 16px 0; color: var(--danger); font-size: 14px; }
+.preview {
+  display: flex; align-items: center; gap: 8px; margin: 0 0 16px; padding: 8px 12px; border-radius: 10px;
+  background: var(--chip); color: var(--hint); font-size: 13px; line-height: 1.4;
+}
+.preview svg { width: 15px; height: 15px; flex: none; }
+.preview.flash { animation: flash 0.9s ease; }
+@keyframes flash { 0%, 100% { color: var(--hint); } 25%, 60% { color: var(--accent); } }
+.send {
+  display: block; width: 100%; height: 50px; margin-top: 24px; border: 0; border-radius: 12px;
+  background: var(--button); color: var(--button-text); font: inherit; font-size: 17px; font-weight: 600; cursor: pointer;
+}
+.send:active { opacity: 0.85; }
+.empty-state { padding-top: 28vh; text-align: center; }
+.empty-state svg { width: 44px; height: 44px; margin: 0 auto 14px; color: var(--hint); stroke-width: 1.5; }
+.empty-state h1 { font-size: 20px; }
+[hidden] { display: none !important; }

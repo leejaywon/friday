@@ -66,6 +66,10 @@ class Config:
     # per message; exec stays the fallback. Env: FRIDAY_CODEX_SERVER
     codex_server: bool = True
 
+    # The Mini App (miniapp.py) as an https URL; empty = requests are only answered by reply.
+    # Env: FRIDAY_APP_URL (unset: the page this repo publishes, miniapp.DEFAULT_URL)
+    app_url: str = ""
+
     @property
     def default_model(self) -> str:
         return self.claude_model if self.chat_engine == "claude" else self.codex_model
@@ -152,6 +156,17 @@ def _int_list(raw: str) -> tuple[int, ...]:
     return tuple(int(p) for p in raw.replace(" ", "").split(",") if p)
 
 
+def _app_url() -> str:
+    from .miniapp import DEFAULT_URL
+
+    raw = os.environ.get("FRIDAY_APP_URL")
+    url = DEFAULT_URL if raw is None else raw.strip()
+    if url and not url.startswith("https://"):
+        logging.getLogger(__name__).warning("FRIDAY_APP_URL must be an https URL; the Mini App is off")
+        return ""
+    return url
+
+
 def load_config() -> Config:
     load_dotenv(env_file(), override=False)
     tz = (os.environ.get("FRIDAY_TZ") or "UTC").strip()
@@ -170,6 +185,7 @@ def load_config() -> Config:
         data_dir=data_dir,
         default_tz=tz,
         chat_engine=chat_engine,
+        app_url=_app_url(),
         claude_model=os.environ.get("CLAUDE_MODEL", "").strip(),
         codex_bin=os.environ.get("CODEX_BIN", "codex"),
         codex_model=os.environ.get("CODEX_MODEL", "").strip(),

@@ -767,7 +767,7 @@ async def _run_form(spec: dict, kind: str = "form", name: str = "", domain: str 
     deadline = time.monotonic() + APPROVAL_TIMEOUT
     while time.monotonic() < deadline and store.login_request(rid)["status"] == "pending":
         await asyncio.sleep(2)
-    if store.finish_login_request(rid, "expired"):  # still pending: mark the request message as ended
+    if store.finish_login_request(rid, "expired"):  # still pending: close the form button too
         store.queue("login_expired", text=str(rid))
     return store.login_request(rid)["status"], store.take_result(rid)  # the result is erased once read
 
@@ -777,10 +777,10 @@ NOT_SUBMITTED = {"cancelled": "Cancelled", "expired": "Timed out"}
 
 @server.tool()
 async def request_form(title: str, fields: str, description: str = "", domain: str = "", save_as: str = "",
-                       ctx: Context | None = None) -> str:
-    """Ask the user for structured input or anything secret on Telegram: they reply to Friday's
-    request message, one value per line, and Friday deletes the reply from the chat. For a simple
-    question, just ask in chat instead.
+                       submit_label: str = "", ctx: Context | None = None) -> str:
+    """Ask the user for structured input or anything secret through a form on Telegram (a Mini App
+    whose answer is encrypted to this server, or a reply Friday deletes). For a simple question,
+    just ask in chat instead.
     Sensitive fields (passwords by default, or "sensitive": true) go only to the vault under
     save_as and are never returned to you; the other values are. Waits up to 5 minutes.
     Returns 'Submitted: {json}' (sensitive fields read "stored as <save_as>.<field>"),
@@ -788,13 +788,14 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
 
     title: what the form is for, in the user's language, e.g. 'OpenAI API key'.
     fields: JSON list (at most 12) of {"name", "label", "type", "required" (default true;
-        checkbox false), "help", "options" (select/choice: strings or
+        checkbox false), "placeholder", "help", "options" (select/choice: strings or
         {"value", "label"}), "default", "sensitive"}. type: text, password, code, number, email,
         url, textarea, select, choice, checkbox, date, time.
     description: a sentence on why you ask and how it will be used; shown to the user.
     domain: the site a sensitive value is for (like a login); empty = not bound to any site.
     save_as: vault name for the sensitive values (required if any field is sensitive);
         replaces an entry of that name.
+    submit_label: the submit button's text, e.g. 'Save'.
     """
     try:
         parsed = parse_fields(fields)
@@ -804,7 +805,7 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
         domain = domain.strip().lower().rstrip(".")
         if domain and not DOMAIN.match(domain):
             raise ValueError("domain: a site like lms.example.edu (no https://, no path), or empty")
-        spec = make_spec(title, parsed, description, domain, save_as)
+        spec = make_spec(title, parsed, description, domain, save_as, submit_label)
     except ValueError as e:
         return f"Not requested: {e}"
     status, values = await _run_form(spec, "form", save_as if sensitive else "", domain, ctx)
@@ -819,8 +820,8 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
 @server.tool()
 async def request_login(name: str, domain: str, reason: str = "", fields: str = "", ctx: Context | None = None) -> str:
     """Ask the user on Telegram for a website login when no saved login fits (see list_logins).
-    They reply with it (Friday deletes the reply) and Friday stores it in the vault, so you never
-    see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
+    They type it into a form (or reply with it; Friday deletes the reply) and Friday stores it in
+    the vault, so you never see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
     with that name: it won't ask again on that site), 'Cancelled' or 'Timed out'.
 
     name: short name for the login, e.g. 'school' (letters, digits, '.', '_', '-').
@@ -850,7 +851,7 @@ async def request_login(name: str, domain: str, reason: str = "", fields: str = 
 @server.tool()
 async def request_code(reason: str, label: str = "Code", ctx: Context | None = None) -> str:
     """Ask the user on Telegram for a one-time code (2FA, SMS or email code, OTP) a site asks for.
-    They reply with it; the code is returned to you and not stored anywhere. Waits up to
+    They type it into a form (or reply with it); the code is returned to you and not stored anywhere. Waits up to
     5 minutes. Returns 'Code: <code>', 'Cancelled' or 'Timed out'.
 
     reason: a few words in the user's language, e.g. 'SMS code for lms.example.edu'.

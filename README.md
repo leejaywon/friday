@@ -93,7 +93,7 @@ one). `deploy/push.sh` uploads it and deploys.
 | `/stop <id>` | stop a running coding job |
 | `/runs` | scheduled browser runs and their results; `/runs cancel <id>` cancels one |
 | `/watches` | what Friday is watching for you: pause, resume, delete |
-| `/login <name> <domain>` | save a website login: reply to Friday's message with the username and password |
+| `/login <name> <domain>` | save a website login through a form (see **Forms**) |
 | `/logins` | saved website logins: 🔒 ask again before use, 🗑 delete |
 | `/files [folder]` | the newest files in Friday's workspace; tap one to get or delete it |
 | `/backup` | sends you the database file |
@@ -119,13 +119,22 @@ online, Friday then asks how: ⏰ reminder only, 🧭 prepare it and ask you bef
 shared browser through the Playwright MCP server. To log in it uses a saved login from the vault:
 it types the username and password itself (the agent never sees them), only on the login's own
 domains and only over https. The first use on each site asks you on Telegram (✅ / ❌). If no
-login fits, Friday sends a 🔑 request: reply to it with the username on the first line and the
-password on the second (plus any extra fields it lists). The bot stores them in the vault and
-deletes your reply. One-time codes (SMS, OTP) work the same way and aren't stored. Before
+login fits, Friday sends a 🔑 request (see **Forms** below). One-time codes (SMS, OTP) are asked
+for the same way and aren't stored. Before
 anything irreversible (submit, send, pay, delete) Friday sends a screenshot and waits for ✅.
 "Tomorrow at 9, submit the report on the course site" schedules a browser run: you approve the
 plan and the logins it may use. The browser can't open `file://` pages, and its control port
 listens on the server's localhost only. `FRIDAY_BROWSER=false` turns it off.
+
+**Forms**: when Friday needs a login, a code, a key or a few choices, its request comes with a
+**📝 Open form** button under the text field. It opens Friday's Mini App, a small page inside
+Telegram, and what you type there is encrypted for your server (AES-256-GCM, the key wrapped with
+your server's RSA key in `~/friday-data/vault/`), so Telegram carries only ciphertext. Passwords
+and other 🔐 fields go only to the vault, never to the AI. You can also reply to the request
+message with one value per line; Friday deletes your reply. The page (`site/app/`) is the same for
+every Friday, so all installs use the copy this repo publishes at
+https://leejaywon.github.io/friday/app/. To use your own copy, host `site/` on any https address
+and set `FRIDAY_APP_URL` to its `app/` page; `FRIDAY_APP_URL=` (empty) turns the button off.
 
 **Watches**: say what to watch in plain words. Friday sends a 🔔 approval with what it will
 check, how often (at least every 15 minutes), until when, and which tools and saved logins it may

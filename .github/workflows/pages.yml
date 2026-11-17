@@ -1,0 +1,36 @@
+# Publishes site/ (Friday's Telegram Mini App, site/app/) to GitHub Pages. Every Friday uses this
+# copy by default (src/friday/miniapp.py DEFAULT_URL), so it runs only in the main repo. To host
+# your own copy, change the `if:` below, turn on Pages (Settings > Pages > Source: GitHub Actions)
+# and set FRIDAY_APP_URL to it.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'leejaywon/friday'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

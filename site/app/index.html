@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<!-- Only this folder's scripts and Telegram's run, and nothing is fetched or posted from here: the
+     answer leaves only through Telegram.WebApp.sendData, encrypted to the owner's server. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Friday</title>
+<!-- Before Telegram's script, which appends its launch parameters to the fragment. -->
+<script src="hash.js"></script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main id="main">
+  <p class="preview" id="preview" hidden></p>
+  <header id="header" hidden>
+    <h1 id="title"></h1>
+    <p class="sub" id="desc" hidden></p>
+    <div class="chip" id="site" hidden></div>
+  </header>
+  <div id="body"></div>
+  <p class="error" id="error" hidden></p>
+  <button type="button" class="send" id="send" hidden></button>
+</main>
+<!-- The shared part, then one file per component (each calls FridayApp.register). -->
+<script src="core.js"></script>
+<script src="components/form.js"></script>
+</body>
+</html>

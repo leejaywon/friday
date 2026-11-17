@@ -4,8 +4,9 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from friday import bot as botmod
-from friday.vault import Vault
 from friday.forms import login_spec, parse_fields
+from friday.miniapp import AppKey, encrypt_like_the_page
+from friday.vault import Vault
 
 
 def _bot(cfg):
@@ -49,6 +50,29 @@ def test_login_reply_goes_to_the_vault_only(cfg, caplog):
     assert f.store.login_request(rid)["status"] == "saved"
     assert f.store.take_result(rid) == {}  # nothing for the agent
     assert "pw secret" not in caplog.text and "2024123" not in caplog.text
+    f.store.close()
+
+
+def test_mini_app_answer_is_decrypted_and_routed_like_a_reply(cfg, caplog):
+    f, sent, edited = _bot(replace(cfg, allowed_user_ids=(1,)))
+    rid = f.store.add_login_request("school", "lms.example.edu", "", spec=login_spec("school", "lms.example.edu"))
+    asyncio.run(f._send_login_request(rid))
+    assert f.store.login_request(rid)["form_message_id"]  # sent with the 📝 Open form keyboard
+
+    def answer(payload):
+        async def delete():
+            return True
+        data = encrypt_like_the_page(AppKey(cfg.vault_dir).public_b64(), payload)
+        msg = SimpleNamespace(web_app_data=SimpleNamespace(data=data), chat_id=1, delete=delete)
+        asyncio.run(f.on_app_data(SimpleNamespace(message=msg), None))
+
+    values = {"username": "student", "password": "pw secret 1"}
+    answer({"rid": rid + 1, "values": values})  # not a pending request: nothing saved
+    assert Vault(cfg.vault_dir).get("school") is None
+    answer({"rid": rid, "values": values})
+    assert Vault(cfg.vault_dir).get("school").password == "pw secret 1"
+    assert f.store.login_request(rid)["status"] == "saved" and sent[-1] == "✅ Saved school"
+    assert (cfg.vault_dir / "form_key.pem").stat().st_mode & 0o777 == 0o600 and "pw secret" not in caplog.text
     f.store.close()
 
 

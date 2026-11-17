@@ -22,7 +22,11 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -34,7 +38,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import browser, gcal, mcp_config
+from . import browser, gcal, mcp_config, miniapp
 from . import timeutil as tu
 from . import workspace as wsfiles
 from .agent import AgentResult, engine_status, instructions, run_turn
@@ -84,6 +88,8 @@ APPROVAL_EXPIRES = timedelta(minutes=5, seconds=10)
 FOLLOWUP_EXPIRES = timedelta(minutes=30)
 # Extra turns per message when the agent turns on a toolset (use_tools), so it gets the tools.
 MAX_CONTINUATIONS = 2
+# The plain [Cancel] button next to a request's [📝 Open form]: the text it sends.
+CANCEL_TEXT = "Cancel"
 # A one-line reply that only says a request was sent; the user sees the request itself.
 REQUEST_ECHO = re.compile(r"보냈|보낼게|요청|입력|sent|request|form|fill in|enter|reply", re.I)
 # Before the message when a chat turn is retried with `codex exec` after the app-server died mid-turn.
@@ -244,6 +250,7 @@ class Friday(WatchBot):
         app.add_handler(CommandHandler("login", self.cmd_login, filters=me))
         app.add_handler(CommandHandler("logins", self.cmd_logins, filters=me))
         app.add_handler(CallbackQueryHandler(self.on_login_button, pattern=r"^login:cancel:\d+$"))
+        app.add_handler(MessageHandler(me & filters.StatusUpdate.WEB_APP_DATA, self.on_app_data))
         app.add_handler(CallbackQueryHandler(self.on_vault_button, pattern=r"^vault:(untrust|del|delyes|delno):[A-Za-z0-9_.-]{1,40}$"))
         app.add_handler(CallbackQueryHandler(self.on_job_button, pattern=r"^job:(merge|close|deploy|undo):\d+$"))
         app.add_handler(CallbackQueryHandler(self.on_proposal_button, pattern=r"^prop:(accept|dismiss):\d+$"))
@@ -566,6 +573,12 @@ class Friday(WatchBot):
         if job:
             await self._job_followup(msg, job)
             return
+        # The [Cancel] button next to a request's [📝 Open form]: cancel it, never pass it to the agent.
+        if (msg.text or "").strip() == CANCEL_TEXT and (req := self._keyboard_request()):
+            if self.store.finish_login_request(req["id"], "cancelled"):
+                await self._close_login_request(req["id"], f"❌ {self._request_title(req)}: cancelled", msg.chat_id)
+                await self._request_done("login", req["id"])
+            return
         # A photo sent just before this message may still be downloading; let it join this message.
         waited = 0.0
         while self._downloads and waited < self.cfg.file_download_wait_seconds:
@@ -589,6 +602,12 @@ class Friday(WatchBot):
         note = (f"[The user shared their location: {where}{place}. Map link: "
                 f"https://maps.google.com/?q={where}. Use it for anything about where they are.]")
         await self.ask(msg.chat_id, self._reply_context(msg) + note + "\n" + msg.caption)
+
+    def _keyboard_request(self):
+        """The newest pending request whose keyboard ([📝 Open form] [Cancel]) is showing."""
+        return self.store.conn.execute(
+            "SELECT * FROM login_requests WHERE status = 'pending' AND form_message_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1").fetchone()
 
     @staticmethod
     def _reply_context(msg) -> str:
@@ -1153,15 +1172,20 @@ class Friday(WatchBot):
     @staticmethod
     def _request_spec(r) -> dict:
         spec = json.loads(r["spec"] or "{}")
-        return spec if spec.get("fields") else login_spec(r["name"], r["domain"], r["reason"])  # /login
+        if not spec.get("fields"):  # /login
+            return login_spec(r["name"], r["domain"], r["reason"])
+        return {**spec, "kind": "form"}  # requests from before the Mini App had kinds
 
     def _request_title(self, r) -> str:
         return self._request_spec(r)["title"]
 
     async def _send_login_request(self, rid: int) -> None:
-        """Send a form request (request_form, request_login, request_code, /login). The owner
-        replies to it, one field per line (on_text, _login_reply). The text says where sensitive
-        values go: it comes from Friday, not from the agent's wording, so a phishing attempt shows."""
+        """Send a form request (request_form, request_login, request_code, /login). With the Mini App
+        (FRIDAY_APP_URL) the message carries a reply-keyboard button that opens the form, whose
+        encrypted answer arrives in on_app_data, and a plain [Cancel] button (on_text cancels on that
+        exact text). Replying to the message, one field per line (on_text, _login_reply), works
+        either way. The text says where sensitive values go: it comes from Friday, not from the
+        agent's wording, so a phishing attempt shows."""
         r = self.store.login_request(rid)
         if not r or r["status"] != "pending" or r["message_id"]:
             return
@@ -1174,12 +1198,32 @@ class Friday(WatchBot):
             where = f"used only on {spec['site']}" if spec["site"] else "not tied to any site"
             lines.append(f"🔐 {', '.join(secret)}: stored only in the vault as '{r['name']}', never shown to "
                          f"the AI ({where}).")
-        lines.append("Reply to this message with one value per line; I delete your reply right away:")
+        url = ""
+        if self.cfg.app_url:
+            try:
+                url = miniapp.url(self.cfg.app_url, self.cfg.vault_dir, rid, spec)
+            except Exception as e:  # no Mini App then: the reply still works
+                log.error("Mini App unavailable (%s)", type(e).__name__)
+        if url:
+            lines.append("Tap 📝 Open form below, or reply to this message with one value per line "
+                         "(I delete your reply right away):")
+        else:
+            lines.append("Reply to this message with one value per line; I delete your reply right away:")
         lines += [f"{i}. {self._field_hint(f)}" for i, f in enumerate(spec["fields"], 1)]
-        cancel = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"login:cancel:{rid}")]])
-        m = await self.app.bot.send_message(self.owner, "\n".join(lines)[:TELEGRAM_LIMIT],  # type: ignore[union-attr]
-                                            reply_markup=cancel)
+        text = "\n".join(lines)[:TELEGRAM_LIMIT]
+        if not url:
+            cancel = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"login:cancel:{rid}")]])
+            m = await self.app.bot.send_message(self.owner, text, reply_markup=cancel)  # type: ignore[union-attr]
+            self.store.set_login_request_message(rid, m.message_id)
+            return
+        # sendData only works from a reply-keyboard button, and a message has one keyboard, so
+        # [Cancel] is a plain keyboard button next to it: it sends the text CANCEL_TEXT (on_text).
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("📝 Open form", web_app=WebAppInfo(url)),
+                                         KeyboardButton(CANCEL_TEXT)]],
+                                       resize_keyboard=True, one_time_keyboard=True)
+        m = await self.app.bot.send_message(self.owner, text, reply_markup=keyboard)  # type: ignore[union-attr]
         self.store.set_login_request_message(rid, m.message_id)
+        self.store.set_login_request_form_message(rid, m.message_id)  # = it has the Mini App keyboard
 
     @staticmethod
     def _field_hint(f: dict) -> str:
@@ -1191,11 +1235,16 @@ class Friday(WatchBot):
         return f["label"] + (f" ({'; '.join(extra)})" if extra else "")
 
     async def _close_login_request(self, rid: int, text: str, chat_id: int | None = None) -> None:
-        """Show how a request ended by editing its message."""
+        """Show how a request ended: with the Mini App keyboard, remove it with a new message (a
+        message with a reply keyboard can't be edited); otherwise edit the request message."""
         r = self.store.login_request(rid)
-        if r and r["message_id"]:
-            await self._quiet(self.app.bot.edit_message_text(  # type: ignore[union-attr]
-                text, chat_id=chat_id or self.owner, message_id=r["message_id"]))
+        if not r:
+            return
+        bot, chat = self.app.bot, chat_id or self.owner  # type: ignore[union-attr]
+        if r["form_message_id"]:
+            await self._quiet(bot.send_message(chat, text, reply_markup=ReplyKeyboardRemove()))
+        elif r["message_id"]:
+            await self._quiet(bot.edit_message_text(text, chat_id=chat, message_id=r["message_id"]))
 
     def _save_answer(self, req, values: dict) -> tuple[bool, str]:
         """Route what the owner typed (form or reply), by the request's own spec: sensitive values
@@ -1251,6 +1300,31 @@ class Friday(WatchBot):
         if not deleted:
             await self.say(f"{text}{undeleted}")
         await self._request_done("login", req["id"])
+
+    async def on_app_data(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """The Mini App's answer (Telegram.WebApp.sendData): ciphertext only the vault's key opens
+        (miniapp.py). Routed like a reply; the service message is deleted."""
+        msg = update.message
+        data = msg.web_app_data.data if msg.web_app_data else ""
+        await self._quiet(msg.delete())
+        bot = self.app.bot  # type: ignore[union-attr]
+        try:
+            payload = miniapp.AppKey(self.cfg.vault_dir).decrypt(data)
+        except ValueError as e:
+            log.warning("Mini App answer unreadable (%s)", e)
+            await bot.send_message(msg.chat_id, "❌ I couldn't read what you entered. Please try again.")
+            return
+        req = self.store.login_request(payload["rid"])
+        if not req or req["status"] != "pending":
+            await bot.send_message(msg.chat_id, "This request has already ended, so nothing was saved.",
+                                   reply_markup=ReplyKeyboardRemove())
+            return
+        ok, text = self._save_answer(req, payload["values"])
+        if ok:
+            await self._close_login_request(req["id"], text, msg.chat_id)
+            await self._request_done("login", req["id"])
+        else:
+            await bot.send_message(msg.chat_id, text)
 
     async def cmd_login(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         args = ctx.args or []
