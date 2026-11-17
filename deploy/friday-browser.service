@@ -1,0 +1,20 @@
+[Unit]
+Description=Friday's shared headless browser (Chromium, DevTools on 127.0.0.1:9222)
+After=network-online.target
+Wants=network-online.target
+
+# Playwright's Chromium (deploy/bootstrap.sh installs it, with the AppArmor profile its sandbox
+# needs and a policy that blocks file:// pages). The profile in ~/friday-data/browser keeps
+# logins across restarts. The DevTools port (src/friday/browser.py CDP_PORT) gives full control
+# of the logged-in browser, so it listens on 127.0.0.1 only.
+[Service]
+ExecStart=/bin/sh -c 'exec "$$(ls -d %h/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | sort -V | tail -n 1)" \
+  --headless --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+  --user-data-dir=%h/friday-data/browser --no-first-run --no-default-browser-check \
+  --lang=ko-KR --window-size=1280,900 about:blank'
+Restart=always
+RestartSec=5
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

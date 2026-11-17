@@ -1,0 +1,21 @@
+# Extra MCP servers for Friday. Lives at ~/friday-data/mcp.toml on the server.
+# Read on every message: save the file and the next message uses it, no restart needed.
+# Check it from Telegram with /status.
+#
+# Each server is a [servers.<name>] table with the same keys as Codex's [mcp_servers.<name>]
+# (command/args/env for local servers, url/bearer_token_env_var/http_headers for hosted ones),
+# plus three Friday keys:
+#   enabled  = false            turn a server off without deleting it
+#   approve  = false            block its tools (nobody is there to approve them)
+#   env_from = ["SOME_TOKEN"]   copy variables from .env.server into the server's env
+# Put tokens in .env.server, never in this file.
+
+# Example: current time in any timezone (no account needed).
+# [servers.time]
+# command = "uvx"
+# args = ["mcp-server-time"]
+
+# Example: a hosted server that takes a bearer token from .env.server.
+# [servers.notion]
+# url = "https://mcp.notion.com/mcp"
+# bearer_token_env_var = "NOTION_TOKEN"

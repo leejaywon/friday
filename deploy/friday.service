@@ -1,0 +1,14 @@
+[Unit]
+Description=Friday Telegram agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/friday
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/friday/.venv/bin/friday bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

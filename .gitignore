@@ -1,0 +1,37 @@
+# Python and tools
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Settings and secrets: only .env.example is tracked
+.env
+.env.*
+!.env.example
+
+# Local data: database, files, Google token, browser profile, login vault
+data/
+friday-data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+vault/
+google_token.json
+google_client_secret.json
+client_secret*.json
+
+# Local Claude Code state (CLAUDE.md stays tracked)
+.claude/
+CLAUDE.local.md
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
