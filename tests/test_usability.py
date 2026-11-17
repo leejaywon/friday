@@ -61,3 +61,19 @@ def test_new_instructions_start_a_fresh_thread_with_the_last_exchange(cfg, store
     cfg.instructions_path.write_text(cfg.instructions_path.read_text() + "\n- new rule")
     asyncio.run(bot.ask(1, "다음"))
     assert turns == ["t1", None] and "안녕!" in bot._wrap("다음", [], True)
+
+
+def test_progress_line_only_when_the_turn_runs_long():
+    from friday.bot import ProgressNote
+
+    async def turn(seconds):
+        sent = []
+        note = ProgressNote(lambda t: sent.append(t) or asyncio.sleep(0), after=0.05)
+        note("확인해볼게.")
+        note("페이지를 여는 중이야.")
+        await asyncio.sleep(seconds)
+        note.cancel()
+        return sent
+
+    assert asyncio.run(turn(0.01)) == []
+    assert asyncio.run(turn(0.1)) == ["페이지를 여는 중이야."]

@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import time as clock
 from dataclasses import replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -62,6 +63,8 @@ IDLE_NEW_THREAD = timedelta(hours=6)  # start a fresh Codex thread after this mu
 # Also start one (carrying the last exchange) once the context is this big (AgentResult.input_tokens).
 # Not after every browser turn: follow-ups ("거기 일요일엔?") need what the page said.
 MAX_TURN_INPUT_TOKENS = 60_000
+# A turn still running this long sends the agent's progress line (ProgressNote).
+PROGRESS_AFTER = 8.0
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILES_ONLY = (
     "(The user sent only the files above, with no message. Look at them. If it's clear what they "
@@ -151,6 +154,32 @@ def plain_text(text: str) -> str:
     """Telegram gets plain text: Markdown links become "text url" and **bold** loses its stars."""
     text = MD_LINK.sub(lambda m: m[2] if m[1].strip() == m[2] else f"{m[1]} {m[2]}", text)
     return MD_BOLD.sub(r"\1", text)
+
+
+class ProgressNote:
+    """The agent's "checking X" line from the middle of a turn, sent (once) only when the turn is
+    still running PROGRESS_AFTER seconds in, so quick answers stay one message."""
+
+    def __init__(self, send, after: float):
+        self.send, self.after, self.start = send, after, clock.monotonic()
+        self.text, self.task, self.sent = "", None, False
+
+    def __call__(self, text: str) -> None:
+        text = text.strip()
+        if self.sent or not text.strip(" .-"):
+            return
+        self.text = text  # the latest line is the most current
+        if self.task is None:
+            self.task = asyncio.create_task(self._later())
+
+    async def _later(self) -> None:
+        await asyncio.sleep(max(0.0, self.after - (clock.monotonic() - self.start)))
+        self.sent = True
+        await self.send(self.text)
+
+    def cancel(self) -> None:
+        if self.task and not self.sent:
+            self.task.cancel()
 
 
 def _digest(text: str) -> str:
@@ -374,6 +403,7 @@ class Friday(WatchBot):
         attached, at most MAX_CONTINUATIONS times; only the last turn's reply is sent."""
         async with self.agent_lock:
             typing = asyncio.create_task(self._keep_typing(chat_id))
+            note = ProgressNote(lambda t: self._quiet(self.say(plain_text(t), chat_id)), PROGRESS_AFTER)
             requests, proposal, used = self._followups(), self._last_proposal(), set()
             try:
                 thread = self._current_thread()
@@ -381,7 +411,8 @@ class Friday(WatchBot):
                 for step in range(MAX_CONTINUATIONS + 1):
                     toolsets = self._toolsets()
                     try:
-                        result = await self._codex_turn(prompt, thread, (images or []) if step == 0 else [], toolsets)
+                        result = await self._codex_turn(prompt, thread, (images or []) if step == 0 else [], toolsets,
+                                                        note)
                     except Exception as e:  # e.g. codex binary missing
                         log.exception("codex run failed")
                         result = AgentResult("", thread, [repr(e)])
@@ -396,6 +427,7 @@ class Friday(WatchBot):
                     prompt = f"[{' and '.join(sorted(new))} tools are now available; continue the user's request]"
             finally:
                 typing.cancel()
+                note.cancel()
             made_request = bool(self._followups() - requests)
             self._note_exchange(text, result.text)
             # Not while a request is open: its answer continues this thread.
@@ -409,13 +441,14 @@ class Friday(WatchBot):
             await self.say(f"Codex 오류: {detail[:1500]}\n계속 이러면 /new 를 보내주세요.", chat_id)
         await self.outbox_loop()
 
-    async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str]) -> AgentResult:
+    async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str],
+                          on_note=None) -> AgentResult:
         """One chat turn: in the app-server, or with `codex exec` when it is off or failed."""
         kw = dict(model=self.store.get("model") or "", effort=self.store.get("effort") or "", toolsets=toolsets,
                   tz=self.tz)
         if self.codex:
             try:
-                return await self.codex.run(prompt, thread, images, **kw)
+                return await self.codex.run(prompt, thread, images, on_note=on_note, **kw)
             except CodexServerError as e:
                 log.warning("codex app-server failed, retrying with codex exec: %s", e)
                 if e.partial:

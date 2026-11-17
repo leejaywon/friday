@@ -26,6 +26,7 @@ import re
 import signal
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 
 from .agent import DISABLED_FEATURES, AgentResult, codex_env, codex_overrides, mcp_endpoints
@@ -318,22 +319,25 @@ class CodexServer:
         toolsets: frozenset[str] | set[str] = frozenset(),
         tz: str = "",
         chat: bool = True,
+        on_note: Callable[[str], None] | None = None,
     ) -> AgentResult:
-        """One turn, like agent.run_codex. Raises CodexServerError when the server fails."""
+        """One turn, like agent.run_codex. on_note gets the agent's progress lines ("checking X")
+        as they come. Raises CodexServerError when the server fails."""
         async with self._lock:
             try:
                 await self._ensure(tz or self.cfg.default_tz)
                 config = codex_overrides(self.cfg, toolsets=toolsets, chat=chat, http=mcp_endpoints(toolsets))
                 model = model or self.cfg.codex_model
                 tid = await self._open(thread_id, config, model)
-                return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort)
+                return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note)
             except CodexServerError:
                 # The caller retries with `codex exec`, which writes to the thread on disk: the
                 # next turn here starts over and reloads it rather than using a stale copy.
                 await self._stop()
                 raise
 
-    async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str) -> AgentResult:
+    async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str,
+                    on_note: Callable[[str], None] | None = None) -> AgentResult:
         q: asyncio.Queue = asyncio.Queue()
         self._turns[tid] = q
         messages: list[str] = []
@@ -366,6 +370,8 @@ class CodexServer:
                     partial = True
                 elif method == "item/completed" and item.get("type") == "agentMessage":
                     messages.append(item.get("text", ""))
+                    if on_note and item.get("phase") == "commentary":
+                        on_note(item.get("text", ""))
                 elif method == "item/completed" and item.get("type") == "mcpToolCall":
                     servers.add(item.get("server") or "")
                 elif method == "thread/tokenUsage/updated":
