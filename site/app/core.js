@@ -5,8 +5,8 @@
 //
 // A component is one file in components/ that calls
 //   FridayApp.register(kind, function (spec, app) { ...; return { collect, submitLabel } })
-// where collect() returns {values, skipped} to send (skipped: names the owner marked not needed),
-// or null when something needs fixing (the component shows what). app gives it: body (its container), el, icon, haptic, changed (call on every edit,
+// where collect() returns {values} to send, or null when something needs fixing (the component
+// shows what). app gives it: body (its container), el, icon, haptic, changed (call on every edit,
 // for the close confirmation), submit and inTelegram.
 "use strict";
 
@@ -159,7 +159,7 @@ window.FridayApp = (function () {
       tg.MainButton.showProgress(false);
       tg.MainButton.disable();
       try {
-        const data = await encryptForServer(spec.key, { rid: spec.rid, values: answer.values, skipped: answer.skipped || [] });
+        const data = await encryptForServer(spec.key, { rid: spec.rid, values: answer.values });
         if (data.length > LIMIT) throw new Error("too long");
         haptic("success");
         if (can("6.2")) tg.disableClosingConfirmation();

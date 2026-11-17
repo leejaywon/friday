@@ -141,9 +141,9 @@ your server's RSA key in `~/friday-data/vault/`), so Telegram carries only ciphe
 asks only for the fields that site or service needs: an email alone, a username and password, one
 API key, a public and a secret key. Passwords, keys and other 🔒 fields are hidden from the AI;
 an email or username is passed on so it knows which account. Logins and keys are kept in the
-vault for later. If Friday asks for something the site doesn't use, tap **Not needed** on that
-field. You can also reply to the request message with one value per line (`-` for a field that
-isn't needed); Friday deletes your reply. The page (`site/app/`) is the same for
+vault for later. If Friday asks for something the site doesn't use, tap Cancel and tell it what
+the site needs. You can also reply to the request message with one value per line (`-` for a
+field that isn't needed); Friday deletes your reply. The page (`site/app/`) is the same for
 every Friday, so all installs use the copy this repo publishes at
 https://leejaywon.github.io/friday/app/. To use your own copy, host `site/` on any https address
 and set `FRIDAY_APP_URL` to its `app/` page; `FRIDAY_APP_URL=` (empty) turns the button off.

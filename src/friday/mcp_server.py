@@ -792,7 +792,8 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
                             {"name": "secret_key", "label": "Secret key", "type": "password"}]
     Secrets (passwords, keys, PINs) use type password, which makes them sensitive: you never see
     them, only "stored as <save_as>.<field>". Other values (an email, a username, a public key) come
-    back to you. The user can mark any field "not needed"; the result says which.
+    back to you. If you asked for something the site doesn't use, the user cancels and tells you,
+or (replying instead of using the form) marks that field not needed; the result says which.
     With save_as, everything the user entered is kept in the vault under that name (bound to
     domain if given): fill_login then types its username (or email) and password on that site, and
     fill_login_field any field. Waits up to 5 minutes. Returns 'Submitted: {json}' plus notes,
