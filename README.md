@@ -1,4 +1,4 @@
-# Friday
+<img src="assets/banner.webp" alt="Friday" width="100%">
 
 ![Python 3.12](https://img.shields.io/badge/Python_3.12-3776AB?style=flat-square&logo=python&logoColor=white)
 ![uv](https://img.shields.io/badge/uv-DE5FE9?style=flat-square&logo=uv&logoColor=white)
