@@ -35,7 +35,10 @@ Telegram ──► friday bot (systemd) ──► Codex or Claude Code ──►
 
 You need:
 
-- A fresh **Ubuntu 24.04** VPS you can reach as root over SSH. 2 vCPU and 4 GB of RAM are enough.
+- A fresh **Ubuntu 24.04** VPS you can reach as root over SSH. Size it by what you'll use: the
+  bot itself is light, the headless browser and coding agents take more memory, and
+  `bootstrap.sh` compiles the local Bot API server (for files up to 2 GB), which needs a few GB
+  of RAM while it builds.
 - A Telegram account, and a ChatGPT plan or a Claude plan.
 - Your own copy of this repo on GitHub (a fork, or a private repo you push it to), and the
   [GitHub CLI](https://cli.github.com) signed in (`gh auth login`).
