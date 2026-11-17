@@ -44,6 +44,22 @@ RETRY_START_AFTER = 600  # after the server failed to start, use `codex exec` fo
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # Items that aren't tool calls; any other item means the turn has started doing things.
 NOT_TOOLS = {"userMessage", "agentMessage", "reasoning", "plan", "hookPrompt", "contextCompaction"}
+STOP = {"method": "friday/stop"}  # put in a running turn's queue by stop_turn (the [Stop] button)
+SERVER_NAMES = {"playwright": "browser"}
+
+
+def step_label(item: dict) -> str:
+    """What a tool item is doing, for the turn's status line: "browser: click", "running a command"."""
+    kind = item.get("type")
+    if kind == "mcpToolCall":
+        server = str(item.get("server") or "")
+        tool = str(item.get("tool") or "").removeprefix("browser_").replace("_", " ")
+        return f"{SERVER_NAMES.get(server, server)}: {tool}"
+    if kind == "commandExecution":
+        return "running a command"
+    if kind == "webSearch":
+        return "searching the web"
+    return str(kind or "")
 
 
 class CodexServerError(Exception):
@@ -320,16 +336,19 @@ class CodexServer:
         tz: str = "",
         chat: bool = True,
         on_note: Callable[[str], None] | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """One turn, like agent.run_codex. on_note gets the agent's progress lines ("checking X")
-        as they come. Raises CodexServerError when the server fails."""
+        as they come, on_step each tool call it starts (step_label). Raises CodexServerError when
+        the server fails."""
         async with self._lock:
             try:
                 await self._ensure(tz or self.cfg.default_tz)
                 config = codex_overrides(self.cfg, toolsets=toolsets, chat=chat, http=mcp_endpoints(toolsets))
                 model = model or self.cfg.codex_model
                 tid = await self._open(thread_id, config, model)
-                return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note)
+                return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note,
+                                        on_step)
             except CodexServerError:
                 # The caller retries with `codex exec`, which writes to the thread on disk: the
                 # next turn here starts over and reloads it rather than using a stale copy.
@@ -337,7 +356,8 @@ class CodexServer:
                 raise
 
     async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str,
-                    on_note: Callable[[str], None] | None = None) -> AgentResult:
+                    on_note: Callable[[str], None] | None = None,
+                    on_step: Callable[[str], None] | None = None) -> AgentResult:
         q: asyncio.Queue = asyncio.Queue()
         self._turns[tid] = q
         messages: list[str] = []
@@ -362,12 +382,17 @@ class CodexServer:
                                        servers, tokens)
                 if isinstance(msg, CodexServerError):
                     raise CodexServerError(str(msg), partial)
+                if msg is STOP:
+                    await self._interrupt(tid, turn_id, q)
+                    return AgentResult("", tid, ["stopped"], servers, tokens)
                 method, p = msg.get("method"), msg.get("params") or {}
                 if p.get("turnId") not in (None, turn_id) and method != "turn/completed":
                     continue
                 item = p.get("item") or {}
                 if method == "item/started" and item.get("type") not in NOT_TOOLS:
                     partial = True
+                    if on_step:
+                        on_step(step_label(item))
                 elif method == "item/completed" and item.get("type") == "agentMessage":
                     messages.append(item.get("text", ""))
                     if on_note and item.get("phase") == "commentary":
@@ -402,6 +427,13 @@ class CodexServer:
         if errors:
             log.warning("codex errors: %s", errors)
         return AgentResult((messages[-1] if messages else "").strip(), tid, errors, servers, tokens)
+
+    def stop_turn(self) -> bool:
+        """Stop the running turn (the [Stop] button): it's interrupted and returns. False when no
+        turn has started yet."""
+        for q in self._turns.values():
+            q.put_nowait(STOP)
+        return bool(self._turns)
 
     async def _interrupt(self, tid: str, turn_id: str, q: asyncio.Queue) -> None:
         """Stop a turn that ran too long; restart the server if it doesn't stop."""

@@ -63,20 +63,35 @@ def test_new_instructions_start_a_fresh_thread_with_the_last_exchange(cfg, store
     assert turns == ["t1", None] and "안녕!" in bot._wrap("다음", [], True)
 
 
-def test_progress_line_only_when_the_turn_runs_long():
-    from friday.bot import ProgressNote
+def test_status_message_grows_a_stop_button_and_shrinks_back():
+    from friday.bot import STOP_BUTTON, TurnStatus
 
-    async def turn(seconds):
-        sent = []
-        note = ProgressNote(lambda t: sent.append(t) or asyncio.sleep(0), after=0.05)
-        note("확인해볼게.")
-        note("페이지를 여는 중이야.")
+    async def turn(seconds, stopped=False):
+        shown, gone = [], []
+
+        async def send(text, stop):
+            shown.append((text, stop))
+            return 7
+
+        async def edit(msg_id, text, stop):
+            shown.append((text, stop))
+
+        status = TurnStatus(send, edit, lambda m: gone.append(m) or asyncio.sleep(0),
+                            note_after=0.05, status_after=0.1, every=10, tick=0.01)
+        status.note("확인해볼게.")
+        status.note("페이지를 여는 중이야.")
+        status.on_step("browser: click")
         await asyncio.sleep(seconds)
-        note.cancel()
-        return sent
+        await status.finish(stopped)
+        return shown, gone
 
-    assert asyncio.run(turn(0.01)) == []
-    assert asyncio.run(turn(0.1)) == ["페이지를 여는 중이야."]
+    assert asyncio.run(turn(0.01)) == ([], [])  # quick answers stay one message
+    shown, _ = asyncio.run(turn(0.2))
+    assert shown == [("페이지를 여는 중이야.", False), ("페이지를 여는 중이야.\n\n⏳ 0:00 · browser: click", True),
+                     ("페이지를 여는 중이야.", False)]
+    shown, _ = asyncio.run(turn(0.2, stopped=True))
+    assert shown[-1] == ("페이지를 여는 중이야.\n\n⏹ Stopped after 0:00", False)
+    assert STOP_BUTTON.inline_keyboard[0][0].callback_data == "turn:stop"
 
 
 def test_tree_leaves_out_ignored_files_and_folds_deep_folders(tmp_path):

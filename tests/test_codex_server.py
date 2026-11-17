@@ -43,6 +43,12 @@ def test_turn_result_errors_and_timeout(server, tmp_path):
         server.cfg = replace(server.cfg, codex_timeout_seconds=1)
         slow = await server.run("HANG", "t1")
         assert "longer than 1s" in slow.errors[0] and slow.thread_id == "t1"
+        server.cfg = replace(server.cfg, codex_timeout_seconds=60)
+        steps = []
+        hung = asyncio.create_task(server.run("HANG", "t1", on_step=steps.append))
+        while not server.stop_turn():  # the [Stop] button, once the turn has started
+            await asyncio.sleep(0.01)
+        assert (await hung).errors == ["stopped"] and steps == ["browser: click"]
         ok = await server.run("again", "t1")  # the server is still usable
         await server.close()
         return ok

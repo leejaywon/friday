@@ -67,8 +67,12 @@ IDLE_NEW_THREAD = timedelta(hours=6)  # start a fresh Codex thread after this mu
 # Also start one (carrying the last exchange) once the context is this big (AgentResult.input_tokens).
 # Not after every browser turn: follow-ups ("and on Sunday?") need what the page said.
 MAX_TURN_INPUT_TOKENS = 60_000
-# A turn still running this long sends the agent's progress line (ProgressNote).
+# A turn still running this long shows the agent's progress line (TurnStatus)...
 PROGRESS_AFTER = 8.0
+# ...and this long, how long it's been running, its current step and a [Stop] button, every STATUS_EVERY.
+STATUS_AFTER = 20.0
+STATUS_EVERY = 15.0
+STOP_BUTTON = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="turn:stop")]])
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILES_ONLY = (
     "(The user sent only the files above, with no message. Look at them. If it's clear what they "
@@ -160,30 +164,75 @@ def plain_text(text: str) -> str:
     return MD_BOLD.sub(r"\1", text)
 
 
-class ProgressNote:
-    """The agent's "checking X" line from the middle of a turn, sent (once) only when the turn is
-    still running PROGRESS_AFTER seconds in, so quick answers stay one message."""
+def _clock(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 60}:{s % 60:02d}"
 
-    def __init__(self, send, after: float):
-        self.send, self.after, self.start = send, after, clock.monotonic()
-        self.text, self.task, self.sent = "", None, False
 
-    def __call__(self, text: str) -> None:
+class TurnStatus:
+    """One Telegram message for a long chat turn, edited in place. The agent's latest progress line
+    ("checking X") appears once the turn is PROGRESS_AFTER seconds in, so quick answers stay one
+    message. From STATUS_AFTER on it also says how long the turn has run and its current step, with
+    a [Stop] button. When the turn ends only the progress line stays (no line: the message goes).
+
+    send(text, stop) -> message id, edit(message id, text, stop) and delete(message id) talk to
+    Telegram; stop says whether to show the [Stop] button."""
+
+    def __init__(self, send, edit, delete, note_after: float = PROGRESS_AFTER, status_after: float = STATUS_AFTER,
+                 every: float = STATUS_EVERY, tick: float = 1.0):
+        self.send, self.edit, self.delete = send, edit, delete
+        self.note_after, self.status_after, self.every, self.tick = note_after, status_after, every, tick
+        self.start = clock.monotonic()
+        self.text, self.step = "", ""
+        self.msg_id = None
+        self.shown: tuple[str, bool] = ("", False)
+        self.task = asyncio.create_task(self._run())
+
+    def note(self, text: str) -> None:
         text = text.strip()
-        if self.sent or not text.strip(" .-"):
+        if text.strip(" .-"):
+            self.text = text[:3000]  # the latest line is the most current
+
+    def on_step(self, label: str) -> None:
+        self.step = label
+
+    def _render(self, elapsed: float) -> tuple[str, bool]:
+        if elapsed < self.status_after:
+            return (self.text if elapsed >= self.note_after else ""), False
+        # Whole STATUS_EVERY steps, so the message is edited only that often.
+        shown = self.status_after + (elapsed - self.status_after) // self.every * self.every
+        line = f"⏳ {_clock(shown)}" + (f" · {self.step}" if self.step else "")
+        return (f"{self.text}\n\n{line}" if self.text else line), True
+
+    async def _show(self, text: str, stop: bool) -> None:
+        if not text or (text, stop) == self.shown:
             return
-        self.text = text  # the latest line is the most current
-        if self.task is None:
-            self.task = asyncio.create_task(self._later())
+        try:
+            if self.msg_id is None:
+                self.msg_id = await self.send(text, stop)
+            else:
+                await self.edit(self.msg_id, text, stop)
+            self.shown = (text, stop)
+        except Exception as e:
+            log.info("status message not updated: %s", e)
 
-    async def _later(self) -> None:
-        await asyncio.sleep(max(0.0, self.after - (clock.monotonic() - self.start)))
-        self.sent = True
-        await self.send(self.text)
+    async def _run(self) -> None:
+        while True:
+            await self._show(*self._render(clock.monotonic() - self.start))
+            await asyncio.sleep(self.tick)
 
-    def cancel(self) -> None:
-        if self.task and not self.sent:
-            self.task.cancel()
+    async def finish(self, stopped: bool = False) -> None:
+        self.task.cancel()
+        if stopped:
+            line = f"⏹ Stopped after {_clock(clock.monotonic() - self.start)}"
+            await self._show(f"{self.text}\n\n{line}" if self.shown[0] and self.text else line, False)
+        elif self.shown[0] and self.text:
+            await self._show(self.text, False)
+        elif self.msg_id is not None:
+            try:
+                await self.delete(self.msg_id)
+            except Exception as e:
+                log.info("status message not deleted: %s", e)
 
 
 def _digest(text: str) -> str:
@@ -232,6 +281,8 @@ class Friday(WatchBot):
         # /files buttons carry an index into this list, not a path (callback data is 64 bytes at most)
         self._fs_paths: list[str] = []
         self._fs_index: dict[str, int] = {}
+        self._agent_task: asyncio.Task | None = None  # the chat turn's agent call, which [Stop] stops
+        self._stopping = False
         self._bg: set[asyncio.Task] = set()  # continuation turns after the owner answered a request
 
     # --- setup -------------------------------------------------------------
@@ -260,6 +311,7 @@ class Friday(WatchBot):
         app.add_handler(CommandHandler("jobs", self.cmd_jobs, filters=me))
         app.add_handler(CommandHandler("stop", self.cmd_stop, filters=me))
         app.add_handler(CommandHandler("runs", self.cmd_runs, filters=me))
+        app.add_handler(CallbackQueryHandler(self.on_stop_button, pattern=r"^turn:stop$"))
         app.add_handler(CallbackQueryHandler(self.on_approval_button, pattern=r"^appr:(yes|no):\d+$"))
         app.add_handler(CommandHandler("login", self.cmd_login, filters=me))
         app.add_handler(CommandHandler("logins", self.cmd_logins, filters=me))
@@ -426,7 +478,8 @@ class Friday(WatchBot):
         attached, at most MAX_CONTINUATIONS times; only the last turn's reply is sent."""
         async with self.agent_lock:
             typing = asyncio.create_task(self._keep_typing(chat_id))
-            note = ProgressNote(lambda t: self._quiet(self.say(plain_text(t), chat_id)), PROGRESS_AFTER)
+            status = self._status(chat_id)
+            self._stopping, stopped = False, False
             requests, proposal, used = self._followups(), self._last_proposal(), set()
             shown = self._last_shown()
             try:
@@ -434,25 +487,35 @@ class Friday(WatchBot):
                 prompt = self._wrap(text, files or [], thread is None)
                 for step in range(MAX_CONTINUATIONS + 1):
                     toolsets = self._toolsets()
+                    self._agent_task = asyncio.create_task(self._codex_turn(
+                        prompt, thread, (images or []) if step == 0 else [], toolsets, status))
                     try:
-                        result = await self._codex_turn(prompt, thread, (images or []) if step == 0 else [], toolsets,
-                                                        note)
+                        result = await self._agent_task
+                    except asyncio.CancelledError:
+                        if not self._stopping:  # Friday is stopping, not the [Stop] button
+                            raise
+                        result = AgentResult("", thread, ["stopped"])
                     except Exception as e:  # e.g. codex binary missing
                         log.exception("agent run failed")
                         result = AgentResult("", thread, [repr(e)])
                     used |= result.mcp_servers
+                    stopped = result.errors == ["stopped"]  # not when the turn finished before [Stop] took
                     thread = result.thread_id or thread
                     if thread:
                         self.store.set("thread_id", thread)
                         self.store.set("thread_engine", self.cfg.chat_engine)
                     self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
                     new = self._toolsets() - toolsets
-                    if not new or not thread or step == MAX_CONTINUATIONS:
+                    if not new or not thread or step == MAX_CONTINUATIONS or stopped:
                         break
                     prompt = f"[{' and '.join(sorted(new))} tools are now available; continue the user's request]"
             finally:
+                self._agent_task = None
                 typing.cancel()
-                note.cancel()
+                await status.finish(stopped)
+            if stopped:
+                self._note_exchange(text, "(stopped by the user)")
+                return
             made_request = bool(self._followups() - requests)
             self._note_exchange(text, result.text)
             # Not while a request is open: its answer continues this thread.
@@ -469,13 +532,15 @@ class Friday(WatchBot):
         await self.outbox_loop()
 
     async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str],
-                          on_note=None) -> AgentResult:
+                          status: TurnStatus | None = None) -> AgentResult:
         """One chat turn: in Codex's app-server, else `codex exec` (off or failed) or Claude."""
         kw = dict(model=self.store.get("model") or "", effort=self.store.get("effort") or "", toolsets=toolsets,
                   tz=self.tz)
         if self.codex:
             try:
-                return await self.codex.run(prompt, thread, images, on_note=on_note, **kw)
+                return await self.codex.run(prompt, thread, images,
+                                            on_note=status and (lambda t: status.note(plain_text(t))),
+                                            on_step=status and status.on_step, **kw)
             except CodexServerError as e:
                 log.warning("codex app-server failed, retrying with codex exec: %s", e)
                 if e.partial:
@@ -492,6 +557,35 @@ class Friday(WatchBot):
             return False
         one_line = "\n" not in t and len(t) <= 120
         return not (one_line and (made_proposal or (made_request and REQUEST_ECHO.search(t))))
+
+    def _status(self, chat_id: int) -> TurnStatus:
+        def bot():
+            return self.app.bot  # type: ignore[union-attr]
+
+        async def send(text: str, stop: bool) -> int:
+            return (await bot().send_message(chat_id, text, reply_markup=STOP_BUTTON if stop else None)).message_id
+
+        def edit(msg_id: int, text: str, stop: bool):
+            return bot().edit_message_text(text, chat_id=chat_id, message_id=msg_id,
+                                           reply_markup=STOP_BUTTON if stop else None)
+
+        return TurnStatus(send, edit, lambda msg_id: bot().delete_message(chat_id, msg_id))
+
+    async def on_stop_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """[Stop] on a long turn's status message: interrupt the agent; the turn reports it."""
+        q = update.callback_query
+        if not q.from_user or q.from_user.id not in self.cfg.allowed_user_ids:
+            await q.answer()
+            return
+        task = self._agent_task
+        if task is None or task.done():
+            await q.answer("Nothing running")
+            await self._quiet(q.edit_message_reply_markup(None))
+            return
+        self._stopping = True
+        if not (self.codex and self.codex.stop_turn()):
+            task.cancel()  # `codex exec` / Claude, or the app-server turn hasn't started: kill it
+        await q.answer("Stopping…")
 
     async def _keep_typing(self, chat_id: int) -> None:
         while True:

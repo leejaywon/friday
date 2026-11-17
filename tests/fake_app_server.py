@@ -55,6 +55,8 @@ for line in sys.stdin:
             note("item/started", threadId=tid, turnId=turn, item={"type": "mcpToolCall", "id": "i1", "server": "friday"})
             sys.exit(1)
         if "HANG" in text:
+            note("item/started", threadId=tid, turnId=turn,
+                 item={"type": "mcpToolCall", "id": "i1", "server": "playwright", "tool": "browser_click"})
             continue
         if "FAIL" in text:
             note("error", threadId=tid, turnId=turn, willRetry=False, error={"message": "usage limit reached"})
