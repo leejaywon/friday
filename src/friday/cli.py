@@ -25,9 +25,9 @@ def main() -> None:
     vault = sub.add_parser("vault", help="website logins for the browser (Telegram: /login, /logins)")
     vsub = vault.add_subparsers(dest="vault_cmd", required=True)
     vadd = vsub.add_parser("add", help="add or replace a login; asks for the username and password")
-    vadd.add_argument("name", help="short name, e.g. school")
+    vadd.add_argument("name", help="short name, e.g. portal")
     vadd.add_argument("--domain", action="append", required=True,
-                      help="site it may be typed into, e.g. lms.example.edu (subdomains included; repeatable)")
+                      help="site it may be typed into, e.g. portal.example.com (subdomains included; repeatable)")
     vsub.add_parser("list", help="names, domains and where they're trusted (never passwords)")
     vrm = vsub.add_parser("remove", help="delete a login")
     vrm.add_argument("name")

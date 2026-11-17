@@ -78,7 +78,7 @@ FILES_ONLY = (
 # Files answered on their own when at least one is an image (photo, screenshot).
 IMAGES_ONLY = (
     "[The user sent the image(s) above without a message. Work out what it is. If it shows deadlines, "
-    "assignments, exams, meetings or anything to remember, call propose_items with them (don't add them "
+    "bills, appointments, meetings or anything to remember, call propose_items with them (don't add them "
     "yourself); include submission for things handed in online. If it's unclear what they want, ask one "
     "short question. Otherwise describe it briefly.]"
 )
@@ -1330,7 +1330,7 @@ class Friday(WatchBot):
         args = ctx.args or []
         try:
             if len(args) != 2:
-                raise ValueError("Usage: /login <name> <domain>, e.g. /login school lms.example.edu")
+                raise ValueError("Usage: /login <name> <domain>, e.g. /login portal portal.example.com")
             domain = check(args[0], [args[1]])[0]
         except ValueError as e:
             await update.message.reply_text(f"Not requested: {e}")

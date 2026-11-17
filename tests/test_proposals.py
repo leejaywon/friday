@@ -6,17 +6,17 @@ import json
 from friday import bot as botmod
 
 ITEMS = [
-    {"kind": "task", "title": "자료구조 과제 3", "due": "2099-11-20T23:59",
-     "submission": {"site": "lms.example.edu", "what": "PDF 보고서"}},
-    {"kind": "reminder", "title": "중간고사 공부", "when": "2099-11-19T09:00"},
+    {"kind": "task", "title": "분기 보고서", "due": "2099-11-20T23:59",
+     "submission": {"site": "portal.example.com", "what": "PDF 보고서"}},
+    {"kind": "reminder", "title": "발표 준비", "when": "2099-11-19T09:00"},
     {"kind": "event", "title": "팀 회의", "start": "2099-11-21T14:00"},
 ]
 
 
 def test_propose_stores_and_queues(tools):
-    assert tools.propose_items(json.dumps(ITEMS), "자료구조 강의계획서").startswith("Proposed 3 item(s) as #P1")
+    assert tools.propose_items(json.dumps(ITEMS), "팀 공지").startswith("Proposed 3 item(s) as #P1")
     p = tools.store.proposal(1)
-    assert p["status"] == "pending" and p["note"] == "자료구조 강의계획서"
+    assert p["status"] == "pending" and p["note"] == "팀 공지"
     assert p["items"][0]["due"] == "2099-11-20T23:59+09:00"
     assert p["items"][2]["end"] == "2099-11-21T15:00+09:00"  # default: one hour
     [row] = tools.store.pending_outbox()
@@ -42,8 +42,8 @@ def test_accept_adds_items_exactly_once(cfg, tools):
     first, second = asyncio.run(go())
     assert len(first) == 3 and second is None  # a double tap adds nothing
     titles = sorted(t.title for t in f.store.open_tasks())
-    assert titles == ["자료구조 과제 3", "팀 회의"]  # no calendar connected: the event became a task
-    assert "lms.example.edu" in next(t.notes for t in f.store.open_tasks() if t.title == "자료구조 과제 3")
-    assert [r.text for r in f.store.active_reminders()] == ["중간고사 공부"]
+    assert titles == ["분기 보고서", "팀 회의"]  # no calendar connected: the event became a task
+    assert "portal.example.com" in next(t.notes for t in f.store.open_tasks() if t.title == "분기 보고서")
+    assert [r.text for r in f.store.active_reminders()] == ["발표 준비"]
     assert f.store.proposal(pid)["status"] == "accepted"
     f.store.close()

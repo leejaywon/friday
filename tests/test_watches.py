@@ -31,7 +31,7 @@ def test_notifies_only_when_triggered_with_a_new_fingerprint(store):
 
 
 def test_three_failures_in_a_row_pause_the_watch_once(store):
-    wid = store.add_watch("KTX 좌석", "check seats", "15m", NOW)
+    wid = store.add_watch("콘서트 티켓", "check seats", "15m", NOW)
     first = wt.record_check(store, wid, "", "codex exited 1", NOW, TZ)
     assert first.note is None and store.watch(wid)["status"] == "active"
     assert store.watch(wid)["next_check_at"] == "2026-11-17T03:30:00+00:00"  # backed off past the 15m interval

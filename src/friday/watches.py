@@ -250,7 +250,7 @@ class WatchBot:
     def _watches_view(self) -> tuple[str, InlineKeyboardMarkup | None]:
         rows = self.store.watches()
         if not rows:
-            return "Nothing is being watched. Say something like \"tell me when my course site posts a new notice\".", None
+            return "Nothing is being watched. Say something like \"tell me when that website posts a new notice\".", None
         lines, buttons = [], []
         for w in rows:
             lines.append(("⏸ " if w["status"] == "paused" else "🔔 ") + describe(w, self.tz))

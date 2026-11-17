@@ -16,7 +16,7 @@ FridayApp.register("form", function (spec, app) {
 
   function placeholderFor(f) {
     if (f.placeholder) return f.placeholder;
-    const l = f.label || f.name; // "Student ID" -> "student ID", "OTP" stays
+    const l = f.label || f.name; // "Member ID" -> "member ID", "OTP" stays
     return (f.type === "select" ? "Choose " : "Enter ") + (/^[A-Z][a-z]/.test(l) ? l[0].toLowerCase() + l.slice(1) : l);
   }
   function clearError(box) {

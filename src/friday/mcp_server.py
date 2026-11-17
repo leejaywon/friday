@@ -608,11 +608,11 @@ def propose_items(items_json: str, note: str = "") -> str:
         {"kind": "reminder", "title": "message text", "when": "2026-11-19T09:00", "repeat": optional RRULE}
         {"kind": "event", "title": "...", "start": "2026-11-21T14:00", "end": optional (default +1h),
          "location": optional}
-      Any item may add "notes" and, for something the user must hand in online (an assignment on
-      an e-campus site, a form), "submission": {"site": "lms.example.edu", "what": "report PDF"};
+      Any item may add "notes" and, for something the user must hand in online (a report on
+      a website, a form), "submission": {"site": "portal.example.com", "what": "report PDF"};
       Friday then asks how to handle the submission.
       Times are ISO 8601 in the user's local time. Leave out items whose time has passed.
-    note: optional short context shown under the list, e.g. the course name or source.
+    note: optional short context shown under the list, e.g. where the items came from.
     """
     tz = _tz()
     if looks_secret(f"{items_json} {note}"):
@@ -726,7 +726,7 @@ async def fill_login(name: str, ctx: Context | None = None) -> str:
 
 @server.tool()
 async def fill_login_field(name: str, field: str, ctx: Context | None = None) -> str:
-    """Type one extra field of a saved login (e.g. a student id or PIN, see list_logins) into the
+    """Type one extra field of a saved login (e.g. a member ID or PIN, see list_logins) into the
     input that has focus on the open page: click the input first. Only on the login's own domains
     over https, with the same approval as fill_login. Doesn't submit. You never see the value."""
     login, err = _vault_login(name)
@@ -804,7 +804,7 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
             raise ValueError("save_as is required when a field is sensitive: letters, digits, '.', '_' or '-'")
         domain = domain.strip().lower().rstrip(".")
         if domain and not DOMAIN.match(domain):
-            raise ValueError("domain: a site like lms.example.edu (no https://, no path), or empty")
+            raise ValueError("domain: a site like portal.example.com (no https://, no path), or empty")
         spec = make_spec(title, parsed, description, domain, save_as, submit_label)
     except ValueError as e:
         return f"Not requested: {e}"
@@ -824,11 +824,11 @@ async def request_login(name: str, domain: str, reason: str = "", fields: str = 
     the vault, so you never see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
     with that name: it won't ask again on that site), 'Cancelled' or 'Timed out'.
 
-    name: short name for the login, e.g. 'school' (letters, digits, '.', '_', '-').
-    domain: the site it is for, e.g. 'lms.example.edu' (no https://, no path; subdomains included).
-    reason: optional few words in the user's language, e.g. 'submit the assignment'.
+    name: short name for the login, e.g. 'portal' (letters, digits, '.', '_', '-').
+    domain: the site it is for, e.g. 'portal.example.com' (no https://, no path; subdomains included).
+    reason: optional few words in the user's language, e.g. 'submit the report'.
     fields: optional JSON list of extra fields the site needs besides username and password
-        (always asked), e.g. '[{"name": "student_id", "label": "Student ID", "type": "text"}]', same
+        (always asked), e.g. '[{"name": "member_id", "label": "Member ID", "type": "text"}]', same
         format as request_form. They are sensitive (kept in the vault, typed with
         fill_login_field) unless a field says "sensitive": false.
     """
@@ -854,7 +854,7 @@ async def request_code(reason: str, label: str = "Code", ctx: Context | None = N
     They type it into a form (or reply with it); the code is returned to you and not stored anywhere. Waits up to
     5 minutes. Returns 'Code: <code>', 'Cancelled' or 'Timed out'.
 
-    reason: a few words in the user's language, e.g. 'SMS code for lms.example.edu'.
+    reason: a few words in the user's language, e.g. 'SMS code for portal.example.com'.
     label: the field's label, e.g. 'Code' or 'OTP'.
     """
     status, values = await _run_form(code_spec(reason, label), "code", ctx=ctx, tool="request_code")
@@ -872,7 +872,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
     5 minutes. Go on only if this returns 'approved'.
 
     summary: what exactly you're about to do, in the user's language, e.g.
-        'Data structures HW 3: attach report.pdf, then press Submit'.
+        'Expense report: attach receipt.pdf, then press Submit'.
     """
     shot = cfg.files_dir / "browser" / f"approval-{tu.now_utc():%Y%m%d-%H%M%S}.png"
     try:
@@ -892,7 +892,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
 @server.tool()
 async def schedule_browser_run(when: str, instructions: str, mode: str, logins: str = "") -> str:
     """Schedule browser work for later, only when the user's own message asks for it (e.g.
-    "tomorrow at 9, hand in the assignment on the course site"). The user approves the plan on Telegram first; that
+    "tomorrow at 9, submit the report on the portal"). The user approves the plan on Telegram first; that
     also approves the listed logins for that run. At the time, a fresh agent does the work and
     Friday reports the result.
 
@@ -935,14 +935,14 @@ async def schedule_browser_run(when: str, instructions: str, mode: str, logins: 
 @server.tool()
 async def add_watch(title: str, check: str, every: str, until: str = "", toolsets: str = "", logins: str = "") -> str:
     """Watch for a condition and tell the user when it is newly met, only when the user's own
-    message asks for it ("tell me when the course site posts a notice", "tell me if my PR gets a review
+    message asks for it ("tell me when that website posts a notice", "tell me if my PR gets a review
     or CI fails", "tell me when a train seat opens up on Dec 20"). A plain time ("remind me at 9
     tomorrow") is a reminder instead.
     The user approves the watch on Telegram first; that also approves the listed logins for its
     checks. Then a fresh agent checks it every interval, observing only, and Friday messages the
     user when it is triggered with something new.
 
-    title: a few words the user will recognize, e.g. 'course site notices'.
+    title: a few words the user will recognize, e.g. 'new notices on the portal'.
     check: the complete instruction for that unattended agent, which can't see this chat: where to
         look (URL, repo, route and date), what counts as the condition being met, and for "new"
         things, what to compare (e.g. the newest notice's title and date). Same language as the user.

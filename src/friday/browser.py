@@ -241,7 +241,7 @@ RUN_RULES = {
                "request_approval with exactly what you are about to submit, and submit only if it "
                "returns approved.",
     "auto": "Mode: auto. The user approved this run in advance, so you may submit without asking. "
-            "If anything is unexpected (another assignment than described, a missing or doubtful file, "
+            "If anything is unexpected (a different item than described, a missing or doubtful file, "
             "an error, a page asking for something the task doesn't cover), stop and report instead.",
 }
 

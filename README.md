@@ -9,13 +9,13 @@ A personal assistant that lives on your own server and talks to you over Telegra
 - **Google Calendar**: read and add events, heads-up before meetings, morning brief.
 - **Memory**: Friday saves lasting facts about you and recalls them later.
 - **Files and photos**: send them to the bot; they land in `files/inbox/` for Friday to use. A
-  photo of a syllabus or notice turns into a list of deadlines and events you add with one tap.
+  photo of a schedule, notice or invoice turns into a list of deadlines and events you add with one tap.
   `/files` lists them to get back or delete. Telegram's limits apply: 20 MB in, 50 MB out.
 - **Voice messages**: Friday transcribes them (Groq Whisper or OpenAI) and answers what you said.
 - **Browser**: a shared headless Chromium on the server that Friday drives for you, with an
   encrypted login vault. It asks you on Telegram before the first login on each site and before
-  anything irreversible, and can do browser work at a scheduled time (e.g. hand in an assignment).
-- **Watches**: "tell me when the course site posts a new notice": Friday checks on a schedule and
+  anything irreversible, and can do browser work at a scheduled time (e.g. submit a form).
+- **Watches**: "tell me when that website posts a new notice": Friday checks on a schedule and
   messages you only when something new matches.
 - **Coding jobs**: ask for a change to a project on the server; Claude Code or Codex does it in a
   sandbox. GitHub repos get a pull request you merge or close from Telegram; local projects are
@@ -109,20 +109,20 @@ buttons. "workout at 7" is a *reminder* (a message at a time, optionally repeati
 supported). Vague times like "by evening" have fixed meanings (`VAGUE_TIMES` in
 `src/friday/timeutil.py`).
 
-**Photos and documents**: send a photo of a syllabus, notice or schedule without a caption and
+**Photos and documents**: send a photo of a schedule, notice or invoice without a caption and
 Friday lists what it found (📋) instead of adding it. Nothing is added until you tap ✅ Add all.
 Events go to Google Calendar, or become to-dos if it isn't connected. For something handed in
 online, Friday then asks how: ⏰ reminder only, 🧭 prepare it and ask you before submitting, or
 🤖 submit it on its own. The last two schedule a browser run 24 hours before the deadline.
 
-**Browser**: ask for things like "open the course site and check my grades". Friday drives the
+**Browser**: ask for things like "open the shop's site and check my order". Friday drives the
 shared browser through the Playwright MCP server. To log in it uses a saved login from the vault:
 it types the username and password itself (the agent never sees them), only on the login's own
 domains and only over https. The first use on each site asks you on Telegram (✅ / ❌). If no
 login fits, Friday sends a 🔑 request (see **Forms** below). One-time codes (SMS, OTP) are asked
 for the same way and aren't stored. Before
 anything irreversible (submit, send, pay, delete) Friday sends a screenshot and waits for ✅.
-"Tomorrow at 9, submit the report on the course site" schedules a browser run: you approve the
+"Tomorrow at 9, submit the report on the portal" schedules a browser run: you approve the
 plan and the logins it may use. The browser can't open `file://` pages, and its control port
 listens on the server's localhost only. `FRIDAY_BROWSER=false` turns it off.
 

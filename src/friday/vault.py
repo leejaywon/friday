@@ -33,14 +33,14 @@ class Login:
     password: str = field(repr=False)
     domains: tuple[str, ...]
     trusted: tuple[str, ...] = ()  # domains where it is filled without asking
-    # Other sensitive fields from a form (request_form / request_login fields=...), e.g. a student
-    # id, a PIN or an API key: name -> value. Typed by fill_login_field, never shown.
+    # Other sensitive fields from a form (request_form / request_login fields=...), e.g. a member
+    # ID, a PIN or an API key: name -> value. Typed by fill_login_field, never shown.
     extra: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def domain_allowed(host: str, domains: tuple[str, ...] | list[str]) -> bool:
     """The host is one of the domains or a subdomain of one (never a look-alike such as
-    evil-lms.example.edu or lms.example.edu.evil.com)."""
+    evil-portal.example.com or portal.example.com.evil.com)."""
     host = (host or "").lower().rstrip(".")
     return any(host == d or host.endswith("." + d) for d in domains)
 
@@ -51,7 +51,7 @@ def check(name: str, domains: list[str]) -> list[str]:
     if not NAME.match(name):
         raise ValueError("name: use letters, digits, '.', '_' or '-' (max 40)")
     if not domains or not all(DOMAIN.match(d) for d in domains):
-        raise ValueError("give at least one domain like lms.example.edu (no https://, no path)")
+        raise ValueError("give at least one domain like portal.example.com (no https://, no path)")
     return domains
 
 
