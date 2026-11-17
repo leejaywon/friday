@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import Config, env_file
+from .mcp_http import token_path as mcp_token_path
 from .vault import Login, domain_allowed
 
 CDP_PORT = 9222  # same as deploy/friday-browser.service
@@ -57,16 +58,19 @@ def private_paths(cfg: Config) -> list[Path]:
     profile (session cookies), and Friday's other secrets."""
     home = Path.home()
     return [cfg.vault_dir, cfg.browser_profile, env_file(), cfg.google_token, cfg.botapi_dir,
-            home / ".ssh", home / ".codex", home / ".claude", home / ".claude.json"]
+            mcp_token_path(cfg), home / ".ssh", home / ".codex", home / ".claude", home / ".claude.json"]
 
 
-def playwright_mcp_command(cfg: Config) -> list[str]:
+def playwright_mcp_command(cfg: Config, port: int | None = None) -> list[str]:
     """The pinned Playwright MCP server (npx where deploy.sh hasn't installed it), inside bubblewrap
     when available so that its file upload can't read private_paths (its own workspace-only check
     is a guardrail, not a boundary). bwrap needs existing mount points, so only existing paths
-    are hidden."""
+    are hidden. With port it serves HTTP on 127.0.0.1 (deploy/friday-playwright-mcp.service);
+    without, stdio."""
     run = ["node", str(PLAYWRIGHT_MCP_CLI)] if PLAYWRIGHT_MCP_CLI.exists() else ["npx", "-y", PLAYWRIGHT_MCP]
     cmd = [*run, "--cdp-endpoint", CDP_URL, "--output-dir", str(cfg.files_dir / "browser")]
+    if port:
+        cmd += ["--host", "127.0.0.1", "--port", str(port)]
     bwrap = shutil.which("bwrap")
     if not bwrap:
         return cmd

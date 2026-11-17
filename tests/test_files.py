@@ -14,7 +14,7 @@ def friday(cfg, monkeypatch):
     f = botmod.Friday(replace(cfg, file_followup_wait_seconds=0.05))
     f.runs = []
 
-    async def run_codex(cfg, prompt, thread, images, model="", effort=""):
+    async def run_codex(cfg, prompt, thread, images, model="", effort="", **kw):
         f.runs.append((prompt, list(images or [])))
         return AgentResult("ok", "thread-1", [])
 

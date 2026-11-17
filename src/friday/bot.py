@@ -71,6 +71,14 @@ IMAGES_ONLY = (
 )
 # A browser approval stops counting after this: the tool waiting for it gives up at 5 minutes.
 APPROVAL_EXPIRES = timedelta(minutes=5, seconds=10)
+# A request the chat agent didn't wait for (mcp_server._follow_up) expires after this.
+FOLLOWUP_EXPIRES = timedelta(minutes=30)
+# Extra turns per message when the agent turns on a toolset (use_tools), so it gets the tools.
+MAX_CONTINUATIONS = 2
+# The plain [취소] button under a form request's [📝 입력하기]: the text it sends.
+CANCEL_TEXT = "취소"
+# A one-line reply that only says a request was sent; the user sees the request itself.
+REQUEST_ECHO = re.compile(r"보냈|보낼게|요청|입력|폼|양식|sent|request|form|fill in|enter", re.I)
 VOICE_NOTE = "[The user sent this as a voice message; it was transcribed automatically and may contain recognition errors.]\n"
 HELP = """\
 Talk to me normally, in Korean or English. I can keep your to-dos and deadlines, set reminders,
@@ -151,6 +159,7 @@ class Friday:
         # /files buttons carry an index into this list, not a path (callback data is 64 bytes at most)
         self._fs_paths: list[str] = []
         self._fs_index: dict[str, int] = {}
+        self._bg: set[asyncio.Task] = set()  # continuation turns after the owner answered a request
 
     # --- setup -------------------------------------------------------------
 
@@ -190,6 +199,7 @@ class Friday:
         app.add_handler(CommandHandler("files", self.cmd_files, filters=me))
         app.add_handler(CallbackQueryHandler(self.on_files_button, pattern=r"^fs:(r|[dfgxy]:\d{1,6}(:\d{1,4})?)$"))
         app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, self.on_text))
+        app.add_handler(MessageHandler(me & (filters.LOCATION | filters.VENUE), self.on_location))
         attachments = filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.VOICE
         app.add_handler(MessageHandler(me & attachments, self.on_file))
         app.add_handler(MessageHandler(~me, self.on_stranger), group=1)
@@ -254,6 +264,12 @@ class Friday:
 
     def _wrap(self, text: str, files: list[str], new_thread: bool) -> str:
         head = [f"[Now: {tu.local_str(tu.now_utc(), self.tz)} ({self.tz})]"]
+        raw = self.store.get("last_location")
+        if raw:  # a location shared in the last 3 hours still answers "here" / "near me"
+            loc = json.loads(raw)
+            at = tu.from_iso(loc["at"])
+            if tu.now_utc() - at < timedelta(hours=3):
+                head.append(f"[User's last shared location ({tu.local_str(at, self.tz)}): {loc['where']}]")
         if files:
             head.append("[Files the user sent, saved in the workspace: " + ", ".join(files) + "]")
         has_image = any(Path(f).suffix.lower() in IMAGE_SUFFIXES for f in files)
@@ -263,8 +279,21 @@ class Friday:
     def _current_thread(self) -> str | None:
         last = self.store.get("last_message_at")
         if last and tu.now_utc() - tu.from_iso(last) > IDLE_NEW_THREAD:
-            self.store.delete("thread_id")
+            self._reset_thread()
         return self.store.get("thread_id")
+
+    def _reset_thread(self) -> None:
+        """A fresh conversation: no Codex thread, and the optional toolsets off again."""
+        self.store.delete("thread_id")
+        self.store.delete("toolsets")
+
+    def _toolsets(self) -> set[str]:
+        """Optional toolsets this conversation turned on (mcp_server.use_tools)."""
+        return set(json.loads(self.store.get("toolsets") or "[]"))
+
+    def _followups(self) -> set[str]:
+        """Requests to the owner the chat agent didn't wait for (mcp_server._follow_up)."""
+        return {r[0] for r in self.store.conn.execute("SELECT key FROM kv WHERE key LIKE 'followup:%'")}
 
     async def ask(self, chat_id: int, text: str, files: list[str] | None = None, images: list[Path] | None = None) -> None:
         files = (self._take_pending_files()) + (files or [])
@@ -274,41 +303,138 @@ class Friday:
             path = self.cfg.workspace / f
             if path.suffix.lower() in IMAGE_SUFFIXES and path not in images:
                 images.append(path)
+        await self._turn(chat_id, text, files, images)
+
+    async def _turn(self, chat_id: int, text: str, files: list[str] | None = None,
+                    images: list[Path] | None = None) -> None:
+        """Answer a message (or continue after a note) in the chat's Codex thread. When the agent
+        turns on a toolset (use_tools), the thread is continued right away with the toolset
+        attached, at most MAX_CONTINUATIONS times; only the last turn's reply is sent."""
         async with self.agent_lock:
             typing = asyncio.create_task(self._keep_typing(chat_id))
+            requests = self._followups()
             try:
                 thread = self._current_thread()
-                try:
-                    result = await run_codex(
-                        self.cfg,
-                        self._wrap(text, files, thread is None),
-                        thread,
-                        images,
-                        model=self.store.get("model") or "",
-                        effort=self.store.get("effort") or "",
-                    )
-                except Exception as e:  # e.g. codex binary missing
-                    log.exception("codex run failed")
-                    result = AgentResult("", thread, [repr(e)])
-                if result.thread_id:
-                    self.store.set("thread_id", result.thread_id)
-                self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
+                prompt = self._wrap(text, files or [], thread is None)
+                for step in range(MAX_CONTINUATIONS + 1):
+                    toolsets = self._toolsets()
+                    try:
+                        result = await run_codex(
+                            self.cfg,
+                            prompt,
+                            thread,
+                            (images or []) if step == 0 else [],
+                            model=self.store.get("model") or "",
+                            effort=self.store.get("effort") or "",
+                            toolsets=toolsets,
+                            chat=True,
+                        )
+                    except Exception as e:  # e.g. codex binary missing
+                        log.exception("codex run failed")
+                        result = AgentResult("", thread, [repr(e)])
+                    thread = result.thread_id or thread
+                    if thread:
+                        self.store.set("thread_id", thread)
+                    self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
+                    new = self._toolsets() - toolsets
+                    if not new or not thread or step == MAX_CONTINUATIONS:
+                        break
+                    prompt = f"[{' and '.join(sorted(new))} tools are now available; continue the user's request]"
             finally:
                 typing.cancel()
+            made_request = bool(self._followups() - requests)
         if result.text:
-            await self.say(result.text, chat_id)
-        else:
+            if self._worth_sending(result.text, made_request):
+                await self.say(result.text, chat_id)
+        elif result.errors or not made_request:
             detail = "; ".join(result.errors) or "no reply"
             await self.say(f"Codex failed: {detail[:1500]}\nIf this keeps happening, send /new.", chat_id)
         await self.outbox_loop()
 
+    @staticmethod
+    def _worth_sending(text: str, made_request: bool) -> bool:
+        """Not "-" (the agent's "nothing to add"), and not a one-liner that only says a request
+        was sent when the turn sent one (the user sees the request itself)."""
+        t = text.strip()
+        if t.strip(" .\"'`") in ("", "-", "—"):
+            return False
+        return not (made_request and "\n" not in t and len(t) <= 120 and REQUEST_ECHO.search(t))
+
     async def _keep_typing(self, chat_id: int) -> None:
         while True:
-            try:
-                await self.app.bot.send_chat_action(chat_id, ChatAction.TYPING)  # type: ignore[union-attr]
-            except Exception:
-                pass
+            if not self._waiting_on_owner():  # a tool is waiting for the owner's tap, not working
+                try:
+                    await self.app.bot.send_chat_action(chat_id, ChatAction.TYPING)  # type: ignore[union-attr]
+                except Exception:
+                    pass
             await asyncio.sleep(4)
+
+    def _waiting_on_owner(self) -> bool:
+        """Is a tool waiting for an answer to a recent approval or form (not one it didn't wait for)?"""
+        since = tu.to_utc_iso(tu.now_utc() - APPROVAL_EXPIRES)
+        rows = self.store.conn.execute(
+            "SELECT 'approval', id FROM approvals WHERE status = 'pending' AND created_at > ? "
+            "UNION ALL SELECT 'login', id FROM login_requests WHERE status = 'pending' AND created_at > ?",
+            (since, since)).fetchall()
+        return any(self.store.get(f"followup:{kind}:{rid}") is None for kind, rid in rows)
+
+    # --- requests the chat agent didn't wait for (mcp_server._follow_up) ------
+
+    async def _request_done(self, kind: str, rid: int) -> None:
+        """A request from a chat turn (kind 'login': request_form/login/code, 'approval':
+        request_approval) was answered, cancelled or expired: continue the chat thread with the
+        outcome. Nothing happens for requests a tool waited for, or after /new."""
+        key = f"followup:{kind}:{rid}"
+        raw = self.store.get(key)
+        if raw is None:
+            return
+        self.store.delete(key)
+        note = self._request_outcome(kind, rid, json.loads(raw)["tool"])
+        if not self._current_thread():
+            return
+        task = asyncio.create_task(self._turn(self.owner, note))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    def _request_outcome(self, kind: str, rid: int, tool: str) -> str:
+        """What the agent learns: like the tool's result when it waited. Sensitive values are only
+        named ("stored as …"); the form's other values are read once and erased (take_result)."""
+        if kind == "approval":
+            status = self.store.approval(rid)["status"]
+            answer = {"approved": "approved: go ahead with exactly that step",
+                      "denied": "denied: don't do it"}.get(status, "not answered in time: don't do it")
+            return f"[Your request_approval was {answer}. Continue the user's request.]"
+        r = self.store.login_request(rid)
+        spec = self._request_spec(r)
+        values = self.store.take_result(rid)
+        if r["status"] == "cancelled":
+            outcome = "the user cancelled it"
+        elif r["status"] != "saved":
+            outcome = f"no answer within {FOLLOWUP_EXPIRES.seconds // 60} minutes; it expired"
+        elif tool == "request_code":
+            outcome = f"Code: {values.get('code', '')}"
+        elif tool == "request_login":
+            outcome = (f"Saved login {r['name']} for {r['domain']} (fill_login with that name won't ask "
+                       "again on that site)") + (f". Other values: {json.dumps(values, ensure_ascii=False)}"
+                                                   if values else "")
+        else:
+            values.update({f["name"]: f"stored as {r['name']}.{f['name']}" for f in spec["fields"] if f["sensitive"]})
+            outcome = "Submitted: " + json.dumps(values, ensure_ascii=False)
+        return f"[Answer to your {tool} ({spec['title']}): {outcome}. Continue the user's request.]"
+
+    async def _expire_followups(self) -> None:
+        now = tu.now_utc()
+        for key in self._followups():
+            info = json.loads(self.store.get(key) or "{}")
+            if not info or now - tu.from_iso(info["at"]) < FOLLOWUP_EXPIRES:
+                continue
+            _, kind, raw = key.split(":")
+            rid = int(raw)
+            if kind == "login" and self.store.finish_login_request(rid, "expired"):
+                await self._close_login_request(rid, "⌛ 시간이 지나 요청이 끝났어요")
+            elif kind == "approval":
+                self.store.decide_approval(rid, "expired")
+            await self._request_done(kind, rid)
 
     def _take_pending_files(self) -> list[str]:
         raw = self.store.get("pending_files")
@@ -328,12 +454,54 @@ class Friday:
         if job:
             await self._job_followup(msg, job)
             return
+        # The [취소] button under a form request: cancel it, never pass it to the agent.
+        if (msg.text or "").strip() == CANCEL_TEXT and (req := self._keyboard_request()):
+            if self.store.finish_login_request(req["id"], "cancelled"):
+                await self._close_login_request(req["id"], f"❌ {self._request_title(req)} 요청 취소됨", msg.chat_id)
+                await self._request_done("login", req["id"])
+            return
         # A photo sent just before this message may still be downloading; let it join this message.
         waited = 0.0
         while self._downloads and waited < self.cfg.file_download_wait_seconds:
             await asyncio.sleep(0.25)
             waited += 0.25
-        await self.ask(update.effective_chat.id, msg.text)
+        await self.ask(update.effective_chat.id, self._reply_context(msg) + msg.text)
+
+    async def on_location(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """A shared location (or venue): remembered for this conversation and passed to the agent,
+        so "this cafe" or "near me" can be answered. Live-location updates arrive as edits and are
+        ignored; the first position is enough for a question."""
+        msg = update.message
+        loc = msg.venue.location if msg.venue else msg.location
+        where = f"{loc.latitude:.6f},{loc.longitude:.6f}"
+        place = f" ({msg.venue.title}, {msg.venue.address})" if msg.venue else ""
+        self.store.set("last_location", json.dumps({"at": tu.to_utc_iso(tu.now_utc()), "where": where}))
+        note = (f"[The user shared their location: {where}{place}. Map link: "
+                f"https://maps.google.com/?q={where}. Use it for anything about where they are.]")
+        await self.ask(msg.chat_id, self._reply_context(msg) + note + "\n" + (msg.caption or ""))
+
+    def _keyboard_request(self):
+        """The newest pending form request whose keyboard ([📝 입력하기] [취소]) is showing."""
+        return self.store.conn.execute(
+            "SELECT * FROM login_requests WHERE status = 'pending' AND form_message_id IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+
+    @staticmethod
+    def _reply_context(msg) -> str:
+        """A line telling the agent which message the owner replied to (the quoted part if they
+        quoted one), so "this" or "that one" makes sense. Empty when it isn't a reply."""
+        r = msg.reply_to_message
+        if not r:
+            return ""
+        quote = getattr(msg, "quote", None)
+        text = (quote.text if quote and quote.text else "") or r.text or r.caption or ""
+        if not text:
+            text = "(a photo or file)" if (r.photo or r.document or r.audio or r.video or r.voice) else "(no text)"
+        text = " ".join(text.split())
+        text = text if len(text) <= 300 else text[:300] + "…"
+        own = r.from_user and msg.from_user and r.from_user.id == msg.from_user.id
+        who = "their own earlier message" if own else "your (Friday's) message"
+        return f"[The user is replying to {who}: «{text}»]\n"
 
     async def on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
@@ -450,7 +618,7 @@ class Friday:
         await update.message.reply_text(HELP)
 
     async def cmd_new(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        self.store.delete("thread_id")
+        self._reset_thread()
         await update.message.reply_text("Started a fresh conversation. Memories, tasks and reminders are kept.")
 
     async def cmd_reminders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -856,7 +1024,9 @@ class Friday:
             await q.answer("Unknown request")
             return
         # The tool stops waiting after 5 minutes (or dies with its run); a later tap mustn't count.
-        late = a["status"] == "pending" and tu.now_utc() - tu.from_iso(a["created_at"]) > APPROVAL_EXPIRES
+        # A chat request nobody waits for (followup) lasts longer; _expire_followups ends it.
+        late = (a["status"] == "pending" and self.store.get(f"followup:approval:{aid}") is None
+                and tu.now_utc() - tu.from_iso(a["created_at"]) > APPROVAL_EXPIRES)
         if late:
             self.store.decide_approval(aid, "expired")
         decided = self.store.decide_approval(aid, "approved" if answer == "yes" else "denied")
@@ -868,6 +1038,8 @@ class Friday:
             await self._quiet(q.edit_message_caption(f"{q.message.caption}\n\n{label}"))
         elif q.message:
             await self._quiet(q.edit_message_text(f"{q.message.text}\n\n{label}"))
+        if decided:
+            await self._request_done("approval", aid)
 
     # --- forms and website logins (request_form/login/code, /login, /logins) ---
 
@@ -882,9 +1054,10 @@ class Friday:
     async def _send_login_request(self, rid: int) -> None:
         """Send a form request (request_form, request_login, request_code, /login). With
         FRIDAY_FORM_URL the message carries a reply-keyboard button that opens the encrypted form
-        (on_form_data), and a second small message the [취소] button; a reply to the request
-        (on_text, _login_reply) works either way. The text says where sensitive values go: it comes
-        from Friday, not from the agent's wording, so a phishing attempt shows."""
+        (on_form_data) and a plain [취소] button (on_text cancels on that exact text); a reply to
+        the request (on_text, _login_reply) works either way. The text says where sensitive values go: it comes
+        from Friday, not from the agent's wording, so a phishing attempt shows (with the form, the
+        page shows it; the message stays short)."""
         r = self.store.login_request(rid)
         if not r or r["status"] != "pending" or r["message_id"]:
             return
@@ -899,44 +1072,42 @@ class Friday:
             except Exception as e:  # no form then: the reply still works
                 log.error("form unavailable (%s)", type(e).__name__)
         icon = {"login": "🔑", "code": "🔢"}.get(r["kind"], "📝")
-        lines = [f"{icon} {spec['title']}"]
-        if spec["description"]:
-            lines.append(spec["description"])
-        secret = [f["label"] for f in fields if f["sensitive"]]
-        if secret:
-            where = f"{spec['site']} 에서만 쓰여요" if spec["site"] else "특정 사이트에 묶이지 않아요"
-            try:
-                replaces = r["name"] in {n for n, _ in Vault(self.cfg.vault_dir).names()}
-            except Exception:
-                replaces = False
-            lines.append(f"🔐 {', '.join(secret)}: 금고의 '{r['name']}'에만 저장되고 AI에게는 보이지 않아요 "
-                         f"({where})." + (f" 지금 있는 '{r['name']}'은 새 값으로 바뀌어요." if replaces else ""))
-        how = "아래 [📝 입력하기]를 눌러 입력해주세요 (암호화해서 보내요). 또는 이 메시지에 답장으로" if url \
-            else "이 메시지에 답장으로"
-        lines.append(f"{how} 한 줄에 하나씩: {', '.join(f['label'] for f in fields)}. 답장은 바로 채팅에서 지워요.")
+        why = f" ({spec['description']})" if spec["description"] else ""
+        head = f"🔑 {spec['title']} 정보가 필요해요{why}." if r["kind"] == "login" else f"{icon} {spec['title']}{why}"
+        labels = ", ".join(f["label"] for f in fields)
+        if url:  # the form page shows where each value goes (vault entry, site)
+            lines = [head, f"[📝 입력하기]를 누르거나, 이 메시지에 답장으로 한 줄에 하나씩 보내도 돼요: {labels}."]
+        else:
+            lines = [head]
+            secret = [f["label"] for f in fields if f["sensitive"]]
+            if secret:
+                where = f"{spec['site']} 에서만 쓰여요" if spec["site"] else "특정 사이트에 묶이지 않아요"
+                lines.append(f"🔐 {', '.join(secret)}: 금고의 '{r['name']}'에만 저장되고 AI에게는 보이지 않아요 ({where}).")
+            lines.append(f"이 메시지에 답장으로 한 줄에 하나씩: {labels}. 답장은 바로 채팅에서 지워요.")
         text = "\n".join(lines)[:TELEGRAM_LIMIT]
         if not url:
             m = await self.app.bot.send_message(self.owner, text, reply_markup=cancel)  # type: ignore[union-attr]
             self.store.set_login_request_message(rid, m.message_id)
             return
         # sendData only works from a reply-keyboard button, and a message has one keyboard, so
-        # [취소] goes on its own message.
-        keyboard = ReplyKeyboardMarkup([[KeyboardButton("📝 입력하기", web_app=WebAppInfo(url))]],
+        # [취소] is a plain keyboard button next to it: it sends the text CANCEL_TEXT (on_text).
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("📝 입력하기", web_app=WebAppInfo(url)),
+                                         KeyboardButton(CANCEL_TEXT)]],
                                        resize_keyboard=True, one_time_keyboard=True)
         m = await self.app.bot.send_message(self.owner, text, reply_markup=keyboard)  # type: ignore[union-attr]
         self.store.set_login_request_message(rid, m.message_id)
-        c = await self.app.bot.send_message(self.owner, "필요 없으면:", reply_markup=cancel)  # type: ignore[union-attr]
-        self.store.set_login_request_form_message(rid, c.message_id)
+        self.store.set_login_request_form_message(rid, m.message_id)  # = it has the form keyboard
 
     async def _close_login_request(self, rid: int, text: str, chat_id: int | None = None) -> None:
-        """Show how a request ended: with the form, drop the [취소] message and the keyboard;
-        otherwise edit the request message."""
+        """Show how a request ended: with the form, remove its keyboard (and the separate [취소]
+        message older requests had); otherwise edit the request message."""
         r = self.store.login_request(rid)
         if not r:
             return
         bot, chat = self.app.bot, chat_id or self.owner  # type: ignore[union-attr]
         if r["form_message_id"]:
-            await self._quiet(bot.delete_message(chat, r["form_message_id"]))
+            if r["form_message_id"] != r["message_id"]:
+                await self._quiet(bot.delete_message(chat, r["form_message_id"]))
             await self._quiet(bot.send_message(chat, text, reply_markup=ReplyKeyboardRemove()))
         elif r["message_id"]:
             await self._quiet(bot.edit_message_text(text, chat_id=chat, message_id=r["message_id"]))
@@ -994,6 +1165,7 @@ class Friday:
         await self._close_login_request(req["id"], text + (" (메시지 삭제함)" if deleted else ""), msg.chat_id)
         if not deleted:
             await self.say(f"{text}{undeleted}")
+        await self._request_done("login", req["id"])
 
     async def on_form_data(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """The form's answer (Telegram.WebApp.sendData): ciphertext only the vault's form key opens
@@ -1016,6 +1188,7 @@ class Friday:
         ok, text = self._save_answer(req, payload["values"])
         if ok:
             await self._close_login_request(req["id"], text, msg.chat_id)
+            await self._request_done("login", req["id"])
         else:
             await bot.send_message(msg.chat_id, text)
 
@@ -1065,6 +1238,7 @@ class Friday:
             await q.answer("취소됨")
             await self._close_login_request(rid, f"❌ {self._request_title(r)} 요청 취소됨",
                                             q.message.chat_id if q.message else None)
+            await self._request_done("login", rid)
         else:
             await q.answer("이미 끝난 요청이에요")
             await self._quiet(q.edit_message_reply_markup(None))
@@ -1142,7 +1316,7 @@ class Friday:
         return 10
 
     async def _browser_run(self, run) -> None:
-        """A fresh Codex thread does the run (FRIDAY_RUN_ID lets fill_login use its approved logins);
+        """A fresh Codex thread does the run (its run id lets fill_login use its approved logins);
         the result and a last screenshot go to the user. Never raises except on shutdown."""
         rid = run["id"]
         await self._quiet(self.say(f"🌐 Browser run #{rid} started ({run['mode']}): {short(run['prompt'], 200)}"))
@@ -1151,6 +1325,7 @@ class Friday:
             result = await run_codex(
                 replace(self.cfg, codex_timeout_seconds=browser.RUN_TIMEOUT_SECONDS), prompt,
                 model=self.store.get("model") or "", effort=self.store.get("effort") or "", run_id=rid,
+                toolsets={"browser"},
             )
         except asyncio.CancelledError:
             if self.store.scheduled_run(rid)["status"] != "cancelled":  # Friday is stopping: next start reports it
@@ -1523,6 +1698,7 @@ class Friday:
         for t in self.store.tasks_now_due(now):
             await self._send_task_alert(f"⏰ Due now: {t.title}", t)
             self.store.mark_task_due_notified(t.id)
+        await self._expire_followups()
         return 15
 
     async def outbox_loop(self) -> float:

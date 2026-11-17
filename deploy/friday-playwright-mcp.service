@@ -1,0 +1,20 @@
+[Unit]
+Description=Playwright MCP server for Friday's browser (HTTP on 127.0.0.1:8931)
+After=network-online.target friday-browser.service
+Wants=network-online.target
+
+# Long-lived, so a turn with the browser toolset doesn't start Node. `friday playwright-mcp`
+# runs the pinned @playwright/mcp (installed by deploy.sh) inside bubblewrap, connected to the
+# shared browser's DevTools port, serving http://127.0.0.1:8931/mcp (src/friday/browser.py
+# playwright_mcp_command). Each Codex run is its own session. Tools that could reveal what
+# fill_login typed are hidden by Codex's config (browser.BLOCKED_TOOLS). If this is down, Codex
+# starts the server on stdio for each run instead.
+[Service]
+WorkingDirectory=%h/friday-data/workspace
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/friday/.venv/bin/friday playwright-mcp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

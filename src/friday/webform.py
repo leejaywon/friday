@@ -113,6 +113,10 @@ def login_spec(name: str, domain: str, reason: str = "", extra: list[dict] | Non
          "autocomplete": "current-password"},
         *(extra or []),
     ]
+    # A short reason ("건국대학교 eCampus 로그인") makes the better title; the page shows the domain itself.
+    reason = (reason or "").strip()
+    if reason and len(reason) <= 40 and "\n" not in reason:
+        return make_spec(reason, fields, "", domain, name, "저장")
     return make_spec(f"{domain} 로그인", fields, reason, domain, name, "저장")
 
 

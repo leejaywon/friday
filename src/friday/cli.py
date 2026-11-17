@@ -1,4 +1,4 @@
-"""Command line: `friday bot | ask | google-auth | doctor | mcp | vault | botapi`."""
+"""Command line: `friday bot | ask | google-auth | doctor | mcp | playwright-mcp | vault | botapi`."""
 
 from __future__ import annotations
 
@@ -19,7 +19,11 @@ def main() -> None:
     auth = sub.add_parser("google-auth", help="connect Google Calendar (run on a machine with a browser)")
     auth.add_argument("--client-secret", type=Path, help="OAuth client JSON from Google Cloud Console")
     sub.add_parser("doctor", help="check the configuration")
-    sub.add_parser("mcp", help="run the MCP tool server on stdio (Codex starts this itself)")
+    mcp = sub.add_parser("mcp", help="run the MCP tool server on stdio (Claude Code), or with --http as a "
+                                     "local service for Codex (deploy/friday-mcp.service)")
+    mcp.add_argument("--http", action="store_true", help="serve streamable HTTP on 127.0.0.1 (bearer token required)")
+    sub.add_parser("playwright-mcp", help="run the Playwright MCP server on 127.0.0.1 for Codex "
+                                          "(deploy/friday-playwright-mcp.service)")
     vault = sub.add_parser("vault", help="website logins for the browser (Telegram: /login, /logins)")
     vsub = vault.add_subparsers(dest="vault_cmd", required=True)
     vadd = vsub.add_parser("add", help="add or replace a login; asks for the username and password")
@@ -41,9 +45,9 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     if args.cmd == "mcp":
-        from .mcp_server import run
+        from .mcp_server import run, run_http
 
-        run()
+        run_http() if args.http else run()
         return
 
     from .config import ensure_dirs, load_config
@@ -51,7 +55,15 @@ def main() -> None:
     cfg = load_config()
     ensure_dirs(cfg)
 
-    if args.cmd == "vault":
+    if args.cmd == "playwright-mcp":
+        import os
+
+        from . import browser, mcp_http
+
+        mcp_http.token(cfg)  # exists before bwrap starts, so it is hidden from the server too
+        cmd = browser.playwright_mcp_command(cfg, mcp_http.playwright_port())
+        os.execvp(cmd[0], cmd)
+    elif args.cmd == "vault":
         vault_cmd(cfg, args)
     elif args.cmd == "botapi":
         from . import botapi

@@ -162,13 +162,34 @@ def test_codex_args_sandbox_and_github(cfg):
     assert str(cfg.vault_dir) in next(o for o in ov if o.startswith("permissions="))  # the shell can't read it
     assert not any(o.startswith("mcp_servers.github") for o in ov)
 
-    ov = _overrides(codex_args(replace(cfg, github_token_set=True), None, []))
+    gh = {"github"}
+    ov = _overrides(codex_args(replace(cfg, github_token_set=True), None, [], toolsets=gh))
     assert any("X-MCP-Readonly" in o for o in ov) and any(o.startswith("shell_environment_policy") for o in ov)
-    ov = _overrides(codex_args(replace(cfg, github_token_set=True, github_readonly=False), None, []))
+    ov = _overrides(codex_args(replace(cfg, github_token_set=True, github_readonly=False), None, [], toolsets=gh))
     assert not any("X-MCP-Readonly" in o for o in ov)
     # With only the coding (write) token, chat's GitHub access is always read-only.
-    ov = _overrides(codex_args(replace(cfg, github_code_token="x", github_readonly=False), None, []))
+    ov = _overrides(codex_args(replace(cfg, github_code_token="x", github_readonly=False), None, [], toolsets=gh))
     assert any("X-MCP-Readonly" in o for o in ov)
+
+
+def test_codex_args_attach_optional_toolsets_only_when_on(cfg):
+    cfg = replace(cfg, github_token_set=True, browser_enabled=True)
+    ov = _overrides(codex_args(cfg, None, [], chat=True))
+    assert any(o.startswith("mcp_servers.friday.url=") for o in ov)
+    assert 'mcp_servers.friday.http_headers={"X-Friday-Chat" = "1"}' in ov
+    assert not any(o.startswith(("mcp_servers.github", "mcp_servers.playwright")) for o in ov)
+    hidden = next(o for o in ov if o.startswith("mcp_servers.friday.disabled_tools="))
+    assert '"fill_login"' in hidden and '"request_approval"' in hidden and "use_tools" not in hidden
+
+    ov = _overrides(codex_args(cfg, None, [], toolsets={"browser", "github"}, chat=True))
+    assert any(o.startswith("mcp_servers.playwright.url=") for o in ov)
+    assert any(o.startswith("mcp_servers.github.url=") for o in ov)
+    assert not any(o.startswith("mcp_servers.friday.disabled_tools=") for o in ov)
+
+    # A scheduled run: the browser, its run id instead of the chat marker, and no use_tools.
+    ov = _overrides(codex_args(cfg, None, [], run_id=7, toolsets={"browser"}, chat=True))
+    assert 'mcp_servers.friday.http_headers={"X-Friday-Run" = "7"}' in ov
+    assert 'mcp_servers.friday.disabled_tools=["use_tools"]' in ov
 
 
 def test_secrets_are_refused_but_normal_text_is_not():

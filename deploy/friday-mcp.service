@@ -1,0 +1,18 @@
+[Unit]
+Description=Friday's MCP tools for Codex (streamable HTTP on 127.0.0.1:8765, bearer token)
+After=network-online.target
+Wants=network-online.target
+
+# Long-lived, so a chat turn doesn't start the server (src/friday/mcp_http.py). Codex connects
+# to http://127.0.0.1:8765/mcp with the token in ~/friday-data/mcp_token (0600, created on first
+# start; the agents' shells and coding jobs can't read it). If this is down, Codex starts the
+# tools on stdio for each run instead.
+[Service]
+WorkingDirectory=%h/friday
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/friday/.venv/bin/friday mcp --http
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

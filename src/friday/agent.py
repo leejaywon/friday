@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import browser, mcp_config
+from . import browser, mcp_config, mcp_http
 from .config import Config, env_file
 from .timeutil import VAGUE_TIMES
 
@@ -39,12 +39,17 @@ CAPABILITIES = """\
 What you can do (use it; don't say you can't or don't know when a tool covers it):
 - Reminders, tasks, Google Calendar, memory, files in this workspace, sending files to Telegram.
 - The user's projects: list_projects shows every project on this server (~/code, GitHub or local).
-  The github tools read their GitHub repos, issues and pull requests.
 - Code changes: start_coding_job hands a change or a new project to a coding agent on this server;
   the result comes back on Telegram as a pull request (GitHub repos) or commits (local projects).
-- A real browser (playwright tools) with the user's saved logins (fill_login; request_login when
-  one is missing), and scheduled browser runs for later.
 - Web search for anything current.
+- Optional toolsets, off until you turn one on with use_tools (then end your turn; you are
+  continued with the tools attached, and they stay on for this conversation):
+  - browser: a real browser (playwright tools) on any website, with the user's saved logins
+    (list_logins, fill_login, fill_login_field), request_approval before irreversible steps, and
+    schedule_browser_run for browser work later. For logging in, checking or submitting on a site.
+  - github: the user's GitHub repos, issues and pull requests (read).
+Before asking the user for something (a URL, a site, a name, a detail), look for it yourself:
+recall, list_projects, list_files, web search, the browser. Ask only if that fails.
 When a request is clear, do it rather than asking for confirmation. If something needs a tool
 you don't have, say in one line what's missing.
 """
@@ -70,6 +75,10 @@ Non-negotiable rules:
   coding agent can't see this chat, so write the task in full: what to change and every detail
   the user gave.
 - Telegram shows plain text: no Markdown. Write links as bare URLs, e.g. "source: https://xe.com".
+
+Requests to the user (request_form, request_login, request_code, request_approval): in chat they
+return at once. Then end your turn, writing nothing but "-" unless you have something else to
+say (the user sees the request itself); you are continued with the answer when it comes.
 
 Browser (playwright tools, fill_login, fill_login_field, request_login, request_code,
 request_approval, schedule_browser_run; request_login and request_code are request_form forms):
@@ -131,6 +140,17 @@ def github_read_token_var(cfg: Config) -> str | None:
     return CODE_TOKEN_VAR if cfg.github_code_token else None
 
 
+# Optional toolsets, attached only when the conversation turned them on (use_tools) because
+# loading their tools into every turn is slow. Friday's own tools for the browser are hidden
+# with it.
+TOOLSETS = ("browser", "github")
+FRIDAY_BROWSER_TOOLS = ["fill_login", "fill_login_field", "list_logins", "request_approval", "schedule_browser_run"]
+
+
+def available_toolsets(cfg: Config) -> list[str]:
+    return [t for t, on in (("browser", cfg.browser_enabled), ("github", bool(github_read_token_var(cfg)))) if on]
+
+
 def codex_args(
     cfg: Config,
     thread_id: str | None,
@@ -138,18 +158,44 @@ def codex_args(
     model: str = "",
     effort: str = "",
     run_id: int | None = None,
+    toolsets: frozenset[str] | set[str] = frozenset(),
+    chat: bool = False,
+    http: tuple[bool, bool] = (True, True),
 ) -> list[str]:
-    env = {"FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir), "FRIDAY_TZ": cfg.default_tz}
-    if run_id:  # a scheduled browser run: fill_login may use that run's pre-approved logins
-        env["FRIDAY_RUN_ID"] = str(run_id)
-    env_toml = "{" + ", ".join(f"{k} = {_toml_str(v)}" for k, v in env.items()) + "}"
-    overrides = [
-        f"mcp_servers.friday.command={_toml_str(sys.executable)}",
-        'mcp_servers.friday.args=["-m", "friday.mcp_server"]',
-        f"mcp_servers.friday.env={env_toml}",
+    """toolsets: the optional ones to attach (TOOLSETS). chat: a Telegram chat turn, where
+    requests to the user don't wait for the answer (Friday continues the thread when it comes).
+    http: whether (Friday's, Playwright's) MCP servers are reached over their local HTTP
+    services (mcp_http) rather than started for this run on stdio."""
+    browser_on = "browser" in toolsets and cfg.browser_enabled
+    if http[0]:
+        headers = {}
+        if run_id:  # a scheduled browser run: fill_login may use that run's pre-approved logins
+            headers[mcp_http.RUN_HEADER] = str(run_id)
+        elif chat:
+            headers[mcp_http.CHAT_HEADER] = "1"
+        overrides = [
+            f"mcp_servers.friday.url={_toml_str(mcp_http.url(mcp_http.friday_port()))}",
+            f"mcp_servers.friday.bearer_token_env_var={_toml_str(mcp_http.TOKEN_VAR)}",
+            f"mcp_servers.friday.http_headers={mcp_config.toml_value(headers)}",
+        ]
+    else:
+        env = {"FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir), "FRIDAY_TZ": cfg.default_tz}
+        if run_id:
+            env["FRIDAY_RUN_ID"] = str(run_id)
+        elif chat:
+            env["FRIDAY_CHAT"] = "1"
+        overrides = [
+            f"mcp_servers.friday.command={_toml_str(sys.executable)}",
+            'mcp_servers.friday.args=["-m", "friday.mcp_server"]',
+            f"mcp_servers.friday.env={mcp_config.toml_value(env)}",
+        ]
+    hidden = ([] if browser_on else FRIDAY_BROWSER_TOOLS) + (["use_tools"] if run_id else [])
+    if hidden:
+        overrides.append(f"mcp_servers.friday.disabled_tools={mcp_config.toml_value(hidden)}")
+    overrides += [
         # Friday's own tools run without a prompt; there is nobody at a terminal to approve them.
         'mcp_servers.friday.default_tools_approval_mode="approve"',
-        # fill_login and request_approval wait up to 5 minutes for the user's tap.
+        # fill_login and request_approval may wait up to 5 minutes for the user's tap.
         "mcp_servers.friday.tool_timeout_sec=400",
         'approval_policy="never"',
         # Shell commands: write only in the workspace, no network, and no reading the vault, the
@@ -158,27 +204,35 @@ def codex_args(
             "extends": ":workspace", "filesystem": {str(p): "deny" for p in browser.private_paths(cfg)}}) + "}",
         'default_permissions="friday-chat"',
         f"web_search={_toml_str(cfg.web_search)}",
+        # Shell commands never get the tokens (GitHub's, Friday's MCP token), only Codex does.
+        'shell_environment_policy.exclude=["*TOKEN*", "*KEY*", "*SECRET*"]',
     ]
     token_var = github_read_token_var(cfg)
-    if token_var:
+    if token_var and "github" in toolsets:
         # GitHub's hosted MCP server. With only the coding token it is always read-only: chat reads,
         # and changes go through coding jobs.
         overrides += [
             f"mcp_servers.github.url={_toml_str(GITHUB_MCP_URL)}",
             f"mcp_servers.github.bearer_token_env_var={_toml_str(token_var)}",
             'mcp_servers.github.default_tools_approval_mode="approve"',
-            # Shell commands never get the tokens, only the MCP server does.
-            'shell_environment_policy.exclude=["*TOKEN*", "*KEY*", "*SECRET*"]',
         ]
         if cfg.github_readonly or token_var == CODE_TOKEN_VAR:
             overrides.append('mcp_servers.github.http_headers={"X-MCP-Readonly" = "true"}')
-    if cfg.browser_enabled:
+    if browser_on:
         # The shared browser (deploy/friday-browser.service) through the Playwright MCP server.
-        pw = browser.playwright_mcp_command(cfg)
+        if http[1]:
+            overrides += [
+                f"mcp_servers.playwright.url={_toml_str(mcp_http.url(mcp_http.playwright_port()))}",
+                "mcp_servers.playwright.startup_timeout_sec=20",
+            ]
+        else:
+            pw = browser.playwright_mcp_command(cfg)
+            overrides += [
+                f"mcp_servers.playwright.command={_toml_str(pw[0])}",
+                f"mcp_servers.playwright.args={mcp_config.toml_value(pw[1:])}",
+                "mcp_servers.playwright.startup_timeout_sec=60",  # npx (no deploy.sh install) may download first
+            ]
         overrides += [
-            f"mcp_servers.playwright.command={_toml_str(pw[0])}",
-            f"mcp_servers.playwright.args={mcp_config.toml_value(pw[1:])}",
-            "mcp_servers.playwright.startup_timeout_sec=60",  # npx (no deploy.sh install) may download first
             f"mcp_servers.playwright.disabled_tools={mcp_config.toml_value(browser.BLOCKED_TOOLS)}",
             'mcp_servers.playwright.default_tools_approval_mode="approve"',
         ]
@@ -231,11 +285,19 @@ async def run_codex(
     model: str = "",
     effort: str = "",
     run_id: int | None = None,
+    toolsets: frozenset[str] | set[str] = frozenset(),
+    chat: bool = False,
 ) -> AgentResult:
-    args = codex_args(cfg, thread_id, images or [], model, effort, run_id)
-    env = None
+    # The local MCP services (deploy/friday-mcp.service, friday-playwright-mcp.service) when they
+    # are up; otherwise Codex starts the servers itself, as before they existed.
+    http = (mcp_http.listening(mcp_http.friday_port()),
+            "browser" in toolsets and mcp_http.listening(mcp_http.playwright_port()))
+    args = codex_args(cfg, thread_id, images or [], model, effort, run_id, toolsets, chat, http)
+    env = {**os.environ}
+    if http[0]:
+        env[mcp_http.TOKEN_VAR] = mcp_http.token(cfg)
     if github_read_token_var(cfg) == CODE_TOKEN_VAR:
-        env = {**os.environ, CODE_TOKEN_VAR: cfg.github_code_token}
+        env[CODE_TOKEN_VAR] = cfg.github_code_token
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=cfg.workspace,

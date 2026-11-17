@@ -148,7 +148,7 @@ MIGRATIONS = [
     # to the agent, erased as soon as it reads them. name/domain: where sensitive values are saved.
     ("login_requests", "kind", "TEXT NOT NULL DEFAULT 'login'"),  # login | code | form
     ("login_requests", "spec", "TEXT NOT NULL DEFAULT '{}'"),
-    ("login_requests", "form_message_id", "INTEGER"),  # the [취소] message sent with the form button
+    ("login_requests", "form_message_id", "INTEGER"),  # the message with the form keyboard (older: a [취소] message)
     ("login_requests", "result", "TEXT"),
 ]
 

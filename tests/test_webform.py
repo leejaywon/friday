@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 from friday import bot as botmod
@@ -83,3 +84,45 @@ def test_request_form_returns_plain_values_and_only_stores_sensitive_ones(cfg, t
     assert row["status"] == "saved" and row["result"] is None  # erased once the tool read it
     assert "sk-very" not in json.dumps(dict(row)) and sent[-1] == "✅ openai 저장됨 (나머지는 전달함)"
     f.store.close()
+
+
+def test_chat_request_returns_at_once_and_the_answer_continues_the_thread(cfg, tools, monkeypatch):
+    f, sent, deleted = _bot(replace(cfg, allowed_user_ids=(1,)))
+    monkeypatch.setattr(tools, "store", f.store)
+    f.store.set("thread_id", "thread-1")
+    notes = []
+    monkeypatch.setattr(f, "_turn", lambda chat, note: notes.append(note) or asyncio.sleep(0))
+    chat = SimpleNamespace(headers={"X-Friday-Chat": "1"})  # what Codex sends for a chat turn
+    fields = json.dumps([{"name": "api_key", "label": "API 키", "type": "password"},
+                         {"name": "account", "label": "계정", "type": "text"}])
+
+    out = asyncio.run(tools.request_form("OpenAI", fields, "요약에 쓸 키", save_as="openai", ctx=chat))
+    assert out.startswith("Sent to the user") and not notes  # returned without waiting
+    rid = f.store.conn.execute("SELECT max(id) FROM login_requests").fetchone()[0]
+    assert [r["kind"] for r in f.store.pending_outbox()] == ["login_request"]
+
+    f.store.set_login_request_form_message(rid, 5)
+    values = {"api_key": "sk-very-secret", "account": "업무용"}
+    asyncio.run(f.on_form_data(_form_answer(f, {"rid": rid, "values": values}, deleted), None))
+    assert len(notes) == 1 and "sk-very-secret" not in notes[0]
+    assert '"account": "업무용"' in notes[0] and "stored as openai.api_key" in notes[0]
+    assert f.store.get(f"followup:login:{rid}") is None
+    f.store.close()
+
+
+def test_mcp_http_requires_the_bearer_token(cfg, tools):
+    from starlette.testclient import TestClient
+
+    from friday import mcp_http
+
+    token = mcp_http.token(cfg)
+    assert mcp_http.token(cfg) == token and mcp_http.token_path(cfg).stat().st_mode & 0o777 == 0o600
+    app = mcp_http.BearerAuth(tools.server.streamable_http_app(host="127.0.0.1"), token)
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
+    head = {"Accept": "application/json, text/event-stream", "Host": "127.0.0.1:8765"}
+    with TestClient(app, base_url="http://127.0.0.1:8765") as c:
+        assert c.post("/mcp", json=init, headers=head).status_code == 401
+        assert c.post("/mcp", json=init, headers={**head, "Authorization": "Bearer wrong"}).status_code == 401
+        ok = c.post("/mcp", json=init, headers={**head, "Authorization": f"Bearer {token}"})
+        assert ok.status_code == 200, ok.text

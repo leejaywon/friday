@@ -1,8 +1,10 @@
 """Tools Codex calls while answering: reminders, tasks, calendar, memory, files, coding jobs,
 proposals, and browser logins and approvals.
 
-Codex starts this as a stdio MCP server for each run. It writes to the same SQLite database the
-bot reads, and anything meant for the user's phone goes through the outbox table.
+It runs as a long-lived local HTTP server (deploy/friday-mcp.service, `friday mcp --http`, see
+mcp_http.py) that Codex connects to on every run, or on stdio (`friday mcp`: Claude Code, and
+Codex when the service is down). It writes to the same SQLite database the bot reads, and
+anything meant for the user's phone goes through the outbox table.
 """
 
 from __future__ import annotations
@@ -16,8 +18,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 
-from . import browser, gcal
+from . import browser, gcal, mcp_http
 from . import timeutil as tu
 from . import workspace as wsfiles
 from .config import ensure_dirs, load_config
@@ -45,6 +48,56 @@ server = MCPServer(
 
 def _tz() -> str:
     return store.tz(cfg.default_tz)
+
+
+def _context(ctx: Context | None, header: str, env: str) -> str:
+    """Per-run context: an HTTP header Codex sends (mcp_http), or on stdio the server's env."""
+    if ctx is None:  # called directly, not through MCP
+        return ""
+    try:
+        headers = ctx.headers
+    except Exception:  # no request (e.g. called directly)
+        headers = None
+    return (headers.get(header) or "") if headers else os.environ.get(env, "")
+
+
+def _run_id(ctx: Context | None) -> int:
+    """The scheduled browser run this call belongs to, or 0."""
+    raw = _context(ctx, mcp_http.RUN_HEADER, "FRIDAY_RUN_ID")
+    return int(raw) if raw.isdigit() else 0
+
+
+def _in_chat(ctx: Context | None) -> bool:
+    """A Telegram chat turn: requests to the user return at once and the bot continues the
+    thread with the answer. Scheduled runs (nobody chatting) and other clients wait instead."""
+    return bool(_context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")) and not _run_id(ctx)
+
+
+TOOLSETS = ("browser", "github")
+
+
+@server.tool()
+def use_tools(toolset: str, reason: str = "") -> str:
+    """Turn on an optional toolset for the rest of this conversation (see your instructions):
+    'browser' (a real browser with the user's saved logins, approvals and scheduled browser runs)
+    or 'github' (the user's GitHub repos, issues and pull requests). The tools are attached
+    right after this turn and you are continued automatically: call this as soon as you know you
+    need them, then end your turn, writing nothing but "-".
+
+    reason: a few words on what you need them for.
+    """
+    name = toolset.strip().lower()
+    if name not in TOOLSETS:
+        return f"Unknown toolset '{toolset}'. Toolsets: {', '.join(TOOLSETS)}."
+    if name == "browser" and not cfg.browser_enabled:
+        return "The browser is turned off on this server (FRIDAY_BROWSER=false)."
+    if name == "github" and not (cfg.github_token_set or cfg.github_code_token):
+        return "GitHub isn't connected (no GITHUB_TOKEN on the server)."
+    on = set(json.loads(store.get("toolsets") or "[]"))
+    on.add(name)
+    store.set("toolsets", json.dumps(sorted(on)))
+    return (f"The {name} tools will be available in a moment. End your turn now, writing nothing but "
+            "\"-\"; you'll be continued automatically with them attached.")
 
 
 @server.tool()
@@ -418,7 +471,14 @@ def propose_items(items_json: str, note: str = "") -> str:
 # --- browser ----------------------------------------------------------------
 
 APPROVAL_TIMEOUT = 300  # seconds to wait for a tap; agent.py gives these tools a longer Codex timeout
-RUN_ID = int(os.environ.get("FRIDAY_RUN_ID") or 0)  # set by Friday only for a scheduled browser run
+# What a request to the user returns in chat, where it doesn't wait (_in_chat).
+SENT = ("Sent to the user. When they answer you'll be continued automatically with the result; "
+        "end your turn now, writing nothing but \"-\" unless you have something else to tell them.")
+
+
+def _follow_up(kind: str, rid: int, tool: str) -> None:
+    """Mark a request the bot continues the chat thread for when it's answered (bot._request_done)."""
+    store.set(f"followup:{kind}:{rid}", json.dumps({"tool": tool, "at": tu.to_utc_iso(tu.now_utc())}))
 
 
 async def _ask(kind: str, text: str, screenshot: Path | None = None) -> str:
@@ -449,10 +509,10 @@ def list_logins() -> str:
     return "\n".join(lines) or "No saved logins."
 
 
-async def _may_fill(name: str, login, host: str) -> str | None:
+async def _may_fill(name: str, login, host: str, run_id: int = 0) -> str | None:
     """None if the login may be typed on host: trusted there (approved once, or typed in for it),
     pre-approved for this run, or approved now on Telegram. Otherwise the refusal to return."""
-    if domain_allowed(host, login.trusted) or (RUN_ID and store.run_allows_login(RUN_ID, name)):
+    if domain_allowed(host, login.trusted) or (run_id and store.run_allows_login(run_id, name)):
         return None
     status = await _ask("login", f"🔑 '{name}' 로그인 정보를 {host} 에 입력할까요?\n"
                                  "(허용하면 이 사이트에서는 다음부터 묻지 않아요. /logins 에서 되돌릴 수 있어요)")
@@ -475,7 +535,7 @@ def _vault_login(name: str):
 
 
 @server.tool()
-async def fill_login(name: str) -> str:
+async def fill_login(name: str, ctx: Context | None = None) -> str:
     """Log in with a saved login: types its username and password into the login form open in the
     browser and submits it. Open the site's login page first. The user approves the first use on
     each site on Telegram; after that it fills there without asking (logins of an approved
@@ -492,7 +552,7 @@ async def fill_login(name: str) -> str:
         return f"The browser isn't reachable ({type(e).__name__})."
     if not ok:
         return f"Wrong site: {host} (open the login form on https://{login.domains[0]} first)"
-    if refusal := await _may_fill(name, login, host):
+    if refusal := await _may_fill(name, login, host, _run_id(ctx)):
         return refusal
     try:
         return await browser.fill_login(login)
@@ -501,7 +561,7 @@ async def fill_login(name: str) -> str:
 
 
 @server.tool()
-async def fill_login_field(name: str, field: str) -> str:
+async def fill_login_field(name: str, field: str, ctx: Context | None = None) -> str:
     """Type one extra field of a saved login (e.g. a student id or PIN, see list_logins) into the
     input that has focus on the open page: click the input first. Only on the login's own domains
     over https, with the same approval as fill_login. Doesn't submit. You never see the value."""
@@ -521,7 +581,7 @@ async def fill_login_field(name: str, field: str) -> str:
         return f"Wrong site: {host} (open https://{login.domains[0]} first)"
     if state == "no_input":
         return f"No input has focus on {host}: click the field first, then call fill_login_field again."
-    if refusal := await _may_fill(name, login, host):
+    if refusal := await _may_fill(name, login, host, _run_id(ctx)):
         return refusal
     try:
         return await browser.fill_focused(login.domains, login.extra[field], field)
@@ -529,10 +589,16 @@ async def fill_login_field(name: str, field: str) -> str:
         return f"Couldn't fill the field ({type(e).__name__})."
 
 
-async def _run_form(spec: dict, kind: str = "form", name: str = "", domain: str = "") -> tuple[str, dict]:
+async def _run_form(spec: dict, kind: str = "form", name: str = "", domain: str = "",
+                    ctx: Context | None = None, tool: str = "request_form") -> tuple[str, dict]:
     """Send a form to the user and wait up to 5 minutes. Returns (status, the non-sensitive
-    values); sensitive values went to the vault under name, never here."""
+    values); sensitive values went to the vault under name, never here. In chat it doesn't
+    wait: ('sent', {}), and the bot continues the thread with the answer."""
     rid = store.add_login_request(name, domain, spec["description"], kind=kind, spec=spec)
+    if _in_chat(ctx):
+        _follow_up("login", rid, tool)
+        store.queue("login_request", text=str(rid))
+        return "sent", {}
     store.queue("login_request", text=str(rid))
     deadline = time.monotonic() + APPROVAL_TIMEOUT
     while time.monotonic() < deadline and store.login_request(rid)["status"] == "pending":
@@ -547,7 +613,7 @@ NOT_SUBMITTED = {"cancelled": "Cancelled", "expired": "Timed out"}
 
 @server.tool()
 async def request_form(title: str, fields: str, description: str = "", domain: str = "", save_as: str = "",
-                       submit_label: str = "") -> str:
+                       submit_label: str = "", ctx: Context | None = None) -> str:
     """Ask the user for structured input or anything secret through a secure form on Telegram
     (encrypted to this server). For a simple question, just ask in chat instead.
     Sensitive fields (passwords by default, or "sensitive": true) go only to the vault under
@@ -577,7 +643,9 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
         spec = make_spec(title, parsed, description, domain, save_as, submit_label)
     except ValueError as e:
         return f"Not requested: {e}"
-    status, values = await _run_form(spec, "form", save_as if sensitive else "", domain)
+    status, values = await _run_form(spec, "form", save_as if sensitive else "", domain, ctx)
+    if status == "sent":
+        return SENT
     if status != "saved":
         return NOT_SUBMITTED.get(status, "Timed out")
     values.update({n: f"stored as {save_as}.{n}" for n in sensitive})
@@ -585,7 +653,7 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
 
 
 @server.tool()
-async def request_login(name: str, domain: str, reason: str = "", fields: str = "") -> str:
+async def request_login(name: str, domain: str, reason: str = "", fields: str = "", ctx: Context | None = None) -> str:
     """Ask the user on Telegram for a website login when no saved login fits (see list_logins).
     They type it into a secure form (or reply with it); Friday stores it in the vault, so you never
     see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
@@ -606,7 +674,9 @@ async def request_login(name: str, domain: str, reason: str = "", fields: str = 
             raise ValueError("username and password are always asked; don't list them in fields")
     except ValueError as e:
         return f"Not requested: {e}"
-    status, values = await _run_form(spec, "login", name, domain)
+    status, values = await _run_form(spec, "login", name, domain, ctx, "request_login")
+    if status == "sent":
+        return SENT
     if status != "saved":
         return NOT_SUBMITTED.get(status, "Timed out")
     return f"Saved login {name} for {domain}" + (f". Other values: {json.dumps(values, ensure_ascii=False)}"
@@ -614,7 +684,7 @@ async def request_login(name: str, domain: str, reason: str = "", fields: str = 
 
 
 @server.tool()
-async def request_code(reason: str, label: str = "인증번호") -> str:
+async def request_code(reason: str, label: str = "인증번호", ctx: Context | None = None) -> str:
     """Ask the user on Telegram for a one-time code (2FA, SMS or email code, OTP) a site asks for.
     They type it into a form; the code is returned to you and not stored anywhere. Waits up to
     5 minutes. Returns 'Code: <code>', 'Cancelled' or 'Timed out'.
@@ -622,14 +692,16 @@ async def request_code(reason: str, label: str = "인증번호") -> str:
     reason: a few words in the user's language, e.g. 'lms.example.edu 로그인 문자 인증'.
     label: the field's label, e.g. '인증번호' or 'OTP'.
     """
-    status, values = await _run_form(code_spec(reason, label), "code")
+    status, values = await _run_form(code_spec(reason, label), "code", ctx=ctx, tool="request_code")
+    if status == "sent":
+        return SENT
     if status == "saved" and values.get("code"):
         return f"Code: {values['code']}"
     return NOT_SUBMITTED.get(status, "Timed out")
 
 
 @server.tool()
-async def request_approval(summary: str) -> str:
+async def request_approval(summary: str, ctx: Context | None = None) -> str:
     """Ask the user before an irreversible step (submit, send, post, pay, delete). Friday sends a
     screenshot of the current page with your summary and approve/deny buttons, and waits up to
     5 minutes. Go on only if this returns 'approved'.
@@ -642,7 +714,13 @@ async def request_approval(summary: str) -> str:
         url = await browser.screenshot(shot)
     except Exception:
         url = None
-    status = await _ask("action", f"✋ {summary}" + (f"\n{url}" if url else ""), shot if url else None)
+    text = f"✋ {summary}" + (f"\n{url}" if url else "")
+    if _in_chat(ctx):
+        aid = store.add_approval("action", text)
+        _follow_up("approval", aid, "request_approval")
+        store.queue("approval", text=str(aid), path=str(shot) if url else None)
+        return SENT
+    status = await _ask("action", text, shot if url else None)
     return {"approved": "approved", "denied": "denied: don't do it", "expired": "timed out: don't do it"}[status]
 
 
@@ -739,6 +817,15 @@ def set_model(model: str = "", effort: str = "") -> str:
 
 def run() -> None:
     server.run("stdio")
+
+
+def run_http(port: int | None = None) -> None:
+    """Serve on 127.0.0.1 over streamable HTTP, for Codex (deploy/friday-mcp.service). Every
+    request needs the bearer token (mcp_http.token)."""
+    import uvicorn
+
+    app = mcp_http.BearerAuth(server.streamable_http_app(host="127.0.0.1"), mcp_http.token(cfg))
+    uvicorn.run(app, host="127.0.0.1", port=port or mcp_http.friday_port(), log_level="warning")
 
 
 if __name__ == "__main__":
