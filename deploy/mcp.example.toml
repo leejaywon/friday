@@ -3,8 +3,8 @@
 # Check it from Telegram with /status.
 #
 # Each server is a [servers.<name>] table with the same keys as Codex's [mcp_servers.<name>]
-# (command/args/env for local servers, url/bearer_token_env_var/http_headers for hosted ones),
-# plus three Friday keys:
+# (command/args/env for local servers, url/bearer_token_env_var/http_headers for hosted ones;
+# with CHAT_ENGINE=claude Friday translates them for Claude Code), plus three Friday keys:
 #   enabled  = false            turn a server off without deleting it
 #   approve  = false            block its tools (nobody is there to approve them)
 #   env_from = ["SOME_TOKEN"]   copy variables from .env.server into the server's env

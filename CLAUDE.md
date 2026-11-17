@@ -21,5 +21,6 @@ Personal Telegram agent (Python 3.12, uv). README.md explains what it does and h
 
 To undo a bad deploy, `git revert` the commit, push, and deploy again.
 
-The Friday tools (reminders, tasks, calendar, memory, send a file to Telegram) are available
-here as the `friday` MCP server, writing to the same database the bot uses.
+If Claude here has the `friday` MCP server (`claude mcp add friday --scope user -- ~/friday/.venv/bin/friday mcp`),
+the Friday tools (reminders, tasks, calendar, memory, send a file to Telegram) write to the same
+database the bot uses.
