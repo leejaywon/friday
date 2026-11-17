@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -47,3 +48,16 @@ def test_chat_turns_always_have_the_browser(cfg, tools, store):
     assert any(o.startswith("mcp_servers.playwright.url=") for o in ov)
     assert "already attached" in tools.use_tools("browser") and store.get("toolsets") is None
     assert not Friday(replace(cfg, browser_enabled=False))._toolsets()
+
+
+def test_new_instructions_start_a_fresh_thread_with_the_last_exchange(cfg, store):
+    bot = Friday(cfg)
+    bot._wrap("안녕", [], True)
+    bot.store.set("thread_id", "t1")
+    bot._note_exchange("안녕", "안녕!")
+    turns = []
+    bot._turn = lambda chat, text, files, images: turns.append(bot._current_thread()) or asyncio.sleep(0)
+    asyncio.run(bot.ask(1, "다음"))
+    cfg.instructions_path.write_text(cfg.instructions_path.read_text() + "\n- new rule")
+    asyncio.run(bot.ask(1, "다음"))
+    assert turns == ["t1", None] and "안녕!" in bot._wrap("다음", [], True)

@@ -4,6 +4,7 @@ reminders, task alerts, meeting heads-ups and the morning brief."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -150,6 +151,10 @@ def plain_text(text: str) -> str:
     """Telegram gets plain text: Markdown links become "text url" and **bold** loses its stars."""
     text = MD_LINK.sub(lambda m: m[2] if m[1].strip() == m[2] else f"{m[1]} {m[2]}", text)
     return MD_BOLD.sub(r"\1", text)
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def safe_name(name: str) -> str:
@@ -307,7 +312,9 @@ class Friday(WatchBot):
         if carry := self.store.get("carry"):
             self.store.delete("carry")
             context.append(carry)
-        return "\n".join([f"{instructions(self.cfg)}\n---", *context, body])
+        prompt = instructions(self.cfg)
+        self.store.set("prompt_hash", _digest(prompt))
+        return "\n".join([f"{prompt}\n---", *context, body])
 
     def _current_thread(self) -> str | None:
         last = self.store.get("last_message_at")
@@ -320,12 +327,16 @@ class Friday(WatchBot):
         for key in ("thread_id", "toolsets", "carry"):
             self.store.delete(key)
 
-    def _continue_fresh(self, said: str, replied: str) -> None:
-        """Go on in a new Codex thread that starts with a note of the last exchange (_wrap)."""
+    def _note_exchange(self, said: str, replied: str) -> None:
         note = f"the user said «{short(' '.join(said.split()) or '(only files)', 300)}»"
         if replied.strip(" .\"'`-—"):
             note += f" and you replied «{short(' '.join(replied.split()), 300)}»"
-        self.store.set("carry", f"[Continuing this conversation in a fresh context. Last exchange: {note}.]")
+        self.store.set("last_exchange", note)
+
+    def _continue_fresh(self) -> None:
+        """Go on in a new Codex thread that starts with a note of the last exchange (_wrap)."""
+        if note := self.store.get("last_exchange"):
+            self.store.set("carry", f"[Continuing this conversation in a fresh context. Last exchange: {note}.]")
         self.store.delete("thread_id")
 
     def _toolsets(self) -> set[str]:
@@ -349,6 +360,11 @@ class Friday(WatchBot):
             path = self.cfg.workspace / f
             if path.suffix.lower() in IMAGE_SUFFIXES and path not in images:
                 images.append(path)
+        # A thread keeps the instructions it started with: after a deploy or a FRIDAY.md edit, the
+        # next message goes on in a fresh one (not while a request's answer is due in this one).
+        if (self.store.get("thread_id") and not self._followups()
+                and self.store.get("prompt_hash") != _digest(instructions(self.cfg))):
+            self._continue_fresh()
         await self._turn(chat_id, text, files, images)
 
     async def _turn(self, chat_id: int, text: str, files: list[str] | None = None,
@@ -381,9 +397,10 @@ class Friday(WatchBot):
             finally:
                 typing.cancel()
             made_request = bool(self._followups() - requests)
+            self._note_exchange(text, result.text)
             # Not while a request is open: its answer continues this thread.
             if thread and not self._followups() and result.input_tokens > MAX_TURN_INPUT_TOKENS:
-                self._continue_fresh(text, result.text)
+                self._continue_fresh()
         if result.text:
             if self._worth_sending(result.text, made_request, self._last_proposal() > proposal):
                 await self.say(plain_text(result.text), chat_id)
