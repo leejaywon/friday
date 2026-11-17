@@ -212,7 +212,7 @@ bootstrap() {
     ok "done (the friday user, Codex, Claude Code, uv and the sandbox are installed)"
     return
   fi
-  info "Installs packages, Node + Codex CLI, Claude Code, uv and Chromium, creates the 'friday'"
+  info "Installs packages, Node + Codex CLI, Claude Code, uv and Google Chrome, creates the 'friday'"
   info "user, turns off SSH password login and enables a firewall that allows only SSH."
   info "Takes a few minutes."
   if ! confirm "Run it on $(host_of "$ROOT_HOST")?"; then die "the server needs bootstrap.sh."; fi

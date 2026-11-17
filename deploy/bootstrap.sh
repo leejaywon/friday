@@ -51,30 +51,41 @@ echo "== uv and Claude Code for $APP_USER"
 sudo -u "$APP_USER" -H bash -lc 'command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh'
 sudo -u "$APP_USER" -H bash -lc 'test -x ~/.local/bin/claude || curl -fsSL https://claude.ai/install.sh | bash'
 
-echo "== browser: Playwright's Chromium for Friday (deploy/friday-browser.service)"
-PLAYWRIGHT=1.65.0  # keep in step with playwright in pyproject.toml
-apt-get install -yq fonts-noto-cjk libatomic1   # CJK text in screenshots; Node bundled with the playwright package
-npx -y "playwright@$PLAYWRIGHT" install-deps chromium
-sudo -u "$APP_USER" -H bash -lc "npx -y playwright@$PLAYWRIGHT install chromium"
-# Like bwrap above: let this Chromium create user namespaces for its own sandbox, which matters
-# since it opens arbitrary sites. Only this binary, not machine-wide.
-cat > /etc/apparmor.d/friday-chrome <<EOF
+echo "== browser: Google Chrome Stable for Friday (H.264/AAC included)"
+if [[ $(dpkg --print-architecture) != amd64 ]]; then
+  echo "Friday's Google Chrome package requires an amd64 server." >&2
+  exit 1
+fi
+apt-get install -yq fonts-noto-cjk libatomic1
+if ! dpkg-query -W -f='${Status}' google-chrome-stable 2>/dev/null | grep -q 'install ok installed'; then
+  chrome_deb=$(mktemp --suffix=.deb)
+  curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o "$chrome_deb"
+  chmod 644 "$chrome_deb"
+  apt-get install -yq "$chrome_deb"
+  rm -f "$chrome_deb"
+fi
+# Ubuntu ships this profile for Chrome. Reload it, or provide it on minimal images, so Chrome
+# can create user namespaces for its sandbox without disabling it or changing global settings.
+if [[ ! -f /etc/apparmor.d/chrome ]]; then
+cat > /etc/apparmor.d/chrome <<'EOF'
 abi <abi/4.0>,
 include <tunables/global>
 
-profile friday-chrome /home/$APP_USER/.cache/ms-playwright/chromium-*/chrome-linux*/chrome flags=(unconfined) {
+profile chrome /opt/google/chrome/chrome flags=(unconfined) {
   userns,
-  include if exists <local/friday-chrome>
+  include if exists <local/chrome>
 }
 EOF
-apparmor_parser -r /etc/apparmor.d/friday-chrome
-# Chrome policy (this build reads chrome_for_testing): no file:// pages, so the agent driving the
-# browser can't open files on the server, and no saved passwords or autofill in the profile.
-install -d /etc/opt/chrome_for_testing/policies/managed
-cat > /etc/opt/chrome_for_testing/policies/managed/friday.json <<'EOF'
+fi
+apparmor_parser -r /etc/apparmor.d/chrome
+# Chrome Stable's policy location differs from Playwright's build. Keep file:// blocked and
+# passwords/autofill out of the profile. Root owns the policies; the browser user cannot edit them.
+install -d -m 755 /etc/opt/chrome/policies/managed
+cat > /etc/opt/chrome/policies/managed/friday.json <<'EOF'
 {"URLBlocklist": ["file://*"], "PasswordManagerEnabled": false,
  "AutofillAddressEnabled": false, "AutofillCreditCardEnabled": false}
 EOF
+chmod 644 /etc/opt/chrome/policies/managed/friday.json
 
 # Package caches the job sandbox may write to (src/friday/jobs.py AGENT_CACHES); it ignores
 # paths that don't exist yet.

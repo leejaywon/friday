@@ -26,9 +26,12 @@ main() {
   uv sync --frozen --no-dev -q
   # Starter MCP config, only if there isn't one yet (the server copy is the one you edit).
   [[ -f ~/friday-data/mcp.toml ]] || cp deploy/mcp.example.toml ~/friday-data/mcp.toml
-  # The shared browser: Chromium for the pinned playwright package (a no-op when installed; its
-  # system packages come from bootstrap.sh) and the Playwright MCP server pinned in browser.py.
-  .venv/bin/playwright install chromium
+  # Chrome comes from bootstrap.sh, including codecs, sandbox setup and managed policies.
+  # Refuse to deploy a service that cannot start; existing servers need the browser setup first.
+  if [[ ! -x /usr/bin/google-chrome-stable ]]; then
+    echo "Google Chrome Stable is missing. Run the browser setup in deploy/bootstrap.sh as root first." >&2
+    return 1
+  fi
   npm install -s --no-fund --no-audit --prefix ~/.local/share/friday/playwright-mcp \
     "$(grep -o '@playwright/mcp@[0-9.]*' src/friday/browser.py)"
   mkdir -p ~/.config/systemd/user
@@ -37,6 +40,7 @@ main() {
   systemctl --user daemon-reload
   systemctl --user enable -q friday.service
   # Started if it isn't running, not restarted: that would interrupt a browser run in progress.
+  # Browser binary/unit changes require an explicit restart after backing up its stopped profile.
   systemctl --user enable -q --now friday-browser.service
   # The local Bot API server was removed. Where an older version set it up, log the bot out of it
   # (so Telegram's cloud API takes the bot back) and stop it.

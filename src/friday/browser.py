@@ -1,4 +1,4 @@
-"""The shared browser: a headless Chromium that deploy/friday-browser.service keeps running.
+"""The shared browser: headless Google Chrome that deploy/friday-browser.service keeps running.
 
 The chat agent drives it through the Playwright MCP server; Friday's own code connects over the
 same DevTools (CDP) port only to type stored logins and take screenshots. The port gives full

@@ -20,7 +20,7 @@ A personal assistant that lives on your own server and talks to you over Telegra
   photo of a schedule, notice or invoice turns into a list of deadlines and events you add with one tap.
   `/files` lists them to get back or delete. Telegram's limits apply: 20 MB in, 50 MB out.
 - **Voice messages**: Friday transcribes them (Groq Whisper or OpenAI) and answers what you said.
-- **Browser**: a shared headless Chromium on the server that Friday drives for you, with an
+- **Browser**: shared headless Google Chrome on the server, with H.264/AAC playback and an
   encrypted login vault. It asks you on Telegram before the first login on each site and before
   anything irreversible, and can do browser work at a scheduled time (e.g. submit a form).
 - **Watches**: "tell me when that website posts a new notice": Friday checks on a schedule and
@@ -35,7 +35,7 @@ inbound ports are open apart from SSH.
 ```
 Telegram ──► friday bot (systemd) ──► Codex or Claude Code ──► friday MCP tools ──► SQLite
                      │                        │                                     ▲
-                     │                        └──► Playwright MCP ──► Chromium (systemd)
+                     │                        └──► Playwright MCP ──► Chrome (systemd)
                      └── reminder / calendar / brief / browser-run / watch loops ───┘
 ```
 
@@ -43,8 +43,8 @@ Telegram ──► friday bot (systemd) ──► Codex or Claude Code ──►
 
 You need:
 
-- A fresh **Ubuntu 24.04** VPS you can reach as root over SSH. Size it by what you'll use: the
-  bot itself is light; the headless browser and coding agents take more memory.
+- A fresh **Ubuntu 24.04 amd64 (x86_64)** VPS you can reach as root over SSH. Size it by what
+  you'll use: the bot itself is light; the headless browser and coding agents take more memory.
 - A Telegram account, and a ChatGPT plan or a Claude plan.
 - Your own copy of this repo on GitHub (a fork, or a private repo you push it to), and the
   [GitHub CLI](https://cli.github.com) signed in (`gh auth login`).
@@ -60,7 +60,7 @@ deploy/setup.sh
 ```
 
 It sets up an SSH key and the `friday` / `friday-root` SSH aliases, prepares the server
-(`deploy/bootstrap.sh`: packages, the Codex and Claude Code CLIs, Chromium, the `friday` user,
+(`deploy/bootstrap.sh`: packages, the Codex and Claude Code CLIs, Google Chrome, the `friday` user,
 key-only SSH and a firewall), asks for the bot token from @BotFather, which AI plan to use, your
 timezone and the optional keys, gives the server a deploy key for your repo, signs in to Codex or
 Claude on the server, deploys, and sets your Telegram user id so the bot answers only you. Each
@@ -193,6 +193,23 @@ ssh friday 'cd ~/friday && .venv/bin/friday doctor'
 The server runs GitHub's `main`; only pushed commits go live. Commit, `git push`, then
 `deploy/push.sh`. Never edit `~/friday` on the server: each deploy resets it. To undo a deploy,
 `git revert` the commit, push, and deploy again.
+
+The shared browser is Google Chrome Stable, installed by `deploy/bootstrap.sh` with its
+H.264/AAC codecs, Ubuntu AppArmor sandbox profile and root-owned Chrome policies. Chrome
+updates through its APT repository. Normal deploys leave the running browser alone; after a
+browser/unit change, stop `friday-browser.service`, back up `~/friday-data/browser` with its
+permissions intact, and start it again. Preserve that profile to retain site logins. When
+moving from a newer Chromium to Chrome Stable, verify a profile copy before switching.
+
+To check actual video frames and decoded audio samples in the running browser:
+
+```bash
+ssh friday 'cd ~/friday && .venv/bin/python deploy/check-browser.py'
+```
+
+It opens and closes a test tab, serves generated samples on a temporary loopback port, and
+returns a nonzero exit code if H.264, AAC or combined playback fails. It does not require a
+speaker and does not read login cookies.
 
 If you hit your ChatGPT plan's limits, `ssh -t friday 'codex login --with-api-key'` switches Codex
 to an OpenAI API key (`codex login --device-auth` switches back).
