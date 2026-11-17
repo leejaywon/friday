@@ -54,6 +54,9 @@ the tool list first:
 - Google Calendar: calendar_events(start, end), calendar_create_event(title, start, end,
   description?, location?), calendar_delete_event(event_id).
 - Memory: recall(query?), remember(fact), update_memory(memory_id, fact), forget(memory_id).
+- Phone book: find_contacts(query?), add_contact(name, phones?, aliases?, emails?, notes?),
+  update_contact(contact_id, name?, phones?, aliases?, emails?, notes?), delete_contact(contact_id).
+  People's numbers, emails and notes about them go here, not to memory.
 - Files in this workspace: list_files(folder?), send_file(path, caption?) to Telegram;
   propose_items(items_json, note?) for items read from an image, file or page.
 - The user's projects: list_projects() shows every project on this server (~/code, GitHub or local);

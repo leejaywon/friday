@@ -93,3 +93,15 @@ def test_tree_leaves_out_ignored_files_and_folds_deep_folders(tmp_path):
     plain, msg = show(root, depth=2)
     assert "node_modules" not in plain and "utils/  (2 files)" in plain and "README.md" in plain
     assert msg.startswith("<b>") and "<pre>app/\n" in msg
+
+
+def test_phone_book(tools):
+    out = tools.add_contact("김민수", ["휴대폰: 010-1234-5678", "회사 02-123-4567"], ["Minsu Kim", "민수형"],
+                            notes="고등학교 친구")
+    assert "휴대폰 010-1234-5678 · 회사 02-123-4567" in out and "(Minsu Kim, 민수형)" in out
+    tools.add_contact("John Park", ["+1 415-555-0100 (US)"])
+    assert tools.find_contacts("minsu").startswith("#1 김민수") and "John" not in tools.find_contacts("민수형")
+    assert tools.find_contacts("5678").startswith("#1 김민수")
+    assert tools.add_contact("민수", ["01012345678"]).startswith("Not saved: this looks like an existing contact")
+    out = tools.update_contact(1, phones=["010-1234-5678", "+44 20 7946 0958"])
+    assert "010-1234-5678 · +442079460958" in out and "고등학교 친구" in out

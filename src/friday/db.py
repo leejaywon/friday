@@ -152,6 +152,16 @@ CREATE TABLE IF NOT EXISTS watches (        -- "tell me when X": a condition an 
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS watches_due ON watches(status, next_check_at);
+CREATE TABLE IF NOT EXISTS contacts (       -- the user's phone book (contacts.py)
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,              -- as the user calls them
+    aliases     TEXT NOT NULL DEFAULT '[]', -- JSON list: other spellings and nicknames (Minsu Kim, 민수형)
+    phones      TEXT NOT NULL DEFAULT '[]', -- JSON [{"number": "+821012345678", "label": "휴대폰"}]
+    emails      TEXT NOT NULL DEFAULT '[]', -- JSON list
+    notes       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT
+);
 """
 
 JOB_FIELDS = (
@@ -511,6 +521,37 @@ class Store:
 
     def forget(self, mid: int) -> bool:
         return self.conn.execute("DELETE FROM memories WHERE id = ?", (mid,)).rowcount > 0
+
+    # --- contacts ------------------------------------------------------------
+
+    def add_contact(self, name: str, aliases: list[str], phones: list[dict], emails: list[str], notes: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO contacts(name, aliases, phones, emails, notes, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (name, json.dumps(aliases, ensure_ascii=False), json.dumps(phones, ensure_ascii=False),
+             json.dumps(emails, ensure_ascii=False), notes, self._now()),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def contact(self, cid: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM contacts WHERE id = ?", (cid,)).fetchone()
+
+    def contacts(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM contacts ORDER BY name COLLATE NOCASE, id").fetchall()
+
+    def update_contact(self, cid: int, **fields) -> bool:
+        """fields: name, notes (text) or aliases, phones, emails (lists); only those given change."""
+        sets, args = [], []
+        for key, value in fields.items():
+            sets.append(f"{key} = ?")
+            args.append(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+        if not sets:
+            return self.contact(cid) is not None
+        sets.append("updated_at = ?")
+        return self.conn.execute(f"UPDATE contacts SET {', '.join(sets)} WHERE id = ?",
+                                 (*args, self._now(), cid)).rowcount > 0
+
+    def delete_contact(self, cid: int) -> bool:
+        return self.conn.execute("DELETE FROM contacts WHERE id = ?", (cid,)).rowcount > 0
 
     # --- outbox (messages the agent's tools ask the bot to send) ------------
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -20,12 +21,12 @@ from zoneinfo import ZoneInfo
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from . import browser, gcal, mcp_http
+from . import browser, contacts, gcal, mcp_http
 from . import timeutil as tu
 from . import watches as wt
 from . import workspace as wsfiles
 from .config import ensure_dirs, load_config
-from .db import Store
+from .db import Store, search_terms
 from .jobs import REPO_ARG, github_slug, short
 from .models import available_models, model_list
 from .models import summary as models_summary
@@ -340,6 +341,101 @@ def recall(query: str = "") -> str:
 def forget(memory_id: int) -> str:
     """Delete a saved memory by id."""
     return "Forgotten." if store.forget(memory_id) else "No memory with that id."
+
+
+@server.tool()
+def find_contacts(query: str = "") -> str:
+    """The user's phone book. With a query: contacts whose name, other names, number (4+ digits,
+    e.g. "5678"), email or notes match it; empty: everyone (up to 50). Try other spellings too
+    (민수 / Minsu)."""
+    rows = store.contacts()
+    if not rows:
+        return "The phone book is empty."
+    terms = search_terms(query)
+    if terms or re.search(r"\d{4}", query):
+        def score(r) -> int:
+            text = " ".join([r["name"], r["aliases"], r["emails"], r["notes"]]).lower()
+            return sum(t in text for t in terms) + 2 * contacts.number_matches(query, json.loads(r["phones"]))
+        ranked = sorted(((score(r), r) for r in rows), key=lambda x: -x[0])
+        rows = [r for n, r in ranked if n]
+        if not rows:
+            return f"No contact matches '{query}' ({len(store.contacts())} in the phone book)."
+    shown = rows[:50]
+    more = f"\n({len(shown)} of {len(rows)} shown; search to narrow)" if len(rows) > len(shown) else ""
+    return "\n".join(contacts.show(r) for r in shown) + more
+
+
+def _contact_fields(phones, aliases, emails, notes) -> dict | str:
+    """The fields given (None = not given), checked; or why they can't be saved."""
+    out: dict = {}
+    try:
+        if phones is not None:
+            out["phones"] = contacts.parse_phones(phones)
+    except ValueError as e:
+        return f"Not saved: {e}. Give phones like [\"휴대폰: 010-1234-5678\", \"회사 02-123-4567\"]."
+    if aliases is not None:
+        out["aliases"] = contacts.split_list(aliases)
+    if emails is not None:
+        out["emails"] = contacts.split_list(emails)
+        if bad := [e for e in out["emails"] if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e)]:
+            return f"Not saved: '{bad[0]}' isn't an email address."
+    if notes is not None:
+        out["notes"] = notes.strip()
+    if looks_secret(" ".join([out.get("notes", ""), *out.get("aliases", [])])):
+        return REFUSAL
+    return out
+
+
+@server.tool()
+def add_contact(name: str, phones: list[str] | None = None, aliases: list[str] | None = None,
+                emails: list[str] | None = None, notes: str = "") -> str:
+    """Save a person to the phone book. Phone numbers, emails and notes about a person go here,
+    not to memory.
+
+    name: what the user calls them (김민수, 엄마, John Park).
+    phones: each with an optional label, e.g. ["휴대폰: 010-1234-5678", "회사 02-123-4567",
+        "+1 415-555-0100 (US)"]; Korean numbers without +82 are fine.
+    aliases: other names to find them by: the name in other languages or spellings and nicknames
+        (["Minsu Kim", "민수", "민수형"]). Add the obvious ones yourself.
+    notes: what the user wants to remember about them (how they met, birthday, preferences).
+    Refused when someone already has one of these numbers or the same name: update that one."""
+    name = " ".join(name.split())
+    if not name:
+        return "Not saved: a name is needed."
+    fields = _contact_fields(phones or [], aliases or [], emails or [], notes)
+    if isinstance(fields, str):
+        return fields
+    numbers = {p["number"] for p in fields["phones"]}
+    for r in store.contacts():
+        if r["name"].lower() == name.lower() or numbers & {p["number"] for p in json.loads(r["phones"])}:
+            return "Not saved: this looks like an existing contact; use update_contact if it's the same person:\n" \
+                + contacts.show(r)
+    cid = store.add_contact(name, fields["aliases"], fields["phones"], fields["emails"], fields["notes"])
+    return "Saved:\n" + contacts.show(store.contact(cid))
+
+
+@server.tool()
+def update_contact(contact_id: int, name: str = "", phones: list[str] | None = None,
+                   aliases: list[str] | None = None, emails: list[str] | None = None,
+                   notes: str | None = None) -> str:
+    """Change a contact (ids from find_contacts). Only the fields you pass change, and each one
+    you pass replaces the old value: to add a number, alias or note, pass the full new list or
+    text (old ones included); an empty list or "" clears it."""
+    if not store.contact(contact_id):
+        return "No contact with that id."
+    fields = _contact_fields(phones, aliases, emails, notes)
+    if isinstance(fields, str):
+        return fields
+    if " ".join(name.split()):
+        fields["name"] = " ".join(name.split())
+    store.update_contact(contact_id, **fields)
+    return "Updated:\n" + contacts.show(store.contact(contact_id))
+
+
+@server.tool()
+def delete_contact(contact_id: int) -> str:
+    """Remove a contact from the phone book (only when the user asks)."""
+    return "Deleted." if store.delete_contact(contact_id) else "No contact with that id."
 
 
 @server.tool()
