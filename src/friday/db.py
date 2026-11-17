@@ -164,11 +164,10 @@ MIGRATIONS = [
     ("reminders", "skip_dates", "TEXT NOT NULL DEFAULT ''"),  # comma-separated local dates
     ("memories", "updated_at", "TEXT"),
     # login_requests are forms (request_form, request_login, request_code, /login): `spec` is the
-    # form (webform.make_spec; '{}' = a plain login), `result` the non-sensitive values handed back
+    # form (forms.make_spec; '{}' = a plain login), `result` the non-sensitive values handed back
     # to the agent, erased as soon as it reads them. name/domain: where sensitive values are saved.
     ("login_requests", "kind", "TEXT NOT NULL DEFAULT 'login'"),  # login | code | form
     ("login_requests", "spec", "TEXT NOT NULL DEFAULT '{}'"),
-    ("login_requests", "form_message_id", "INTEGER"),  # the message with the form keyboard (older: a [취소] message)
     ("login_requests", "result", "TEXT"),
 ]
 
@@ -618,15 +617,12 @@ class Store:
 
     def add_login_request(self, name: str, domain: str, reason: str = "", kind: str = "login",
                           spec: dict | None = None) -> int:
-        """A form request. spec: webform.make_spec's form; None = a plain login (username, password)."""
+        """A form request. spec: forms.make_spec's form; None = a plain login (username, password)."""
         cur = self.conn.execute(
             "INSERT INTO login_requests(name, domain, reason, kind, spec, created_at) VALUES(?, ?, ?, ?, ?, ?)",
             (name, domain, reason, kind, json.dumps(spec or {}, ensure_ascii=False), self._now()),
         )
         return cur.lastrowid  # type: ignore[return-value]
-
-    def set_login_request_form_message(self, rid: int, message_id: int) -> None:
-        self.conn.execute("UPDATE login_requests SET form_message_id = ? WHERE id = ?", (message_id, rid))
 
     def take_result(self, rid: int) -> dict:
         """A form's non-sensitive values, read once: erased from the database right away."""

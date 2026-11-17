@@ -381,7 +381,7 @@ codex_login() {
 }
 
 claude_login() {
-  step "Sign in to Claude Code on the server (coding jobs and Remote Control)"
+  step "Sign in to Claude Code on the server (coding jobs)"
   if on_server 'test -s ~/.claude/.credentials.json' 2>/dev/null; then
     ok "signed in"
     return
@@ -390,7 +390,7 @@ claude_login() {
   if confirm "Open it now?"; then
     ssh -t "$HOST" 'cd ~/code && ~/.local/bin/claude' || true
   else
-    warn "skipped; coding jobs with Claude and Remote Control need it (CODE_ENGINE=codex works without)."
+    warn "skipped; coding jobs with Claude need it (CODE_ENGINE=codex works without)."
   fi
 }
 
@@ -441,57 +441,6 @@ telegram_user() {
   ENV_CHANGED=0
 }
 
-claude_extras() {
-  step "Friday tools for Claude, and Remote Control (for the Claude iPhone app)"
-  if ! on_server 'test -s ~/.claude/.credentials.json' 2>/dev/null; then
-    warn "skipped: Claude isn't signed in on the server. Run this again after signing in."
-    return
-  fi
-  if on_server '~/.local/bin/claude mcp get friday' >/dev/null 2>&1; then
-    ok "friday MCP server registered for Claude"
-  elif confirm "Give Claude on the server the Friday tools (reminders, tasks, calendar, memory)?"; then
-    on_server '~/.local/bin/claude mcp add friday --scope user -- ~/friday/.venv/bin/friday mcp'
-  fi
-  if on_server 'systemctl --user is-enabled --quiet claude-rc' 2>/dev/null; then
-    ok "claude-rc (Remote Control) enabled"
-  elif confirm "Start Claude Remote Control (session 'vps' in the Claude app)?"; then
-    on_server 'systemctl --user enable --now claude-rc'
-    ok "enabled"
-  fi
-}
-
-login_form() {
-  step "Secure form on GitHub Pages (optional; README.md step 11)"
-  if is_set FRIDAY_FORM_URL || grep -q '^FRIDAY_FORM_URL=' "$ENV_FILE" 2>/dev/null; then
-    ok "FRIDAY_FORM_URL is set in $ENV_FILE; not using GitHub Pages"
-    return
-  fi
-  local owner=${SLUG%%/*} repo=${SLUG#*/} vis
-  owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
-  if gh api "repos/$SLUG/pages" >/dev/null 2>&1; then
-    ok "Pages is on: https://$owner.github.io/$repo/login/"
-    return
-  fi
-  vis=$(gh repo view "$SLUG" --json visibility -q .visibility 2>/dev/null) || vis=""
-  info "Friday's requests (logins, codes, secrets) can open a form with masked fields. It's a static page"
-  info "(site/login/) that GitHub Pages serves at https://$owner.github.io/$repo/login/."
-  if [[ "$vis" != PUBLIC ]]; then
-    warn "$SLUG isn't public, and free GitHub Pages needs a public repo. Host site/login/index.html"
-    warn "on any static https host and set FRIDAY_FORM_URL in $ENV_FILE, or reply to the requests instead."
-    return
-  fi
-  if ! confirm "Turn on GitHub Pages for $SLUG (source: GitHub Actions)?" N; then
-    warn "skipped; Friday's requests still work by reply."
-    return
-  fi
-  gh api -X POST "repos/$SLUG/pages" -f build_type=workflow >/dev/null || die "couldn't turn on Pages for $SLUG."
-  if gh workflow run pages.yml --repo "$SLUG" >/dev/null 2>&1; then
-    ok "Pages on; the 'Pages' workflow is publishing the form (a minute or two)"
-  else
-    ok "Pages on; it publishes the form on the next push of site/ (or run the 'Pages' workflow)"
-  fi
-}
-
 main() {
   cd "$(dirname "$0")/.."
   [[ -t 0 ]] || die "run this in a terminal; it asks questions."
@@ -508,8 +457,6 @@ main() {
   google_calendar
   first_deploy
   telegram_user
-  claude_extras
-  login_form
   echo
   echo "${B}Done.${R} Friday should answer you in Telegram now. Health check:"
   echo "   ssh $HOST 'cd ~/friday && .venv/bin/friday doctor'"

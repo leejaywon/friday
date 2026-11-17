@@ -32,7 +32,7 @@ main() {
   npm install -s --no-fund --no-audit --prefix ~/.local/share/friday/playwright-mcp \
     "$(grep -o '@playwright/mcp@[0-9.]*' src/friday/browser.py)"
   mkdir -p ~/.config/systemd/user
-  cp deploy/friday.service deploy/claude-rc.service deploy/friday-browser.service deploy/friday-botapi.service \
+  cp deploy/friday.service deploy/friday-browser.service deploy/friday-botapi.service \
     deploy/friday-mcp.service deploy/friday-playwright-mcp.service ~/.config/systemd/user/
   systemctl --user daemon-reload
   systemctl --user enable -q friday.service

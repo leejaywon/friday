@@ -23,11 +23,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
-    WebAppInfo,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -46,6 +42,7 @@ from .agent import AgentResult, instructions, run_codex
 from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
+from .forms import check_values, login_spec
 from .jobs import JobError, Outcome, Runner, github_slug, parse_code_args, short
 from .jobs import run as run_cmd
 from .models import available_models, model_list
@@ -54,7 +51,6 @@ from .models import switch as switch_model
 from .transcribe import TranscriptionError, model_for, transcribe
 from .vault import Vault, check
 from .watches import WatchBot
-from .webform import FormKey, check_values, form_url, login_spec
 
 log = logging.getLogger(__name__)
 
@@ -85,8 +81,6 @@ APPROVAL_EXPIRES = timedelta(minutes=5, seconds=10)
 FOLLOWUP_EXPIRES = timedelta(minutes=30)
 # Extra turns per message when the agent turns on a toolset (use_tools), so it gets the tools.
 MAX_CONTINUATIONS = 2
-# The plain [취소] button under a form request's [📝 입력하기]: the text it sends.
-CANCEL_TEXT = "취소"
 # A one-line reply that only says a request was sent; the user sees the request itself.
 REQUEST_ECHO = re.compile(r"보냈|보낼게|요청|입력|폼|양식|sent|request|form|fill in|enter", re.I)
 # Before the message when a chat turn is retried with `codex exec` after the app-server died mid-turn.
@@ -247,7 +241,6 @@ class Friday(WatchBot):
         app.add_handler(CommandHandler("login", self.cmd_login, filters=me))
         app.add_handler(CommandHandler("logins", self.cmd_logins, filters=me))
         app.add_handler(CallbackQueryHandler(self.on_login_button, pattern=r"^login:cancel:\d+$"))
-        app.add_handler(MessageHandler(me & filters.StatusUpdate.WEB_APP_DATA, self.on_form_data))
         app.add_handler(CallbackQueryHandler(self.on_vault_button, pattern=r"^vault:(untrust|del|delyes|delno):[A-Za-z0-9_.-]{1,40}$"))
         app.add_handler(CallbackQueryHandler(self.on_job_button, pattern=r"^job:(merge|close|deploy|undo):\d+$"))
         app.add_handler(CallbackQueryHandler(self.on_proposal_button, pattern=r"^prop:(accept|dismiss):\d+$"))
@@ -567,12 +560,6 @@ class Friday(WatchBot):
         if job:
             await self._job_followup(msg, job)
             return
-        # The [취소] button under a form request: cancel it, never pass it to the agent.
-        if (msg.text or "").strip() == CANCEL_TEXT and (req := self._keyboard_request()):
-            if self.store.finish_login_request(req["id"], "cancelled"):
-                await self._close_login_request(req["id"], f"❌ {self._request_title(req)} 요청 취소됨", msg.chat_id)
-                await self._request_done("login", req["id"])
-            return
         # A photo sent just before this message may still be downloading; let it join this message.
         waited = 0.0
         while self._downloads and waited < self.cfg.file_download_wait_seconds:
@@ -596,12 +583,6 @@ class Friday(WatchBot):
         note = (f"[The user shared their location: {where}{place}. Map link: "
                 f"https://maps.google.com/?q={where}. Use it for anything about where they are.]")
         await self.ask(msg.chat_id, self._reply_context(msg) + note + "\n" + msg.caption)
-
-    def _keyboard_request(self):
-        """The newest pending form request whose keyboard ([📝 입력하기] [취소]) is showing."""
-        return self.store.conn.execute(
-            "SELECT * FROM login_requests WHERE status = 'pending' AND form_message_id IS NOT NULL "
-            "ORDER BY id DESC LIMIT 1").fetchone()
 
     @staticmethod
     def _reply_context(msg) -> str:
@@ -1179,68 +1160,43 @@ class Friday(WatchBot):
         return self._request_spec(r)["title"]
 
     async def _send_login_request(self, rid: int) -> None:
-        """Send a form request (request_form, request_login, request_code, /login). With
-        FRIDAY_FORM_URL the message carries a reply-keyboard button that opens the encrypted form
-        (on_form_data) and a plain [취소] button (on_text cancels on that exact text); a reply to
-        the request (on_text, _login_reply) works either way. The text says where sensitive values go: it comes
-        from Friday, not from the agent's wording, so a phishing attempt shows (with the form, the
-        page shows it; the message stays short)."""
+        """Send a form request (request_form, request_login, request_code, /login). The owner
+        replies to it, one field per line (on_text, _login_reply). The text says where sensitive
+        values go: it comes from Friday, not from the agent's wording, so a phishing attempt shows."""
         r = self.store.login_request(rid)
         if not r or r["status"] != "pending" or r["message_id"]:
             return
         spec = self._request_spec(r)
-        fields = spec["fields"]
-        cancel = InlineKeyboardMarkup([[InlineKeyboardButton("취소", callback_data=f"login:cancel:{rid}")]])
-        url = ""
-        if self.cfg.form_url:
-            try:
-                url = form_url(self.cfg.form_url, {**spec, "v": 1, "rid": rid,
-                                                   "key": FormKey(self.cfg.vault_dir).public_b64()})
-            except Exception as e:  # no form then: the reply still works
-                log.error("form unavailable (%s)", type(e).__name__)
         icon = {"login": "🔑", "code": "🔢"}.get(r["kind"], "📝")
-        why = f" ({spec['description']})" if spec["description"] else ""
-        head = f"{icon} {spec['title']}{why}"
-        if r["domain"]:  # always name the site, whatever the agent titled the request
-            reason = spec["description"] if spec["title"] == f"{r['domain']} 로그인" else spec["title"]
-            head = f"🔑 {r['domain']} 로그인" + (f" ({short(' '.join(reason.split()), 60)})" if reason else "")
-        labels = ", ".join(f["label"] for f in fields)
-        if url:  # the form page shows where each value goes (vault entry, site)
-            lines = [head, f"[📝 입력하기]를 누르거나, 이 메시지에 답장으로 한 줄에 하나씩 보내도 돼요: {labels}."]
-        else:
-            lines = [head]
-            secret = [f["label"] for f in fields if f["sensitive"]]
-            if secret:
-                where = f"{spec['site']} 에서만 쓰여요" if spec["site"] else "특정 사이트에 묶이지 않아요"
-                lines.append(f"🔐 {', '.join(secret)}: 금고의 '{r['name']}'에만 저장되고 AI에게는 보이지 않아요 ({where}).")
-            lines.append(f"이 메시지에 답장으로 한 줄에 하나씩: {labels}. 답장은 바로 채팅에서 지워요.")
-        text = "\n".join(lines)[:TELEGRAM_LIMIT]
-        if not url:
-            m = await self.app.bot.send_message(self.owner, text, reply_markup=cancel)  # type: ignore[union-attr]
-            self.store.set_login_request_message(rid, m.message_id)
-            return
-        # sendData only works from a reply-keyboard button, and a message has one keyboard, so
-        # [취소] is a plain keyboard button next to it: it sends the text CANCEL_TEXT (on_text).
-        keyboard = ReplyKeyboardMarkup([[KeyboardButton("📝 입력하기", web_app=WebAppInfo(url)),
-                                         KeyboardButton(CANCEL_TEXT)]],
-                                       resize_keyboard=True, one_time_keyboard=True)
-        m = await self.app.bot.send_message(self.owner, text, reply_markup=keyboard)  # type: ignore[union-attr]
+        why = f" ({short(' '.join(spec['description'].split()), 120)})" if spec["description"] else ""
+        lines = [f"{icon} {spec['title']}{why}"]
+        secret = [f["label"] for f in spec["fields"] if f["sensitive"]]
+        if secret:
+            where = f"used only on {spec['site']}" if spec["site"] else "not tied to any site"
+            lines.append(f"🔐 {', '.join(secret)}: stored only in the vault as '{r['name']}', never shown to "
+                         f"the AI ({where}).")
+        lines.append("Reply to this message with one value per line; I delete your reply right away:")
+        lines += [f"{i}. {self._field_hint(f)}" for i, f in enumerate(spec["fields"], 1)]
+        cancel = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"login:cancel:{rid}")]])
+        m = await self.app.bot.send_message(self.owner, "\n".join(lines)[:TELEGRAM_LIMIT],  # type: ignore[union-attr]
+                                            reply_markup=cancel)
         self.store.set_login_request_message(rid, m.message_id)
-        self.store.set_login_request_form_message(rid, m.message_id)  # = it has the form keyboard
+
+    @staticmethod
+    def _field_hint(f: dict) -> str:
+        """One line of a request message: the field's label and what a valid answer looks like."""
+        hint = {"checkbox": "yes or no", "date": "YYYY-MM-DD", "time": "HH:MM"}.get(f["type"], "")
+        if f.get("options"):
+            hint = " / ".join(o["label"] for o in f["options"])
+        extra = [h for h in (hint, f.get("help", ""), "" if f["required"] else "optional, empty line to skip") if h]
+        return f["label"] + (f" ({'; '.join(extra)})" if extra else "")
 
     async def _close_login_request(self, rid: int, text: str, chat_id: int | None = None) -> None:
-        """Show how a request ended: with the form, remove its keyboard (and the separate [취소]
-        message older requests had); otherwise edit the request message."""
+        """Show how a request ended by editing its message."""
         r = self.store.login_request(rid)
-        if not r:
-            return
-        bot, chat = self.app.bot, chat_id or self.owner  # type: ignore[union-attr]
-        if r["form_message_id"]:
-            if r["form_message_id"] != r["message_id"]:
-                await self._quiet(bot.delete_message(chat, r["form_message_id"]))
-            await self._quiet(bot.send_message(chat, text, reply_markup=ReplyKeyboardRemove()))
-        elif r["message_id"]:
-            await self._quiet(bot.edit_message_text(text, chat_id=chat, message_id=r["message_id"]))
+        if r and r["message_id"]:
+            await self._quiet(self.app.bot.edit_message_text(  # type: ignore[union-attr]
+                text, chat_id=chat_id or self.owner, message_id=r["message_id"]))
 
     def _save_answer(self, req, values: dict) -> tuple[bool, str]:
         """Route what the owner typed (form or reply), by the request's own spec: sensitive values
@@ -1296,31 +1252,6 @@ class Friday(WatchBot):
         if not deleted:
             await self.say(f"{text}{undeleted}")
         await self._request_done("login", req["id"])
-
-    async def on_form_data(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """The form's answer (Telegram.WebApp.sendData): ciphertext only the vault's form key opens
-        (webform.py). Routed like a reply; the service message is deleted."""
-        msg = update.message
-        data = msg.web_app_data.data if msg.web_app_data else ""
-        await self._quiet(msg.delete())
-        bot = self.app.bot  # type: ignore[union-attr]
-        try:
-            payload = FormKey(self.cfg.vault_dir).decrypt(data)
-        except ValueError as e:
-            log.warning("form answer unreadable (%s)", e)
-            await bot.send_message(msg.chat_id, "❌ 입력 내용을 읽지 못했어요. 다시 시도해주세요.")
-            return
-        req = self.store.login_request(payload["rid"])
-        if not req or req["status"] != "pending":
-            await bot.send_message(msg.chat_id, "이 요청은 이미 끝났거나 없는 요청이에요. 저장하지 않았어요.",
-                                   reply_markup=ReplyKeyboardRemove())
-            return
-        ok, text = self._save_answer(req, payload["values"])
-        if ok:
-            await self._close_login_request(req["id"], text, msg.chat_id)
-            await self._request_done("login", req["id"])
-        else:
-            await bot.send_message(msg.chat_id, text)
 
     async def cmd_login(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         args = ctx.args or []

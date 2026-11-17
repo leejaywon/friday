@@ -1,7 +1,7 @@
 """Website logins and other secrets, encrypted at rest.
 
 Entries are added from the server's terminal (`friday vault add`) or through a form on Telegram
-(request_form / request_login: its sensitive fields, webform.py, or a reply the bot deletes),
+(request_form / request_login: its sensitive fields, forms.py, or a reply the bot deletes),
 never by the agent.
 Only the MCP server's fill_login and fill_login_field read the values, and they type them straight
 into the browser: no agent ever sees them. A login is "trusted" on a domain once the user approved

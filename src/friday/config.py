@@ -65,9 +65,6 @@ class Config:
     # deploy/friday-botapi.service), for files up to 2 GB. Env: TELEGRAM_API_ID, TELEGRAM_API_HASH
     telegram_api_id: str = ""
     telegram_api_hash: str = field(default="", repr=False)  # kept out of os.environ, like the keys above
-    # The secure form (site/login/, a Telegram Mini App) as an https URL; empty = requests are only
-    # asked for by reply. Env: FRIDAY_FORM_URL (default: this repo's GitHub Pages, see form_url_default)
-    form_url: str = ""
 
     @property
     def local_botapi(self) -> bool:
@@ -151,36 +148,6 @@ def _int_list(raw: str) -> tuple[int, ...]:
     return tuple(int(p) for p in raw.replace(" ", "").split(",") if p)
 
 
-def form_url_default() -> str:
-    """This repo's GitHub Pages address for the secure form (.github/workflows/pages.yml publishes
-    site/), from PROJECT_ROOT's git origin; '' if that isn't a GitHub repo."""
-    import re
-    import subprocess
-
-    try:
-        origin = subprocess.run(["git", "-C", str(PROJECT_ROOT), "remote", "get-url", "origin"],
-                                capture_output=True, text=True, timeout=5).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    # https, SSH, or an SSH host alias like github-friday:owner/name.git (as jobs.GITHUB_REMOTE)
-    m = re.search(r"github[^:/]*[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", origin, re.I)
-    if not m:
-        return ""
-    owner, repo = m.group(1).lower(), m.group(2)
-    if repo.lower() == f"{owner}.github.io":  # a user site is served at the root
-        return f"https://{owner}.github.io/login/"
-    return f"https://{owner}.github.io/{repo}/login/"
-
-
-def _form_url() -> str:
-    raw = os.environ.get("FRIDAY_FORM_URL")
-    url = form_url_default() if raw is None else raw.strip()
-    if url and not url.startswith("https://"):
-        logging.getLogger(__name__).warning("FRIDAY_FORM_URL must be an https URL; the secure form is off")
-        return ""
-    return url
-
-
 def load_config() -> Config:
     load_dotenv(env_file(), override=False)
     tz = os.environ.get("FRIDAY_TZ", "Asia/Seoul")
@@ -221,7 +188,6 @@ def load_config() -> Config:
         codex_server=os.environ.get("FRIDAY_CODEX_SERVER", "true").strip().lower() not in ("0", "false", "no", "off"),
         telegram_api_id=os.environ.get("TELEGRAM_API_ID", "").strip(),
         telegram_api_hash=os.environ.pop("TELEGRAM_API_HASH", "").strip(),
-        form_url=_form_url(),
     )
 
 
