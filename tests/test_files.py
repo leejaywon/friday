@@ -21,7 +21,7 @@ def friday(cfg, monkeypatch):
     async def nothing(*a, **k):
         pass
 
-    monkeypatch.setattr(botmod, "run_codex", run_codex)
+    monkeypatch.setattr(botmod, "run_turn", run_codex)
     f.say, f._keep_typing, f.outbox_loop = nothing, nothing, nothing
     yield f
     f.store.close()

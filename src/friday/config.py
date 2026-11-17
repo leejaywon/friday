@@ -33,6 +33,10 @@ class Config:
     github_readonly: bool
     meeting_lead_min: int
     morning_brief_at: str  # "HH:MM" in the user's timezone, or "" to turn it off
+    # The agent behind chat, browser runs and watch checks: codex (a ChatGPT plan) or claude (a
+    # Claude plan, through Claude Code). Env: CHAT_ENGINE, CLAUDE_MODEL (claude's default model)
+    chat_engine: str = "codex"
+    claude_model: str = ""
     # Coding jobs (/code): agents change projects under code_dir.
     code_dir: Path = Path.home() / "code"
     code_engine: str = "claude"  # claude | codex
@@ -65,6 +69,14 @@ class Config:
     # deploy/friday-botapi.service), for files up to 2 GB. Env: TELEGRAM_API_ID, TELEGRAM_API_HASH
     telegram_api_id: str = ""
     telegram_api_hash: str = field(default="", repr=False)  # kept out of os.environ, like the keys above
+
+    @property
+    def default_model(self) -> str:
+        return self.claude_model if self.chat_engine == "claude" else self.codex_model
+
+    @property
+    def default_effort(self) -> str:
+        return "" if self.chat_engine == "claude" else self.codex_effort
 
     @property
     def local_botapi(self) -> bool:
@@ -112,6 +124,11 @@ class Config:
         return self.data_dir / "vault"
 
     @property
+    def claude_mcp_dir(self) -> Path:
+        """Per-run MCP configs for Claude (agent.run_claude): they hold Friday's MCP token."""
+        return self.data_dir / "claude-mcp"
+
+    @property
     def browser_profile(self) -> Path:
         """The shared browser's profile (cookies keep its logins); see deploy/friday-browser.service."""
         return self.data_dir / "browser"
@@ -151,6 +168,9 @@ def _int_list(raw: str) -> tuple[int, ...]:
 def load_config() -> Config:
     load_dotenv(env_file(), override=False)
     tz = (os.environ.get("FRIDAY_TZ") or "UTC").strip()
+    chat_engine = (os.environ.get("CHAT_ENGINE") or "codex").strip().lower()
+    if chat_engine not in ("codex", "claude"):
+        raise ValueError(f"CHAT_ENGINE must be codex or claude, not {chat_engine!r}")
     ZoneInfo(tz)  # fail fast on a typo
     data_dir = Path(os.environ.get("FRIDAY_DATA_DIR") or PROJECT_ROOT / "data").expanduser().resolve()
     transcribe_key = os.environ.pop("TRANSCRIBE_API_KEY", "").strip()
@@ -162,6 +182,8 @@ def load_config() -> Config:
         allowed_user_ids=_int_list(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
         data_dir=data_dir,
         default_tz=tz,
+        chat_engine=chat_engine,
+        claude_model=os.environ.get("CLAUDE_MODEL", "").strip(),
         codex_bin=os.environ.get("CODEX_BIN", "codex"),
         codex_model=os.environ.get("CODEX_MODEL", "").strip(),
         codex_effort=os.environ.get("CODEX_EFFORT", "").strip(),

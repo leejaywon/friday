@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from friday import timeutil as tu
-from friday.agent import codex_args, parse_events
+from friday.agent import claude_cmd, claude_mcp, codex_args, codex_env, codex_overrides, parse_claude_events, parse_events
 from friday.bot import split_message
 from friday.config import load_config
 from friday.db import Store
@@ -190,6 +190,29 @@ def test_codex_args_attach_optional_toolsets_only_when_on(cfg):
     ov = _overrides(codex_args(cfg, None, [], run_id=7, toolsets={"browser"}, chat=True))
     assert 'mcp_servers.friday.http_headers={"X-Friday-Run" = "7"}' in ov
     assert 'mcp_servers.friday.disabled_tools=["use_tools"]' in ov
+
+
+def test_claude_gets_the_same_tools_as_codex(cfg, tmp_path):
+    cfg = replace(cfg, github_token_set=True, browser_enabled=True, chat_engine="claude")
+    env = {**codex_env(cfg), "GITHUB_TOKEN": "gh-read"}
+    config, allowed, hidden = claude_mcp(codex_overrides(cfg, chat=True, toolsets={"github"}), env)
+    friday, github = config["mcpServers"]["friday"], config["mcpServers"]["github"]
+    assert friday["headers"]["X-Friday-Chat"] == "1" and friday["headers"]["Authorization"].startswith("Bearer ")
+    assert github["headers"] == {"Authorization": "Bearer gh-read", "X-MCP-Readonly": "true"}
+    assert set(allowed) == {"mcp__friday", "mcp__github"} and "mcp__friday__fill_login" in hidden
+
+    cmd = claude_cmd(cfg, tmp_path / "mcp.json", allowed, hidden, "session-1", "sonnet", "low")
+    assert cmd[cmd.index("--resume") + 1] == "session-1" and cmd[cmd.index("--effort") + 1] == "low"
+    settings = cmd[cmd.index("--settings") + 1]
+    assert str(cfg.vault_dir) in settings and str(cfg.claude_mcp_dir) in settings and "gh-read" not in " ".join(cmd)
+
+    r = parse_claude_events([
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"assistant","session_id":"s1","message":{"content":[{"type":"tool_use","name":"mcp__friday__add_task"}],'
+        '"usage":{"input_tokens":5,"cache_read_input_tokens":1000}}}',
+        '{"type":"result","session_id":"s1","result":" done ","is_error":false}',
+    ])
+    assert (r.thread_id, r.text, r.mcp_servers, r.input_tokens) == ("s1", "done", {"friday"}, 1005)
 
 
 def test_secrets_are_refused_but_normal_text_is_not():

@@ -38,7 +38,7 @@ from telegram.ext import (
 from . import botapi, browser, gcal, mcp_config
 from . import timeutil as tu
 from . import workspace as wsfiles
-from .agent import AgentResult, instructions, run_codex
+from .agent import AgentResult, engine_status, instructions, run_turn
 from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
@@ -193,7 +193,7 @@ class Friday(WatchBot):
         self.store = Store(cfg.db_path)
         self.agent_lock = asyncio.Lock()
         # Chat turns' Codex: one app-server process, started on the first message (codex_server.py)
-        self.codex = CodexServer(cfg) if cfg.codex_server else None
+        self.codex = CodexServer(cfg) if cfg.codex_server and cfg.chat_engine == "codex" else None
         self.app: Application | None = None
         self._tasks: list[asyncio.Task] = []
         self.runner = Runner(cfg, self.store)
@@ -343,6 +343,8 @@ class Friday(WatchBot):
         last = self.store.get("last_message_at")
         if last and tu.now_utc() - tu.from_iso(last) > IDLE_NEW_THREAD:
             self._reset_thread()
+        if (self.store.get("thread_engine") or "codex") != self.cfg.chat_engine:  # CHAT_ENGINE changed
+            self._continue_fresh()
         return self.store.get("thread_id")
 
     def _reset_thread(self) -> None:
@@ -412,12 +414,13 @@ class Friday(WatchBot):
                         result = await self._codex_turn(prompt, thread, (images or []) if step == 0 else [], toolsets,
                                                         note)
                     except Exception as e:  # e.g. codex binary missing
-                        log.exception("codex run failed")
+                        log.exception("agent run failed")
                         result = AgentResult("", thread, [repr(e)])
                     used |= result.mcp_servers
                     thread = result.thread_id or thread
                     if thread:
                         self.store.set("thread_id", thread)
+                        self.store.set("thread_engine", self.cfg.chat_engine)
                     self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
                     new = self._toolsets() - toolsets
                     if not new or not thread or step == MAX_CONTINUATIONS:
@@ -443,7 +446,7 @@ class Friday(WatchBot):
 
     async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str],
                           on_note=None) -> AgentResult:
-        """One chat turn: in the app-server, or with `codex exec` when it is off or failed."""
+        """One chat turn: in Codex's app-server, else `codex exec` (off or failed) or Claude."""
         kw = dict(model=self.store.get("model") or "", effort=self.store.get("effort") or "", toolsets=toolsets,
                   tz=self.tz)
         if self.codex:
@@ -453,7 +456,7 @@ class Friday(WatchBot):
                 log.warning("codex app-server failed, retrying with codex exec: %s", e)
                 if e.partial:
                     prompt = RETRY_NOTE + prompt
-        return await run_codex(self.cfg, prompt, thread, images, chat=True, **kw)
+        return await run_turn(self.cfg, prompt, thread, images, chat=True, **kw)
 
     @staticmethod
     def _worth_sending(text: str, made_request: bool, made_proposal: bool = False) -> bool:
@@ -774,13 +777,13 @@ class Friday(WatchBot):
         await update.message.reply_text(f"Timezone: {self.tz}. Now: {tu.local_str(tu.now_utc(), self.tz)}")
 
     def _model_summary(self) -> str:
-        return models_summary(self.store, self.cfg.codex_model, self.cfg.codex_effort)
+        return models_summary(self.store, self.cfg.default_model, self.cfg.default_effort)
 
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        models = available_models()
+        models = available_models(engine=self.cfg.chat_engine)
         args = [a.strip() for a in (ctx.args or []) if a.strip()][:2]
         try:
-            note = switch_model(self.store, self.cfg.codex_model, args, models) if args else ""
+            note = switch_model(self.store, self.cfg.default_model, args, models) if args else ""
         except ValueError as e:
             await update.message.reply_text(str(e))
             return
@@ -799,15 +802,9 @@ class Friday(WatchBot):
                 await update.message.reply_document(fh, filename=copy.name, caption="Friday database backup")
 
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        proc = await asyncio.create_subprocess_exec(
-            self.cfg.codex_bin, "login", "status",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        codex = (out.decode(errors="replace").strip().splitlines() or ["?"])[-1]
         extra = mcp_config.load(self.cfg.mcp_config)
         lines = [
-            f"Codex: {codex}",
+            (await engine_status(self.cfg))[1],
             self._model_summary(),
             f"Web search: {self.cfg.web_search}",
             "GitHub: " + (
@@ -1378,13 +1375,13 @@ class Friday(WatchBot):
         return 10
 
     async def _browser_run(self, run) -> None:
-        """A fresh Codex thread does the run (its run id lets fill_login use its approved logins);
+        """A fresh agent thread does the run (its run id lets fill_login use its approved logins);
         the result and a last screenshot go to the user. Never raises except on shutdown."""
         rid = run["id"]
         await self._quiet(self.say(f"🌐 Browser run #{rid} started ({run['mode']}): {short(run['prompt'], 200)}"))
         prompt = instructions(self.cfg) + "\n---\n" + browser.run_prompt(run, tu.local_str(tu.now_utc(), self.tz))
         try:
-            result = await run_codex(
+            result = await run_turn(
                 replace(self.cfg, codex_timeout_seconds=browser.RUN_TIMEOUT_SECONDS), prompt,
                 model=self.store.get("model") or "", effort=self.store.get("effort") or "", run_id=rid,
                 toolsets={"browser"}, tz=self.tz,
@@ -1751,7 +1748,6 @@ class Friday(WatchBot):
             await self.say(text)
             self.store.advance_reminder(r, now)
 
-        zone = ZoneInfo(self.tz)
         for t in self.store.tasks_needing_nudge(now):
             due = f"\nDue {self._short_time(t.due_at)}" if t.due_at else ""
             await self._send_task_alert(f"📝 {t.title}{due}", t)

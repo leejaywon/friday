@@ -63,7 +63,7 @@ def test_crash_restarts_and_the_bot_falls_back_to_exec(server, cfg, monkeypatch)
         execs.append((prompt, thread))
         return AgentResult("from exec", thread, [])
 
-    monkeypatch.setattr(botmod, "run_codex", run_codex)
+    monkeypatch.setattr(botmod, "run_turn", run_codex)
 
     async def go():
         first = await server.run("hello", None)

@@ -256,6 +256,19 @@ env_file() {
     fi
   fi
 
+  if is_set CHAT_ENGINE; then
+    ok "CHAT_ENGINE is $(get_env CHAT_ENGINE)"
+  else
+    info "Which AI plan should Friday use? codex = a ChatGPT plan, claude = a Claude plan."
+    while :; do
+      ask value "codex or claude" codex
+      [[ "$value" == codex || "$value" == claude ]] && break
+    done
+    set_env CHAT_ENGINE "$value"
+    set_env CODE_ENGINE "$value"  # coding jobs on the same plan; change CODE_ENGINE to mix them
+    ok "Friday uses $value"
+  fi
+
   if [[ $created == 0 ]] && ! confirm "Review the timezone and optional keys?" N; then
     return
   fi
@@ -369,8 +382,16 @@ done
 EOF
 }
 
+# Which agents Friday runs: CHAT_ENGINE (codex when unset) and CODE_ENGINE (claude when unset).
+uses() { [[ "$(get_env CHAT_ENGINE)" == "$1" || ( "$1" == codex && -z "$(get_env CHAT_ENGINE)" ) ||
+            "$(get_env CODE_ENGINE)" == "$1" || ( "$1" == claude && -z "$(get_env CODE_ENGINE)" ) ]]; }
+
 codex_login() {
   step "Sign in to Codex on the server (your ChatGPT plan)"
+  if ! uses codex; then
+    ok "not needed (CHAT_ENGINE and CODE_ENGINE aren't codex)"
+    return
+  fi
   if on_server 'codex login status' >/dev/null 2>&1; then
     ok "signed in"
     return
@@ -379,12 +400,16 @@ codex_login() {
   if confirm "Sign in now?"; then
     ssh -t "$HOST" 'codex login --device-auth'
   else
-    warn "skipped; Friday can't answer until Codex is signed in."
+    warn "skipped; Friday can't use Codex until it is signed in."
   fi
 }
 
 claude_login() {
-  step "Sign in to Claude Code on the server (coding jobs)"
+  step "Sign in to Claude Code on the server (your Claude plan)"
+  if ! uses claude; then
+    ok "not needed (CHAT_ENGINE and CODE_ENGINE aren't claude)"
+    return
+  fi
   if on_server 'test -s ~/.claude/.credentials.json' 2>/dev/null; then
     ok "signed in"
     return
@@ -393,7 +418,7 @@ claude_login() {
   if confirm "Open it now?"; then
     ssh -t "$HOST" 'cd ~/code && ~/.local/bin/claude' || true
   else
-    warn "skipped; coding jobs with Claude need it (CODE_ENGINE=codex works without)."
+    warn "skipped; Friday can't use Claude until it is signed in."
   fi
 }
 

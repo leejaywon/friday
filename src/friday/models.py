@@ -1,4 +1,4 @@
-"""The Codex models this account can use, read from Codex's own model cache."""
+"""The models Friday can answer with: Codex's, read from its own model cache, or Claude's."""
 
 from __future__ import annotations
 
@@ -20,8 +20,16 @@ def _cache_path() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "models_cache.json"
 
 
-def available_models(path: Path | None = None) -> list[Model]:
-    """Models Codex lists for this account; empty if Codex hasn't fetched the list yet."""
+# Claude Code's model aliases and effort levels (CHAT_ENGINE=claude).
+CLAUDE_MODELS = [Model(slug, slug.title(), "", ("low", "medium", "high", "xhigh", "max"))
+                 for slug in ("opus", "sonnet", "haiku")]
+
+
+def available_models(path: Path | None = None, engine: str = "codex") -> list[Model]:
+    """Models Codex lists for this account (empty if Codex hasn't fetched the list yet), or
+    Claude's."""
+    if engine == "claude":
+        return CLAUDE_MODELS
     try:
         data = json.loads((path or _cache_path()).read_text())
     except (OSError, ValueError):
@@ -51,7 +59,7 @@ def all_efforts(models: list[Model]) -> set[str]:
 
 
 def summary(store, default_model: str, default_effort: str) -> str:
-    model = store.get("model") or default_model or "Codex default"
+    model = store.get("model") or default_model or "default"
     effort = store.get("effort") or default_effort or "model default"
     return f"Model: {model}, effort: {effort}"
 
@@ -59,11 +67,12 @@ def summary(store, default_model: str, default_effort: str) -> str:
 def model_list(models: list[Model]) -> str:
     if not models:
         return "Usage: /model <name> [effort], /model <effort>, /model default"
-    lines = ["Available models (efforts, default*):"]
+    lines = ["Available models" + (" (efforts, default*):" if any(m.efforts for m in models) else ":")]
     for m in models:
         levels = ", ".join(e + ("*" if e == m.default_effort else "") for e in m.efforts)
-        lines.append(f"• {m.slug} ({levels})")
-    lines.append("\nUsage: /model gpt-6-sol high, /model low, /model default")
+        lines.append(f"• {m.slug}" + (f" ({levels})" if levels else ""))
+    example = models[0].slug + (" " + models[0].efforts[-1] if models[0].efforts else "")
+    lines.append(f"\nUsage: /model {example}, /model default")
     return "\n".join(lines)
 
 
@@ -83,6 +92,8 @@ def switch(store, default_model: str, args: list[str], models: list[Model]) -> s
         if models and not m:
             raise ValueError(f"Unknown model '{model_arg}'.\n\n{model_list(models)}")
     current = find(models, (m.slug if model_arg and m else model_arg) or store.get("model") or default_model)
+    if effort_arg and current and not current.efforts:
+        raise ValueError(f"{current.slug} has no effort setting.")
     if effort_arg and current and effort_arg not in current.efforts:
         raise ValueError(f"{current.slug} supports: {', '.join(current.efforts)}")
     if model_arg:

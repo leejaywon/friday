@@ -24,7 +24,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
 from . import timeutil as tu
-from .agent import instructions, run_codex
+from .agent import instructions, run_turn
 from .jobs import short
 
 log = logging.getLogger(__name__)
@@ -219,12 +219,12 @@ class WatchBot:
         return 15
 
     async def _watch_check(self, w) -> None:
-        """One check in a fresh Codex thread. Never raises except on shutdown."""
+        """One check in a fresh agent thread. Never raises except on shutdown."""
         wid = w["id"]
         prompt = instructions(self.cfg) + "\n---\n" + check_prompt(w, tu.local_str(tu.now_utc(), self.tz))
         toolsets = {t for t in w["toolsets"].split(",") if t in TOOLSETS}
         try:
-            result = await run_codex(
+            result = await run_turn(
                 replace(self.cfg, codex_timeout_seconds=CHECK_TIMEOUT_SECONDS), prompt,
                 # Routine checks are simple and frequent: low effort spares the subscription quota.
                 model=self.store.get("model") or "", effort=os.environ.get("FRIDAY_WATCH_EFFORT", "low"),

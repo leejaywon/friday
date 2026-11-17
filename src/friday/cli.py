@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import shutil
-import subprocess
 from pathlib import Path
 
 
@@ -79,9 +77,9 @@ def main() -> None:
 
         run_bot(cfg)
     elif args.cmd == "ask":
-        from .agent import instructions, run_codex
+        from .agent import instructions, run_turn
 
-        result = asyncio.run(run_codex(cfg, instructions(cfg) + "\n---\n" + args.message))
+        result = asyncio.run(run_turn(cfg, instructions(cfg) + "\n---\n" + args.message))
         print(result.text or f"ERROR: {result.errors}")
     elif args.cmd == "google-auth":
         from . import gcal
@@ -135,12 +133,9 @@ def doctor(cfg) -> None:
     print(f"data dir: {cfg.data_dir}")
     line(bool(cfg.telegram_token), "TELEGRAM_BOT_TOKEN set")
     line(bool(cfg.allowed_user_ids), f"TELEGRAM_ALLOWED_USER_IDS = {list(cfg.allowed_user_ids)}")
-    codex = shutil.which(cfg.codex_bin)
-    line(bool(codex), f"codex found: {codex}")
-    if codex:
-        out = subprocess.run([codex, "login", "status"], capture_output=True, text=True)
-        status = (out.stdout + out.stderr).strip().splitlines()
-        line(out.returncode == 0, f"codex login: {status[-1] if status else '?'}")
+    from .agent import engine_status
+
+    line(*asyncio.run(engine_status(cfg)))
     line(gcal.is_connected(cfg.google_token), f"Google Calendar token: {cfg.google_token}")
     print(f"  --   timezone {cfg.default_tz}, meeting heads-up {cfg.meeting_lead_min} min, "
           f"morning brief {cfg.morning_brief_at or 'off'}")

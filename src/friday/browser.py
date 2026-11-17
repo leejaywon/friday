@@ -57,7 +57,7 @@ def private_paths(cfg: Config) -> list[Path]:
     """Hidden from the chat agent's shell and the Playwright MCP server: the vault, the browser
     profile (session cookies), and Friday's other secrets."""
     home = Path.home()
-    return [cfg.vault_dir, cfg.browser_profile, env_file(), cfg.google_token, cfg.botapi_dir,
+    return [cfg.vault_dir, cfg.browser_profile, env_file(), cfg.google_token, cfg.botapi_dir, cfg.claude_mcp_dir,
             mcp_token_path(cfg), home / ".ssh", home / ".codex", home / ".claude", home / ".claude.json"]
 
 

@@ -954,22 +954,22 @@ def send_file(path: str, caption: str = "") -> str:
 
 @server.tool()
 def set_model(model: str = "", effort: str = "") -> str:
-    """Show or change the Codex model and reasoning effort Friday answers with (same as /model).
+    """Show or change the model (and, for Codex, the reasoning effort) Friday answers with (same as /model).
 
     With no arguments: the current choice and the available models with their efforts. When the
     user asks to switch ("a smaller model than sol", "medium effort"), call it once with no
     arguments to see the list, pick the model they mean, then call it with model and/or effort.
     model='default' resets both. The change applies from the user's next message.
     """
-    models = available_models()
+    models = available_models(engine=cfg.chat_engine)
     args = [a.strip() for a in (model, effort) if a.strip()]
     if not args:
-        return models_summary(store, cfg.codex_model, cfg.codex_effort) + "\n\n" + model_list(models)
+        return models_summary(store, cfg.default_model, cfg.default_effort) + "\n\n" + model_list(models)
     try:
-        note = switch_model(store, cfg.codex_model, args, models)
+        note = switch_model(store, cfg.default_model, args, models)
     except ValueError as e:
         return str(e)
-    return models_summary(store, cfg.codex_model, cfg.codex_effort) + note + "\n(Applies from the next message.)"
+    return models_summary(store, cfg.default_model, cfg.default_effort) + note + "\n(Applies from the next message.)"
 
 
 def run() -> None:
