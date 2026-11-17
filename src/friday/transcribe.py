@@ -66,7 +66,7 @@ async def transcribe(
                     data=data,
                     files={"file": (path.name, f, mime)},
                 )
-    except httpx.HTTPError as e:
+    except Exception as e:  # httpx errors, and h11's (not httpx's) when the upload goes wrong
         raise TranscriptionError(f"{type(e).__name__}: {e}"[:300]) from e
     if resp.status_code != 200:
         raise TranscriptionError(f"{provider} returned HTTP {resp.status_code}: {resp.text[:300]}")

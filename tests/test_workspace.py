@@ -1,6 +1,7 @@
 """Workspace paths can't escape the workspace."""
 
 from friday import workspace
+from friday.bot import unique_path
 
 
 def test_workspace_paths_refuse_escapes_including_symlinks(cfg, tmp_path):
@@ -19,3 +20,8 @@ def test_workspace_paths_refuse_escapes_including_symlinks(cfg, tmp_path):
     assert workspace.entries(ws, "files/out") is None
     assert [e.rel for e in workspace.entries(ws, "files")] == ["files/inbox"]  # links outside not listed
     assert [e.rel for e in workspace.recent(ws)] == ["files/inbox/a.txt"]
+
+
+def test_files_arriving_together_get_their_own_names(tmp_path):
+    names = [unique_path(tmp_path, "120000_voice.ogg").name for _ in range(3)]
+    assert names == ["120000_voice.ogg", "120000_voice-2.ogg", "120000_voice-3.ogg"]

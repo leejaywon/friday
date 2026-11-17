@@ -195,6 +195,20 @@ def safe_name(name: str) -> str:
     return name[:120]
 
 
+def unique_path(folder: Path, name: str) -> Path:
+    """folder/name, or name-2, name-3... when taken, created empty so that files arriving in the
+    same second (an album, several voice messages) never share one."""
+    stem, suffix = Path(name).stem, Path(name).suffix
+    for n in range(1, 1000):
+        path = folder / (name if n == 1 else f"{stem}-{n}{suffix}")
+        try:
+            path.touch(exist_ok=False)
+            return path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"no free name for {name} in {folder}")
+
+
 class Friday(WatchBot):
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -648,7 +662,7 @@ class Friday(WatchBot):
 
         day_dir = self.cfg.files_dir / "inbox" / datetime.now(ZoneInfo(self.tz)).strftime("%Y-%m-%d")
         day_dir.mkdir(parents=True, exist_ok=True)
-        dest = day_dir / name
+        dest = unique_path(day_dir, name)
         self._downloads += 1
         try:
             await self._download(media, dest)
