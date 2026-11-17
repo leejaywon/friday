@@ -609,7 +609,7 @@ def propose_items(items_json: str, note: str = "") -> str:
         {"kind": "event", "title": "...", "start": "2026-11-21T14:00", "end": optional (default +1h),
          "location": optional}
       Any item may add "notes" and, for something the user must hand in online (a report on
-      a website, a form), "submission": {"site": "portal.example.com", "what": "report PDF"};
+      a website, a form), "submission": {"site": "example.com", "what": "report PDF"};
       Friday then asks how to handle the submission.
       Times are ISO 8601 in the user's local time. Leave out items whose time has passed.
     note: optional short context shown under the list, e.g. where the items came from.
@@ -804,7 +804,7 @@ async def request_form(title: str, fields: str, description: str = "", domain: s
             raise ValueError("save_as is required when a field is sensitive: letters, digits, '.', '_' or '-'")
         domain = domain.strip().lower().rstrip(".")
         if domain and not DOMAIN.match(domain):
-            raise ValueError("domain: a site like portal.example.com (no https://, no path), or empty")
+            raise ValueError("domain: a site like example.com (no https://, no path), or empty")
         spec = make_spec(title, parsed, description, domain, save_as, submit_label)
     except ValueError as e:
         return f"Not requested: {e}"
@@ -824,8 +824,8 @@ async def request_login(name: str, domain: str, reason: str = "", fields: str = 
     the vault, so you never see it. Waits up to 5 minutes. Returns 'Saved login <name> for <domain>' (then call fill_login
     with that name: it won't ask again on that site), 'Cancelled' or 'Timed out'.
 
-    name: short name for the login, e.g. 'portal' (letters, digits, '.', '_', '-').
-    domain: the site it is for, e.g. 'portal.example.com' (no https://, no path; subdomains included).
+    name: short name for the login, e.g. 'mysite' (letters, digits, '.', '_', '-').
+    domain: the site it is for, e.g. 'example.com' (no https://, no path; subdomains included).
     reason: optional few words in the user's language, e.g. 'submit the report'.
     fields: optional JSON list of extra fields the site needs besides username and password
         (always asked), e.g. '[{"name": "member_id", "label": "Member ID", "type": "text"}]', same
@@ -854,7 +854,7 @@ async def request_code(reason: str, label: str = "Code", ctx: Context | None = N
     They type it into a form (or reply with it); the code is returned to you and not stored anywhere. Waits up to
     5 minutes. Returns 'Code: <code>', 'Cancelled' or 'Timed out'.
 
-    reason: a few words in the user's language, e.g. 'SMS code for portal.example.com'.
+    reason: a few words in the user's language, e.g. 'SMS code for example.com'.
     label: the field's label, e.g. 'Code' or 'OTP'.
     """
     status, values = await _run_form(code_spec(reason, label), "code", ctx=ctx, tool="request_code")
@@ -892,7 +892,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
 @server.tool()
 async def schedule_browser_run(when: str, instructions: str, mode: str, logins: str = "") -> str:
     """Schedule browser work for later, only when the user's own message asks for it (e.g.
-    "tomorrow at 9, submit the report on the portal"). The user approves the plan on Telegram first; that
+    "tomorrow at 9, submit the report on the website"). The user approves the plan on Telegram first; that
     also approves the listed logins for that run. At the time, a fresh agent does the work and
     Friday reports the result.
 
@@ -942,7 +942,7 @@ async def add_watch(title: str, check: str, every: str, until: str = "", toolset
     checks. Then a fresh agent checks it every interval, observing only, and Friday messages the
     user when it is triggered with something new.
 
-    title: a few words the user will recognize, e.g. 'new notices on the portal'.
+    title: a few words the user will recognize, e.g. 'new notices on the website'.
     check: the complete instruction for that unattended agent, which can't see this chat: where to
         look (URL, repo, route and date), what counts as the condition being met, and for "new"
         things, what to compare (e.g. the newest notice's title and date). Same language as the user.

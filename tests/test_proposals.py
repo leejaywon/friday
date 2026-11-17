@@ -7,7 +7,7 @@ from friday import bot as botmod
 
 ITEMS = [
     {"kind": "task", "title": "분기 보고서", "due": "2099-11-20T23:59",
-     "submission": {"site": "portal.example.com", "what": "PDF 보고서"}},
+     "submission": {"site": "example.com", "what": "PDF 보고서"}},
     {"kind": "reminder", "title": "발표 준비", "when": "2099-11-19T09:00"},
     {"kind": "event", "title": "팀 회의", "start": "2099-11-21T14:00"},
 ]
@@ -43,7 +43,7 @@ def test_accept_adds_items_exactly_once(cfg, tools):
     assert len(first) == 3 and second is None  # a double tap adds nothing
     titles = sorted(t.title for t in f.store.open_tasks())
     assert titles == ["분기 보고서", "팀 회의"]  # no calendar connected: the event became a task
-    assert "portal.example.com" in next(t.notes for t in f.store.open_tasks() if t.title == "분기 보고서")
+    assert "example.com" in next(t.notes for t in f.store.open_tasks() if t.title == "분기 보고서")
     assert [r.text for r in f.store.active_reminders()] == ["발표 준비"]
     assert f.store.proposal(pid)["status"] == "accepted"
     f.store.close()

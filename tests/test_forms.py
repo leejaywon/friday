@@ -35,18 +35,18 @@ async def _reply(f, rid, *lines):
 def test_login_reply_goes_to_the_vault_only(cfg, caplog):
     f, sent, edited = _bot(replace(cfg, allowed_user_ids=(1,)))
     extra = parse_fields('[{"name": "member_id", "label": "Member ID"}]', sensitive_default=True)
-    rid = f.store.add_login_request("portal", "portal.example.com", "monthly report", spec=login_spec(
-        "portal", "portal.example.com", "monthly report", extra))
+    rid = f.store.add_login_request("mysite", "example.com", "monthly report", spec=login_spec(
+        "mysite", "example.com", "monthly report", extra))
     asyncio.run(f._send_login_request(rid))
-    assert "Member ID" in sent[-1] and "portal.example.com" in sent[-1]
+    assert "Member ID" in sent[-1] and "example.com" in sent[-1]
 
     asyncio.run(_reply(f, rid, "alex", "pw secret 1"))  # a line short: nothing saved
-    assert Vault(cfg.vault_dir).get("portal") is None and f.store.login_request(rid)["status"] == "pending"
+    assert Vault(cfg.vault_dir).get("mysite") is None and f.store.login_request(rid)["status"] == "pending"
 
     asyncio.run(_reply(f, rid, " alex ", "pw secret 1", "2024123"))
-    login = Vault(cfg.vault_dir).get("portal")
+    login = Vault(cfg.vault_dir).get("mysite")
     assert (login.username, login.password, login.extra, login.trusted) == (
-        "alex", "pw secret 1", {"member_id": "2024123"}, ("portal.example.com",))
+        "alex", "pw secret 1", {"member_id": "2024123"}, ("example.com",))
     assert f.store.login_request(rid)["status"] == "saved"
     assert f.store.take_result(rid) == {}  # nothing for the agent
     assert "pw secret" not in caplog.text and "2024123" not in caplog.text
@@ -55,7 +55,7 @@ def test_login_reply_goes_to_the_vault_only(cfg, caplog):
 
 def test_mini_app_answer_is_decrypted_and_routed_like_a_reply(cfg, caplog):
     f, sent, edited = _bot(replace(cfg, allowed_user_ids=(1,)))
-    rid = f.store.add_login_request("portal", "portal.example.com", "", spec=login_spec("portal", "portal.example.com"))
+    rid = f.store.add_login_request("mysite", "example.com", "", spec=login_spec("mysite", "example.com"))
     asyncio.run(f._send_login_request(rid))
     assert f.store.login_request(rid)["form_message_id"]  # sent with the 📝 Open form keyboard
 
@@ -68,10 +68,10 @@ def test_mini_app_answer_is_decrypted_and_routed_like_a_reply(cfg, caplog):
 
     values = {"username": "alex", "password": "pw secret 1"}
     answer({"rid": rid + 1, "values": values})  # not a pending request: nothing saved
-    assert Vault(cfg.vault_dir).get("portal") is None
+    assert Vault(cfg.vault_dir).get("mysite") is None
     answer({"rid": rid, "values": values})
-    assert Vault(cfg.vault_dir).get("portal").password == "pw secret 1"
-    assert f.store.login_request(rid)["status"] == "saved" and sent[-1] == "✅ Saved portal"
+    assert Vault(cfg.vault_dir).get("mysite").password == "pw secret 1"
+    assert f.store.login_request(rid)["status"] == "saved" and sent[-1] == "✅ Saved mysite"
     assert (cfg.vault_dir / "form_key.pem").stat().st_mode & 0o777 == 0o600 and "pw secret" not in caplog.text
     f.store.close()
 

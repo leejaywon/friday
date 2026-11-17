@@ -1330,7 +1330,7 @@ class Friday(WatchBot):
         args = ctx.args or []
         try:
             if len(args) != 2:
-                raise ValueError("Usage: /login <name> <domain>, e.g. /login portal portal.example.com")
+                raise ValueError("Usage: /login <name> <domain>, e.g. /login mysite example.com")
             domain = check(args[0], [args[1]])[0]
         except ValueError as e:
             await update.message.reply_text(f"Not requested: {e}")

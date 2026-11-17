@@ -122,7 +122,7 @@ domains and only over https. The first use on each site asks you on Telegram (�
 login fits, Friday sends a 🔑 request (see **Forms** below). One-time codes (SMS, OTP) are asked
 for the same way and aren't stored. Before
 anything irreversible (submit, send, pay, delete) Friday sends a screenshot and waits for ✅.
-"Tomorrow at 9, submit the report on the portal" schedules a browser run: you approve the
+"Tomorrow at 9, submit the report on the website" schedules a browser run: you approve the
 plan and the logins it may use. The browser can't open `file://` pages, and its control port
 listens on the server's localhost only. `FRIDAY_BROWSER=false` turns it off.
 

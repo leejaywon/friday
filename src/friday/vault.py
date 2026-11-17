@@ -40,7 +40,7 @@ class Login:
 
 def domain_allowed(host: str, domains: tuple[str, ...] | list[str]) -> bool:
     """The host is one of the domains or a subdomain of one (never a look-alike such as
-    evil-portal.example.com or portal.example.com.evil.com)."""
+    evil-example.com or example.com.evil.com)."""
     host = (host or "").lower().rstrip(".")
     return any(host == d or host.endswith("." + d) for d in domains)
 
@@ -51,7 +51,7 @@ def check(name: str, domains: list[str]) -> list[str]:
     if not NAME.match(name):
         raise ValueError("name: use letters, digits, '.', '_' or '-' (max 40)")
     if not domains or not all(DOMAIN.match(d) for d in domains):
-        raise ValueError("give at least one domain like portal.example.com (no https://, no path)")
+        raise ValueError("give at least one domain like example.com (no https://, no path)")
     return domains
 
 
