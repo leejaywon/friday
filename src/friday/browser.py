@@ -68,7 +68,9 @@ def playwright_mcp_command(cfg: Config, port: int | None = None) -> list[str]:
     are hidden. With port it serves HTTP on 127.0.0.1 (deploy/friday-playwright-mcp.service);
     without, stdio."""
     run = ["node", str(PLAYWRIGHT_MCP_CLI)] if PLAYWRIGHT_MCP_CLI.exists() else ["npx", "-y", PLAYWRIGHT_MCP]
-    cmd = [*run, "--cdp-endpoint", CDP_URL, "--output-dir", str(cfg.files_dir / "browser")]
+    # vision: mouse clicks at x,y for what snapshots don't show as a control (a video player's
+    # button, a canvas, a frame); screenshots never show what fill_login typed, unlike page JavaScript.
+    cmd = [*run, "--cdp-endpoint", CDP_URL, "--output-dir", str(cfg.files_dir / "browser"), "--caps", "vision"]
     if port:
         cmd += ["--host", "127.0.0.1", "--port", str(port)]
     bwrap = shutil.which("bwrap")
