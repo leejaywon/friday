@@ -10,7 +10,6 @@ import json
 import logging
 import mimetypes
 import re
-import shutil
 import sqlite3
 import tempfile
 import time as clock
@@ -35,7 +34,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import botapi, browser, gcal, mcp_config
+from . import browser, gcal, mcp_config
 from . import timeutil as tu
 from . import workspace as wsfiles
 from .agent import AgentResult, engine_status, instructions, run_turn
@@ -55,6 +54,10 @@ from .watches import WatchBot
 log = logging.getLogger(__name__)
 
 TELEGRAM_LIMIT = 4000
+# Telegram's Bot API: bots download files up to 20 MB and send up to 50 MB.
+DOWNLOAD_LIMIT = 20 * 1024 * 1024
+UPLOAD_LIMIT = 50 * 1024 * 1024
+UPLOAD_TIMEOUT = 300.0
 FILES_PAGE = 8  # entries per /files page
 IDLE_NEW_THREAD = timedelta(hours=6)  # start a fresh Codex thread after this much silence
 # Also start one (carrying the last exchange) once the context is this big (AgentResult.input_tokens).
@@ -215,7 +218,7 @@ class Friday(WatchBot):
 
     def build(self) -> Application:
         app = (
-            botapi.builder(self.cfg)  # the local Bot API server when TELEGRAM_API_ID is set
+            Application.builder()
             .token(self.cfg.telegram_token)
             .concurrent_updates(True)
             .post_init(self._on_start)
@@ -620,9 +623,8 @@ class Friday(WatchBot):
             ext = mimetypes.guess_extension(mime) if mime.startswith("image/") else None
             if ext in IMAGE_SUFFIXES and Path(name).suffix.lower() not in IMAGE_SUFFIXES:
                 name += ext  # an image sent as a file without its extension: still show it as an image
-        if media.file_size and media.file_size > botapi.download_limit(self.cfg):
-            await msg.reply_text("Telegram bots can only receive files up to 20 MB. Copy bigger ones with scp."
-                                 if not self.cfg.local_botapi else "Telegram bots can't receive files over 2 GB.")
+        if media.file_size and media.file_size > DOWNLOAD_LIMIT:
+            await msg.reply_text("Telegram bots can only receive files up to 20 MB. Copy bigger ones with scp.")
             return
 
         day_dir = self.cfg.files_dir / "inbox" / datetime.now(ZoneInfo(self.tz)).strftime("%Y-%m-%d")
@@ -1596,30 +1598,17 @@ class Friday(WatchBot):
     # --- files (getting files in and out; /files browses the workspace) ------
 
     async def _download(self, media, dest: Path) -> None:
-        """Save an incoming file at dest. The local Bot API server has fetched it into its own folder
-        by the time getFile answers: move it from there (same disk, so instant), don't copy 2 GB."""
-        if not self.cfg.local_botapi:
-            await (await media.get_file()).download_to_drive(dest)
-            return
-        f = await media.get_file(read_timeout=botapi.TRANSFER_TIMEOUT)
-        src = Path(f.file_path or "")
-        if src.is_absolute() and src.is_file() and src.resolve().is_relative_to(self.cfg.botapi_dir.resolve()):
-            await asyncio.to_thread(shutil.move, src, dest)
-        else:
-            await f.download_to_drive(dest)
+        await (await media.get_file()).download_to_drive(dest)
 
     async def _send_path(self, path: Path, caption: str | None = None, chat_id: int | None = None) -> str | None:
         """Send a file as a document. Returns why not when it's too big for Telegram."""
-        size, limit = path.stat().st_size, botapi.upload_limit(self.cfg)
-        if size > limit:
-            how = "" if self.cfg.local_botapi else " Copy it with scp, or set up the local Bot API server (README)."
-            return f"{path.name} is {wsfiles.human_size(size)}; Telegram lets me send up to {wsfiles.human_size(limit)}.{how}"
-        timeouts = {"read_timeout": botapi.TRANSFER_TIMEOUT, "write_timeout": botapi.TRANSFER_TIMEOUT}
-        if self.cfg.local_botapi:  # a Path becomes a file:// URI: the local server reads the file itself
-            await self.app.bot.send_document(chat_id or self.owner, path, filename=path.name, caption=caption, **timeouts)  # type: ignore[union-attr]
-        else:
-            with path.open("rb") as fh:
-                await self.app.bot.send_document(chat_id or self.owner, fh, filename=path.name, caption=caption, **timeouts)  # type: ignore[union-attr]
+        size = path.stat().st_size
+        if size > UPLOAD_LIMIT:
+            return (f"{path.name} is {wsfiles.human_size(size)}; Telegram lets me send up to "
+                    f"{wsfiles.human_size(UPLOAD_LIMIT)}. Copy it with scp.")
+        with path.open("rb") as fh:
+            await self.app.bot.send_document(chat_id or self.owner, fh, filename=path.name, caption=caption,  # type: ignore[union-attr]
+                                             read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
         return None
 
     def _fs_id(self, rel: str) -> int:

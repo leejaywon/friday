@@ -32,20 +32,20 @@ main() {
   npm install -s --no-fund --no-audit --prefix ~/.local/share/friday/playwright-mcp \
     "$(grep -o '@playwright/mcp@[0-9.]*' src/friday/browser.py)"
   mkdir -p ~/.config/systemd/user
-  cp deploy/friday.service deploy/friday-browser.service deploy/friday-botapi.service \
+  cp deploy/friday.service deploy/friday-browser.service \
     deploy/friday-mcp.service deploy/friday-playwright-mcp.service ~/.config/systemd/user/
   systemctl --user daemon-reload
   systemctl --user enable -q friday.service
   # Started if it isn't running, not restarted: that would interrupt a browser run in progress.
   systemctl --user enable -q --now friday-browser.service
-  # The local Bot API server (files up to 2 GB), only when TELEGRAM_API_ID is set in .env. Restarted
-  # along with Friday (a transfer in progress is lost either way), which starts once it listens.
-  if .venv/bin/python -c 'from friday.config import load_config as c; raise SystemExit(not c().local_botapi)'; then
-    systemctl --user enable -q friday-botapi.service
-    systemctl --user restart friday-botapi.service
-    for _ in $(seq 30); do (exec 3<>/dev/tcp/127.0.0.1/8081) 2>/dev/null && break; sleep 0.5; done
-  else
+  # The local Bot API server was removed. Where an older version set it up, log the bot out of it
+  # (so Telegram's cloud API takes the bot back) and stop it.
+  if [[ -f ~/.config/systemd/user/friday-botapi.service ]]; then
+    .venv/bin/python -c 'import httpx; from friday.config import load_config as c
+httpx.post(f"http://127.0.0.1:8081/bot{c().telegram_token}/logOut", timeout=30)' 2>/dev/null \
+      && echo "logged the bot out of the local Bot API server" || true
     systemctl --user disable -q --now friday-botapi.service 2>/dev/null || true
+    rm -f ~/.config/systemd/user/friday-botapi.service
   fi
   # Friday's MCP tools and the Playwright MCP server as local services, so a chat turn doesn't
   # start them (src/friday/mcp_http.py). Restarted for new code; a browser run in progress is

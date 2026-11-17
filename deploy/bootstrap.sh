@@ -80,29 +80,6 @@ EOF
 # paths that don't exist yet.
 sudo -u "$APP_USER" -H mkdir -p /home/$APP_USER/.cache/uv /home/$APP_USER/.local/share/uv /home/$APP_USER/.npm
 
-echo "== telegram-bot-api: local Bot API server, for files up to 2 GB (deploy/friday-botapi.service)"
-# Built from source at a pinned commit (the project has no release tags); skipped when that commit
-# is already installed. Only used once TELEGRAM_API_ID is set in .env (README: "Files up to 2 GB").
-BOTAPI_COMMIT=7232881b39dfcd048a0d569f1983c5184249ee05   # "Update version to 10.4." (2026-11-09)
-BOTAPI_STAMP=/usr/local/share/telegram-bot-api/commit
-if [[ -x /usr/local/bin/telegram-bot-api && "$(cat "$BOTAPI_STAMP" 2>/dev/null)" == "$BOTAPI_COMMIT" ]]; then
-  echo "already built at $BOTAPI_COMMIT"
-else
-  apt-get install -yq make git zlib1g-dev libssl-dev gperf cmake g++
-  BOTAPI_SRC=$(mktemp -d)
-  git clone -q --recursive https://github.com/tdlib/telegram-bot-api.git "$BOTAPI_SRC"
-  git -C "$BOTAPI_SRC" checkout -q "$BOTAPI_COMMIT"
-  git -C "$BOTAPI_SRC" submodule update -q --init --recursive
-  cmake -S "$BOTAPI_SRC" -B "$BOTAPI_SRC/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
-  # TDLib's largest files take a few GB of RAM each to compile: two at a time, capped and niced so
-  # a running Friday isn't the one the OOM killer picks. Takes 20-40 minutes.
-  systemd-run --scope --quiet --nice=15 -p MemoryMax=5G -p MemorySwapMax=2G \
-    cmake --build "$BOTAPI_SRC/build" --target install -j 2
-  install -d "$(dirname "$BOTAPI_STAMP")"
-  echo "$BOTAPI_COMMIT" > "$BOTAPI_STAMP"
-  rm -rf "$BOTAPI_SRC"
-fi
-
 echo "== swap (2 GB)"
 if ! swapon --show | grep -q /swapfile; then
   fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile

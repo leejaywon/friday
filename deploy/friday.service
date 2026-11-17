@@ -1,6 +1,6 @@
 [Unit]
 Description=Friday Telegram agent
-After=network-online.target friday-botapi.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

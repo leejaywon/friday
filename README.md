@@ -10,7 +10,7 @@ A personal assistant that lives on your own server and talks to you over Telegra
 - **Memory**: Friday saves lasting facts about you and recalls them later.
 - **Files and photos**: send them to the bot; they land in `files/inbox/` for Friday to use. A
   photo of a syllabus or notice turns into a list of deadlines and events you add with one tap.
-  `/files` lists them to get back or delete. Up to 20 MB, or 2 GB with the local Bot API server.
+  `/files` lists them to get back or delete. Telegram's limits apply: 20 MB in, 50 MB out.
 - **Voice messages**: Friday transcribes them (Groq Whisper or OpenAI) and answers what you said.
 - **Browser**: a shared headless Chromium on the server that Friday drives for you, with an
   encrypted login vault. It asks you on Telegram before the first login on each site and before
@@ -36,9 +36,7 @@ Telegram ──► friday bot (systemd) ──► Codex or Claude Code ──►
 You need:
 
 - A fresh **Ubuntu 24.04** VPS you can reach as root over SSH. Size it by what you'll use: the
-  bot itself is light, the headless browser and coding agents take more memory, and
-  `bootstrap.sh` compiles the local Bot API server (for files up to 2 GB), which needs a few GB
-  of RAM while it builds.
+  bot itself is light; the headless browser and coding agents take more memory.
 - A Telegram account, and a ChatGPT plan or a Claude plan.
 - Your own copy of this repo on GitHub (a fork, or a private repo you push it to), and the
   [GitHub CLI](https://cli.github.com) signed in (`gh auth login`).
@@ -75,20 +73,6 @@ one). `deploy/push.sh` uploads it and deploys.
    `data/google_client_secret.json` in this folder.
 4. Run `uv run friday google-auth` on your Mac (it opens the browser), then `deploy/push.sh`,
    which uploads the token.
-
-### Files up to 2 GB (optional)
-
-Telegram's Bot API lets bots download files up to 20 MB and send up to 50 MB. A local Bot API
-server ([tdlib/telegram-bot-api](https://github.com/tdlib/telegram-bot-api), built by
-`bootstrap.sh`) raises both to 2 GB. It listens on 127.0.0.1 only, so no port is opened.
-
-1. At https://my.telegram.org → **API development tools**, create an app and put its `api_id`
-   and `api_hash` in `.env.server` as `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`.
-2. Deploy (`deploy/push.sh`), then once: `ssh -t friday 'cd ~/friday && .venv/bin/friday botapi switch'`.
-   This logs the bot out of Telegram's cloud API, which then refuses it for about 10 minutes.
-
-To go back, remove `TELEGRAM_API_ID`, call `logOut` on the local server
-(`curl -s -X POST http://127.0.0.1:8081/bot<token>/logOut` on the server) and deploy.
 
 ## Using it
 

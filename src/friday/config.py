@@ -65,10 +65,6 @@ class Config:
     # Chat turns in one long-lived `codex app-server` (codex_server.py) rather than a `codex exec`
     # per message; exec stays the fallback. Env: FRIDAY_CODEX_SERVER
     codex_server: bool = True
-    # From my.telegram.org: set = the bot talks to the local Bot API server (botapi.py,
-    # deploy/friday-botapi.service), for files up to 2 GB. Env: TELEGRAM_API_ID, TELEGRAM_API_HASH
-    telegram_api_id: str = ""
-    telegram_api_hash: str = field(default="", repr=False)  # kept out of os.environ, like the keys above
 
     @property
     def default_model(self) -> str:
@@ -77,15 +73,6 @@ class Config:
     @property
     def default_effort(self) -> str:
         return "" if self.chat_engine == "claude" else self.codex_effort
-
-    @property
-    def local_botapi(self) -> bool:
-        return bool(self.telegram_api_id)
-
-    @property
-    def botapi_dir(self) -> Path:
-        """The local Bot API server's files and session. Outside the workspace, hidden from the agents."""
-        return self.data_dir / "botapi"
 
     @property
     def transcription_on(self) -> bool:
@@ -208,8 +195,6 @@ def load_config() -> Config:
         transcribe_timeout_seconds=float(os.environ.get("TRANSCRIBE_TIMEOUT_SECONDS", "120")),
         browser_enabled=os.environ.get("FRIDAY_BROWSER", "true").strip().lower() not in ("0", "false", "no", "off"),
         codex_server=os.environ.get("FRIDAY_CODEX_SERVER", "true").strip().lower() not in ("0", "false", "no", "off"),
-        telegram_api_id=os.environ.get("TELEGRAM_API_ID", "").strip(),
-        telegram_api_hash=os.environ.pop("TELEGRAM_API_HASH", "").strip(),
     )
 
 
@@ -217,5 +202,3 @@ def ensure_dirs(cfg: Config) -> None:
     for d in (cfg.data_dir, cfg.workspace, cfg.files_dir / "inbox"):
         d.mkdir(parents=True, exist_ok=True)
     cfg.vault_dir.mkdir(mode=0o700, exist_ok=True)  # exists early, so the sandboxes can hide it
-    if cfg.local_botapi:  # likewise: it holds the bot's Telegram session
-        cfg.botapi_dir.mkdir(mode=0o700, exist_ok=True)
