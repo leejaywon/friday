@@ -83,7 +83,7 @@ apparmor_parser -r /etc/apparmor.d/chrome
 install -d -m 755 /etc/opt/chrome/policies/managed
 cat > /etc/opt/chrome/policies/managed/friday.json <<'EOF'
 {"URLBlocklist": ["file://*"], "PasswordManagerEnabled": false,
- "AutofillAddressEnabled": false, "AutofillCreditCardEnabled": false}
+ "AutofillSettings": [{"url_pattern": "*", "blocked_types": ["contact_info", "payments"]}]}
 EOF
 chmod 644 /etc/opt/chrome/policies/managed/friday.json
 
