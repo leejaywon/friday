@@ -61,7 +61,9 @@ async def check(origin: str) -> dict:
             started = time.monotonic()
             await page.wait_for_function("document.querySelector('audio').ended", timeout=30000)
             elapsed = time.monotonic()-started
-            await asyncio.sleep(.5)  # drain the output buffer before closing the recording
+            # HTMLMediaElement.ended can precede the last samples leaving PulseAudio. Let
+            # its output queue drain; otherwise the test itself truncates the tone's tail.
+            await asyncio.sleep(2.5)
             saved = await asyncio.to_thread(audio.stop, cfg, record["id"])
             metrics = await asyncio.to_thread(continuity, cfg.workspace/saved["path"])
             metrics["playback_wall_seconds"] = elapsed
