@@ -156,7 +156,7 @@ input.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2
 .tag svg { width: 12px; height: 12px; }
 
 /* Planner (components/planner.js): day sections of tasks, events and reminders. */
-h2.section { margin: 18px 16px 6px; color: var(--hint); font-size: 13px; font-weight: 400; text-transform: uppercase; letter-spacing: 0.02em; }
+h2.section { margin: 18px 14px 6px; color: var(--hint); font-size: 13px; font-weight: 400; text-transform: uppercase; letter-spacing: 0.02em; }
 h2.section.warn { color: var(--danger); }
 .group.adder { margin-bottom: 4px; }
 .group.list .row + .row::before, .group.list .editor + .row::before, .group.list .row + .editor::before {
