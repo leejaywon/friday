@@ -6,6 +6,7 @@
 
 FridayApp.register("planner", function (spec, app) {
   const { el, icon, haptic, body } = app;
+  document.body.classList.add("planner"); // its denser type and spacing (app.css)
   const today = /^\d{4}-\d{2}-\d{2}$/.test(spec.today || "") ? spec.today : new Date().toISOString().slice(0, 10);
   const tasks = (spec.tasks || []).filter((x) => Number.isInteger(x.id) && typeof x.t === "string");
   const events = (spec.events || []).filter((x) => Number.isInteger(x.i) && typeof x.t === "string");
