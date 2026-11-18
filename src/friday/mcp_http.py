@@ -23,7 +23,14 @@ from .config import Config
 TOKEN_VAR = "FRIDAY_MCP_TOKEN"  # matches the "*TOKEN*" shell_environment_policy exclusion
 RUN_HEADER = "X-Friday-Run"
 WATCH_HEADER = "X-Friday-Watch"  # a watch check (watches.py)
-CHAT_HEADER = "X-Friday-Chat"
+CHAT_HEADER = "X-Friday-Chat"  # a Telegram chat turn; the value is its lane (bot.Friday lanes)
+NO_BROWSER_HEADER = "X-Friday-No-Browser"  # a chat turn started while another one had the browser
+
+
+def toolsets_key(lane: str) -> str:
+    """The kv key for the toolsets a chat lane turned on (mcp_server.use_tools); lane "1" is the
+    main conversation."""
+    return "toolsets" if lane in ("", "1") else f"toolsets:{lane}"
 
 
 def friday_port() -> int:

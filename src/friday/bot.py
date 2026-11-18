@@ -13,7 +13,7 @@ import re
 import sqlite3
 import tempfile
 import time as clock
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,10 +38,10 @@ from telegram.ext import (
     filters,
 )
 
-from . import browser, gcal, mcp_config, miniapp
+from . import browser, gcal, mcp_config, mcp_http, miniapp
 from . import timeutil as tu
 from . import workspace as wsfiles
-from .agent import AgentResult, engine_status, instructions, run_turn
+from .agent import BROWSER_TOOL_TIMEOUT, AgentResult, engine_status, instructions, run_turn
 from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
@@ -72,7 +72,33 @@ PROGRESS_AFTER = 8.0
 # ...and this long, how long it's been running, its current step and a [Stop] button, every STATUS_EVERY.
 STATUS_AFTER = 20.0
 STATUS_EVERY = 15.0
-STOP_BUTTON = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="turn:stop")]])
+# A tool call running this long is reported (a message of its own, so it notifies), except
+# Friday's own tools, which wait for the owner (approvals, forms).
+STUCK_AFTER = 45.0
+# Chat turns that run at once: the main conversation (lane "1") and side lanes for messages that
+# arrive while it's busy. Only one turn at a time has the browser (Friday.browser_lock).
+LANES = ("1", "2", "3")
+MAX_JOBS = 3  # coding jobs at once (each in its own worktree; a local project takes one at a time)
+# Jobs a restart interrupted start again, at most this many times each (jobs_startup).
+MAX_RESUMES = 2
+RESUME_NOTE = ("(Friday restarted while you were working on this. Look at the files as they are now and "
+               "finish the task.)")
+
+
+def stop_button(lane: str = "1") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"turn:stop:{lane}")]])
+
+
+@dataclass
+class Lane:
+    """One chat turn at a time. The main lane's thread is the conversation's (in the store); a side
+    lane keeps its own, so a follow-up there goes on with what it did."""
+    key: str
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    task: asyncio.Task | None = None  # the agent call running now, which [Stop] stops
+    stopping: bool = False
+    thread: str | None = None  # side lanes only
+    topic: str = ""  # what it's working on, for the other lanes' notes
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILES_ONLY = (
     "(The user sent only the files above, with no message. Look at them. If it's clear what they "
@@ -173,17 +199,24 @@ class TurnStatus:
     """One Telegram message for a long chat turn, edited in place. The agent's latest progress line
     ("checking X") appears once the turn is PROGRESS_AFTER seconds in, so quick answers stay one
     message. From STATUS_AFTER on it also says how long the turn has run and its current step, with
-    a [Stop] button. When the turn ends only the progress line stays (no line: the message goes).
+    a [Stop] button. A tool call that runs STUCK_AFTER seconds is reported once with alert (a new
+    message, which notifies). When the turn ends only the progress line stays (no line: the
+    message goes).
 
-    send(text, stop) -> message id, edit(message id, text, stop) and delete(message id) talk to
-    Telegram; stop says whether to show the [Stop] button."""
+    send(text, stop) -> message id, edit(message id, text, stop), delete(message id) and
+    alert(text) talk to Telegram; stop says whether to show the [Stop] button."""
 
-    def __init__(self, send, edit, delete, note_after: float = PROGRESS_AFTER, status_after: float = STATUS_AFTER,
-                 every: float = STATUS_EVERY, tick: float = 1.0):
-        self.send, self.edit, self.delete = send, edit, delete
-        self.note_after, self.status_after, self.every, self.tick = note_after, status_after, every, tick
+    def __init__(self, send, edit, delete, alert=None, note_after: float = PROGRESS_AFTER,
+                 status_after: float = STATUS_AFTER, every: float = STATUS_EVERY, stuck_after: float = STUCK_AFTER,
+                 tick: float = 1.0):
+        self.send, self.edit, self.delete, self.alert = send, edit, delete, alert
+        self.note_after, self.status_after, self.every, self.stuck_after = note_after, status_after, every, stuck_after
+        self.tick = tick
         self.start = clock.monotonic()
-        self.text, self.step = "", ""
+        self.text, self.waiting = "", ""
+        self.steps: dict[str, tuple[str, float]] = {}  # running tool calls: item id -> (label, started)
+        self.last = ""  # the latest step
+        self.alerted: set[str] = set()
         self.msg_id = None
         self.shown: tuple[str, bool] = ("", False)
         self.task = asyncio.create_task(self._run())
@@ -193,15 +226,38 @@ class TurnStatus:
         if text.strip(" .-"):
             self.text = text[:3000]  # the latest line is the most current
 
-    def on_step(self, label: str) -> None:
-        self.step = label
+    def on_step(self, item_id: str, label: str) -> None:
+        """A tool call started (label) or ended (no label)."""
+        if label:
+            self.steps[item_id] = (label, clock.monotonic())
+            self.last = label
+        else:
+            self.steps.pop(item_id, None)
 
-    def _render(self, elapsed: float) -> tuple[str, bool]:
+    def _stuck(self, now: float) -> tuple[str, str, float] | None:
+        """The longest-running tool call past stuck_after: (item id, label, seconds)."""
+        late = [(now - t, i, label) for i, (label, t) in self.steps.items()
+                if now - t >= self.stuck_after and not label.startswith("friday:")]
+        if not late:
+            return None
+        secs, item_id, label = max(late)
+        return item_id, label, secs
+
+    def _render(self, now: float) -> tuple[str, bool]:
+        elapsed = now - self.start
         if elapsed < self.status_after:
             return (self.text if elapsed >= self.note_after else ""), False
         # Whole STATUS_EVERY steps, so the message is edited only that often.
-        shown = self.status_after + (elapsed - self.status_after) // self.every * self.every
-        line = f"⏳ {_clock(shown)}" + (f" · {self.step}" if self.step else "")
+        def tick(secs: float) -> float:
+            return secs // self.every * self.every
+        line = f"⏳ {_clock(self.status_after + tick(elapsed - self.status_after))}"
+        stuck = self._stuck(now)
+        if self.waiting:
+            line += f" · {self.waiting}"
+        elif stuck:
+            line += f" · ⚠️ {stuck[1]}: no answer for {_clock(tick(stuck[2]))}"
+        elif self.steps or self.last:
+            line += f" · {self.last}"
         return (f"{self.text}\n\n{line}" if self.text else line), True
 
     async def _show(self, text: str, stop: bool) -> None:
@@ -216,9 +272,22 @@ class TurnStatus:
         except Exception as e:
             log.info("status message not updated: %s", e)
 
+    async def _check_stuck(self, now: float) -> None:
+        stuck = self._stuck(now)
+        if not stuck or stuck[0] in self.alerted or not self.alert:
+            return
+        self.alerted.add(stuck[0])
+        try:
+            await self.alert(f"⚠️ {stuck[1]} hasn't answered for {int(stuck[2])}s. Browser steps give up after "
+                             f"{BROWSER_TOOL_TIMEOUT}s and the request goes on; tap ⏹ Stop to end it now.")
+        except Exception as e:
+            log.info("stuck alert not sent: %s", e)
+
     async def _run(self) -> None:
         while True:
-            await self._show(*self._render(clock.monotonic() - self.start))
+            now = clock.monotonic()
+            await self._show(*self._render(now))
+            await self._check_stuck(now)
             await asyncio.sleep(self.tick)
 
     async def finish(self, stopped: bool = False) -> None:
@@ -263,16 +332,19 @@ class Friday(WatchBot):
         self.cfg = cfg
         ensure_dirs(cfg)
         self.store = Store(cfg.db_path)
-        self.agent_lock = asyncio.Lock()
+        self.lanes = {k: Lane(k) for k in LANES}
+        self._lane_free = asyncio.Condition()  # a lane's turn ended (messages wait when all are busy)
+        # The shared browser, one chat turn or scheduled run at a time (two would drive the same tabs).
+        self.browser_lock = asyncio.Lock()
+        self._browser_topic = ""
         # Chat turns' Codex: one app-server process, started on the first message (codex_server.py)
         self.codex = CodexServer(cfg) if cfg.codex_server and cfg.chat_engine == "codex" else None
         self.app: Application | None = None
         self._tasks: list[asyncio.Task] = []
         self.runner = Runner(cfg, self.store)
         self.own_repo: str | None = None  # Friday's own GitHub owner/name, for the Deploy button
-        self._job_runner: asyncio.Task | None = None  # runs one job and reports it; one at a time
-        self._job_id: int | None = None  # the job _job_runner is running
-        self._job_exec: asyncio.Task | None = None  # the agent/git part of it, which /stop cancels
+        self._jobs: dict[int, asyncio.Task] = {}  # job id -> the task running and reporting it
+        self._job_execs: dict[int, asyncio.Task] = {}  # job id -> the agent/git part, which /stop cancels
         self._job_busy: set[int] = set()  # jobs with a button action in flight (double taps)
         self._file_timer: asyncio.Task | None = None  # answers files sent without a message
         self._downloads = 0  # incoming files still downloading
@@ -281,8 +353,6 @@ class Friday(WatchBot):
         # /files buttons carry an index into this list, not a path (callback data is 64 bytes at most)
         self._fs_paths: list[str] = []
         self._fs_index: dict[str, int] = {}
-        self._agent_task: asyncio.Task | None = None  # the chat turn's agent call, which [Stop] stops
-        self._stopping = False
         self._bg: set[asyncio.Task] = set()  # continuation turns after the owner answered a request
 
     # --- setup -------------------------------------------------------------
@@ -311,7 +381,7 @@ class Friday(WatchBot):
         app.add_handler(CommandHandler("jobs", self.cmd_jobs, filters=me))
         app.add_handler(CommandHandler("stop", self.cmd_stop, filters=me))
         app.add_handler(CommandHandler("runs", self.cmd_runs, filters=me))
-        app.add_handler(CallbackQueryHandler(self.on_stop_button, pattern=r"^turn:stop$"))
+        app.add_handler(CallbackQueryHandler(self.on_stop_button, pattern=r"^turn:stop(:\d)?$"))
         app.add_handler(CallbackQueryHandler(self.on_approval_button, pattern=r"^appr:(yes|no):\d+$"))
         app.add_handler(CommandHandler("login", self.cmd_login, filters=me))
         app.add_handler(CommandHandler("logins", self.cmd_logins, filters=me))
@@ -353,7 +423,7 @@ class Friday(WatchBot):
 
     async def _on_stop(self, app: Application) -> None:
         # A running job stays 'running' in the database; the next start marks it failed and says so.
-        tasks = self._tasks + [t for t in (self._job_runner, self._run_task, self._watch_task) if t]
+        tasks = self._tasks + list(self._jobs.values()) + [t for t in (self._run_task, self._watch_task) if t]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -390,8 +460,18 @@ class Friday(WatchBot):
 
     # --- conversation ------------------------------------------------------
 
-    def _wrap(self, text: str, files: list[str], new_thread: bool) -> str:
+    def _wrap(self, text: str, files: list[str], new_thread: bool, lane: str = "1", browser_busy: bool = False) -> str:
         head = [f"[Now: {tu.local_str(tu.now_utc(), self.tz)} ({self.tz})]"]
+        others = [short(x.topic, 120) for x in self.lanes.values() if x.key != lane and x.lock.locked() and x.topic]
+        if others:
+            head.append("[Also in progress in parallel, as other turns of yours: " + "; ".join(f"«{t}»" for t in others)
+                        + ". Don't start that work again here; if asked about it, say it's still running.]")
+        if browser_busy:
+            head.append(f"[The browser is busy with another request («{short(self._browser_topic, 120)}»). If "
+                        "this one needs it, call use_tools(\"browser\"); you're continued when it's free.]")
+        if lane == "1" and (meanwhile := self.store.get("meanwhile")):
+            self.store.delete("meanwhile")
+            head.append("[Meanwhile, in parallel turns: " + "; ".join(json.loads(meanwhile)) + "]")
         raw = self.store.get("last_location")
         if raw:  # a location shared in the last 3 hours still answers "here" / "near me"
             loc = json.loads(raw)
@@ -408,11 +488,15 @@ class Friday(WatchBot):
         if mems := self.store.memories("", 20):
             context.append("[What you know about the user (saved memories, newest first; recall has more):\n"
                            + "\n".join(f"#{m['id']} {short(m['text'], 120)}" for m in mems) + "]")
-        if carry := self.store.get("carry"):
+        if lane != "1":
+            if note := self.store.get("last_exchange"):
+                context.append(f"[A side conversation, running while the main one is busy. Last exchange there: {note}.]")
+        elif carry := self.store.get("carry"):
             self.store.delete("carry")
             context.append(carry)
         prompt = instructions(self.cfg)
-        self.store.set("prompt_hash", _digest(prompt))
+        if lane == "1":
+            self.store.set("prompt_hash", _digest(prompt))
         return "\n".join([f"{prompt}\n---", *context, body])
 
     def _current_thread(self) -> str | None:
@@ -424,15 +508,25 @@ class Friday(WatchBot):
         return self.store.get("thread_id")
 
     def _reset_thread(self) -> None:
-        """A fresh conversation: no Codex thread, and the optional toolsets off again."""
-        for key in ("thread_id", "toolsets", "carry"):
+        """A fresh conversation: no Codex threads (side lanes' too), and the optional toolsets off again."""
+        for key in ("thread_id", "toolsets", "carry", "meanwhile"):
             self.store.delete(key)
+        for lane in self.lanes.values():
+            if lane.key != "1":
+                lane.thread = None
+                self.store.delete(mcp_http.toolsets_key(lane.key))
 
-    def _note_exchange(self, said: str, replied: str) -> None:
+    def _note_exchange(self, said: str, replied: str, lane: str = "1") -> None:
+        """The main lane's last exchange (carried into a fresh thread); a side lane's goes to the
+        main thread's next message ("meanwhile")."""
         note = f"the user said «{short(' '.join(said.split()) or '(only files)', 300)}»"
         if replied.strip(" .\"'`-—"):
             note += f" and you replied «{short(' '.join(replied.split()), 300)}»"
-        self.store.set("last_exchange", note)
+        if lane == "1":
+            self.store.set("last_exchange", note)
+            return
+        notes = json.loads(self.store.get("meanwhile") or "[]")[-4:]
+        self.store.set("meanwhile", json.dumps(notes + [note], ensure_ascii=False))
 
     def _continue_fresh(self) -> None:
         """Go on in a new Codex thread that starts with a note of the last exchange (_wrap)."""
@@ -440,11 +534,14 @@ class Friday(WatchBot):
             self.store.set("carry", f"[Continuing this conversation in a fresh context. Last exchange: {note}.]")
         self.store.delete("thread_id")
 
-    def _toolsets(self) -> set[str]:
-        """Toolsets for a chat turn: the browser, and those this conversation turned on
-        (mcp_server.use_tools)."""
-        on = set(json.loads(self.store.get("toolsets") or "[]"))
-        return on | {"browser"} if self.cfg.browser_enabled else on
+    def _toolsets(self, lane: str = "1") -> set[str]:
+        """Toolsets this chat lane turned on (mcp_server.use_tools); "browser" there means it asked
+        for the browser while another turn had it."""
+        return set(json.loads(self.store.get(mcp_http.toolsets_key(lane)) or "[]"))
+
+    def _drop_browser_request(self, lane: str) -> None:
+        on = self._toolsets(lane) - {"browser"}
+        self.store.set(mcp_http.toolsets_key(lane), json.dumps(sorted(on)))
 
     def _last_shown(self) -> int:
         return self.store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM outbox WHERE kind = 'html'").fetchone()[0]
@@ -456,6 +553,13 @@ class Friday(WatchBot):
         """Requests to the owner the chat agent didn't wait for (mcp_server._follow_up)."""
         return {r[0] for r in self.store.conn.execute("SELECT key FROM kv WHERE key LIKE 'followup:%'")}
 
+    def _free_lane(self) -> Lane | None:
+        """The main lane if it's free, else a free side lane (one with a thread first, so a side
+        conversation goes on where it was)."""
+        free = [x for x in self.lanes.values() if not x.lock.locked()]
+        free.sort(key=lambda x: (x.key != "1", x.thread is None))
+        return free[0] if free else None
+
     async def ask(self, chat_id: int, text: str, files: list[str] | None = None, images: list[Path] | None = None) -> None:
         files = (self._take_pending_files()) + (files or [])
         # Show Codex the images among the files, not just their paths.
@@ -464,35 +568,52 @@ class Friday(WatchBot):
             path = self.cfg.workspace / f
             if path.suffix.lower() in IMAGE_SUFFIXES and path not in images:
                 images.append(path)
+        lane = self._free_lane()
+        if lane is None:
+            await self._quiet(self.say(f"⏳ {len(LANES)} requests are already running; this one starts as soon as "
+                                       "one of them finishes.", chat_id))
+            async with self._lane_free:
+                await self._lane_free.wait_for(lambda: self._free_lane() is not None)
+            lane = self._free_lane()
         # A thread keeps the instructions it started with: after a deploy or a FRIDAY.md edit, the
         # next message goes on in a fresh one (not while a request's answer is due in this one).
-        if (self.store.get("thread_id") and not self._followups()
+        if (lane.key == "1" and self.store.get("thread_id") and not self._followups()
                 and self.store.get("prompt_hash") != _digest(instructions(self.cfg))):
             self._continue_fresh()
-        await self._turn(chat_id, text, files, images)
+        await self._turn(chat_id, text, files, images, lane=lane)
 
     async def _turn(self, chat_id: int, text: str, files: list[str] | None = None,
-                    images: list[Path] | None = None) -> None:
-        """Answer a message (or continue after a note) in the chat's Codex thread. When the agent
-        turns on a toolset (use_tools), the thread is continued right away with the toolset
-        attached, at most MAX_CONTINUATIONS times; only the last turn's reply is sent."""
-        async with self.agent_lock:
+                    images: list[Path] | None = None, lane: Lane | None = None) -> None:
+        """Answer a message (or continue after a note) in a chat lane's Codex thread. Lanes run at
+        the same time; only one turn has the browser, and another one that needs it asks with
+        use_tools("browser") and waits. When the agent turns on a toolset, the thread is continued
+        right away with it attached, at most MAX_CONTINUATIONS times; only the last reply is sent."""
+        lane = lane or self.lanes["1"]
+        async with lane.lock:
+            lane.topic, lane.stopping, stopped, has_browser = text, False, False, False
             typing = asyncio.create_task(self._keep_typing(chat_id))
-            status = self._status(chat_id)
-            self._stopping, stopped = False, False
+            status = self._status(chat_id, lane.key)
             requests, proposal, used = self._followups(), self._last_proposal(), set()
             shown = self._last_shown()
             try:
-                thread = self._current_thread()
-                prompt = self._wrap(text, files or [], thread is None)
-                for step in range(MAX_CONTINUATIONS + 1):
-                    toolsets = self._toolsets()
-                    self._agent_task = asyncio.create_task(self._codex_turn(
-                        prompt, thread, (images or []) if step == 0 else [], toolsets, status))
+                thread = self._current_thread() if lane.key == "1" else lane.thread
+                result = AgentResult("", thread, ["stopped"])
+                if self.cfg.browser_enabled and "browser" in self._toolsets(lane.key):
+                    self._drop_browser_request(lane.key)  # asked for it before (e.g. a request's answer)
+                    has_browser = await self._take_browser(lane, status)
+                elif self.cfg.browser_enabled and not self.browser_lock.locked():
+                    has_browser = await self._take_browser(lane, status)
+                stopped = lane.stopping
+                prompt = self._wrap(text, files or [], thread is None, lane.key,
+                                    browser_busy=self.cfg.browser_enabled and not has_browser)
+                for step in range(0 if stopped else MAX_CONTINUATIONS + 1):
+                    toolsets = (self._toolsets(lane.key) - {"browser"}) | ({"browser"} if has_browser else set())
+                    lane.task = asyncio.create_task(self._codex_turn(
+                        prompt, thread, (images or []) if step == 0 else [], toolsets, status, lane.key))
                     try:
-                        result = await self._agent_task
+                        result = await lane.task
                     except asyncio.CancelledError:
-                        if not self._stopping:  # Friday is stopping, not the [Stop] button
+                        if not lane.stopping:  # Friday is stopping, not the [Stop] button
                             raise
                         result = AgentResult("", thread, ["stopped"])
                     except Exception as e:  # e.g. codex binary missing
@@ -501,26 +622,41 @@ class Friday(WatchBot):
                     used |= result.mcp_servers
                     stopped = result.errors == ["stopped"]  # not when the turn finished before [Stop] took
                     thread = result.thread_id or thread
-                    if thread:
+                    if lane.key != "1":
+                        lane.thread = thread
+                    elif thread:
                         self.store.set("thread_id", thread)
                         self.store.set("thread_engine", self.cfg.chat_engine)
                     self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
-                    new = self._toolsets() - toolsets
+                    new = self._toolsets(lane.key) - toolsets
+                    if "browser" in new:
+                        self._drop_browser_request(lane.key)
+                        if self.cfg.browser_enabled and not has_browser:
+                            has_browser = await self._take_browser(lane, status)
+                            stopped = stopped or lane.stopping
                     if not new or not thread or step == MAX_CONTINUATIONS or stopped:
                         break
                     prompt = f"[{' and '.join(sorted(new))} tools are now available; continue the user's request]"
             finally:
-                self._agent_task = None
+                lane.task = None
+                if has_browser:
+                    self.browser_lock.release()
                 typing.cancel()
                 await status.finish(stopped)
+                lane.topic = ""
+                async with self._lane_free:
+                    self._lane_free.notify_all()
             if stopped:
-                self._note_exchange(text, "(stopped by the user)")
+                self._note_exchange(text, "(stopped by the user)", lane.key)
                 return
             made_request = bool(self._followups() - requests)
-            self._note_exchange(text, result.text)
+            self._note_exchange(text, result.text, lane.key)
             # Not while a request is open: its answer continues this thread.
             if thread and not self._followups() and result.input_tokens > MAX_TURN_INPUT_TOKENS:
-                self._continue_fresh()
+                if lane.key == "1":
+                    self._continue_fresh()
+                else:
+                    lane.thread = None
         if result.text:
             # A one-liner next to a proposal or a tree (show_tree) only says it was sent.
             listed = self._last_proposal() > proposal or self._last_shown() > shown
@@ -531,21 +667,42 @@ class Friday(WatchBot):
             await self.say(f"Agent error: {detail[:1500]}\nIf this keeps happening, send /new.", chat_id)
         await self.outbox_loop()
 
+    async def _take_browser(self, lane: Lane, status: TurnStatus) -> bool:
+        """Wait for the shared browser (another turn or a scheduled run may have it). False when
+        [Stop] ended the wait."""
+        if not self.browser_lock.locked():  # free: taken without yielding, so no other turn gets it too
+            await self.browser_lock.acquire()
+            self._browser_topic = lane.topic
+            return True
+        status.waiting = f"waiting for the browser ({short(self._browser_topic, 40)})"
+        lane.task = asyncio.create_task(self.browser_lock.acquire())
+        try:
+            await lane.task
+        except asyncio.CancelledError:
+            if not lane.stopping:
+                raise
+            return False
+        finally:
+            lane.task = None
+            status.waiting = ""
+        self._browser_topic = lane.topic
+        return True
+
     async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str],
-                          status: TurnStatus | None = None) -> AgentResult:
+                          status: TurnStatus | None = None, lane: str = "1") -> AgentResult:
         """One chat turn: in Codex's app-server, else `codex exec` (off or failed) or Claude."""
         kw = dict(model=self.store.get("model") or "", effort=self.store.get("effort") or "", toolsets=toolsets,
                   tz=self.tz)
         if self.codex:
             try:
-                return await self.codex.run(prompt, thread, images,
+                return await self.codex.run(prompt, thread, images, chat=lane,
                                             on_note=status and (lambda t: status.note(plain_text(t))),
-                                            on_step=status and status.on_step, **kw)
+                                            on_step=status and status.on_step, key=lane, **kw)
             except CodexServerError as e:
                 log.warning("codex app-server failed, retrying with codex exec: %s", e)
                 if e.partial:
                     prompt = RETRY_NOTE + prompt
-        return await run_turn(self.cfg, prompt, thread, images, chat=True, **kw)
+        return await run_turn(self.cfg, prompt, thread, images, chat=lane, **kw)
 
     @staticmethod
     def _worth_sending(text: str, made_request: bool, made_proposal: bool = False) -> bool:
@@ -558,32 +715,34 @@ class Friday(WatchBot):
         one_line = "\n" not in t and len(t) <= 120
         return not (one_line and (made_proposal or (made_request and REQUEST_ECHO.search(t))))
 
-    def _status(self, chat_id: int) -> TurnStatus:
+    def _status(self, chat_id: int, lane: str = "1") -> TurnStatus:
         def bot():
             return self.app.bot  # type: ignore[union-attr]
 
         async def send(text: str, stop: bool) -> int:
-            return (await bot().send_message(chat_id, text, reply_markup=STOP_BUTTON if stop else None)).message_id
+            return (await bot().send_message(chat_id, text, reply_markup=stop_button(lane) if stop else None)).message_id
 
         def edit(msg_id: int, text: str, stop: bool):
             return bot().edit_message_text(text, chat_id=chat_id, message_id=msg_id,
-                                           reply_markup=STOP_BUTTON if stop else None)
+                                           reply_markup=stop_button(lane) if stop else None)
 
-        return TurnStatus(send, edit, lambda msg_id: bot().delete_message(chat_id, msg_id))
+        return TurnStatus(send, edit, lambda msg_id: bot().delete_message(chat_id, msg_id),
+                          alert=lambda text: bot().send_message(chat_id, text, reply_markup=stop_button(lane)))
 
     async def on_stop_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """[Stop] on a long turn's status message: interrupt the agent; the turn reports it."""
+        """[Stop] on a long turn's status message: interrupt that lane's agent; the turn reports it."""
         q = update.callback_query
         if not q.from_user or q.from_user.id not in self.cfg.allowed_user_ids:
             await q.answer()
             return
-        task = self._agent_task
+        lane = self.lanes.get(q.data.split(":")[2] if q.data.count(":") == 2 else "1")
+        task = lane.task if lane else None
         if task is None or task.done():
             await q.answer("Nothing running")
             await self._quiet(q.edit_message_reply_markup(None))
             return
-        self._stopping = True
-        if not (self.codex and self.codex.stop_turn()):
+        lane.stopping = True
+        if not (self.codex and self.codex.stop_turn(lane.key)):
             task.cancel()  # `codex exec` / Claude, or the app-server turn hasn't started: kill it
         await q.answer("Stopping…")
 
@@ -616,10 +775,14 @@ class Friday(WatchBot):
         if raw is None:
             return
         self.store.delete(key)
-        note = self._request_outcome(kind, rid, json.loads(raw)["tool"])
-        if not self._current_thread():
+        info = json.loads(raw)
+        note = self._request_outcome(kind, rid, info["tool"])
+        lane = self.lanes.get(info.get("lane") or "1") or self.lanes["1"]
+        if lane.key != "1" and not lane.thread:  # its thread is gone (a restart): the main one
+            lane = self.lanes["1"]
+        if lane.key == "1" and not self._current_thread():
             return
-        task = asyncio.create_task(self._turn(self.owner, note))
+        task = asyncio.create_task(self._turn(self.owner, note, lane=lane))
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
 
@@ -947,7 +1110,7 @@ class Friday(WatchBot):
             f"Upcoming reminders: {len(self.store.active_reminders())}",
             f"Conversation: {'ongoing' if self.store.get('thread_id') else 'fresh'}",
             f"Coding jobs: {self.cfg.code_engine} by default, "
-            + (f"#{self._running_job_id()} running" if self._running_job_id() else "idle"),
+            + (", ".join(f"#{j}" for j in self._running_jobs()) + " running" if self._running_jobs() else "idle"),
         ]
         await update.message.reply_text("\n".join(lines))
 
@@ -965,8 +1128,8 @@ class Friday(WatchBot):
             await update.message.reply_text(str(e))
             return
         jid = self.store.add_job(repo, task, engine)
-        busy = self._running_job_id()
-        note = f" Starts when job #{busy} is done." if busy else ""
+        busy = self._running_jobs()
+        note = f" Starts when one of {len(busy)} running jobs is done." if len(busy) >= MAX_JOBS else ""
         msg = await update.message.reply_text(f"🛠 Job #{jid} queued: {repo} ({engine})…{note}")
         self.store.link_job_message(msg.message_id, jid)
         self.store.set(f"job_queued_msg:{jid}", str(msg.message_id))  # _run_job edits it into "started"
@@ -982,8 +1145,13 @@ class Friday(WatchBot):
     async def cmd_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         arg = (ctx.args or [""])[0].lstrip("#")
         jid = int(arg) if arg.isdigit() else None
-        if not arg:  # plain /stop: the running job
-            jid = self._running_job_id()
+        if not arg:  # plain /stop: the running job, if there's one
+            running = self._running_jobs()
+            if len(running) > 1:
+                await update.message.reply_text("Jobs running: " + ", ".join(f"#{j}" for j in running)
+                                                + ". Which one? /stop <id>")
+                return
+            jid = running[0] if running else None
         job = self.store.job(jid) if jid else None
         if not job:
             await update.message.reply_text("Usage: /stop <job id>. See /jobs for the list.")
@@ -991,9 +1159,9 @@ class Friday(WatchBot):
         if job["status"] == "queued":
             self.store.update_job(jid, status="cancelled", followup=None)
             await update.message.reply_text(f"⏹ Cancelled job #{jid} before it started.")
-        elif job["status"] == "running" and jid == self._running_job_id() and self._job_exec:
+        elif job["status"] == "running" and jid in self._job_execs:
             # _run_job sees the cancellation, kills the agent's processes and reports it.
-            self._job_exec.cancel()
+            self._job_execs[jid].cancel()
         elif job["status"] == "running":  # not ours to cancel (shouldn't happen); don't leave it stuck
             self.store.update_job(jid, status="cancelled")
             await update.message.reply_text(f"⏹ Marked job #{jid} as cancelled.")
@@ -1076,9 +1244,10 @@ class Friday(WatchBot):
         if job["status"] != "merged" or not self._is_own_repo(job):
             await q.answer("Nothing to deploy.")
             return
-        running = self._running_job_id()
-        if running:  # the restart would kill it
-            await q.answer(f"Job #{running} is running. Deploy after it finishes, or /stop it.", show_alert=True)
+        running = [j for j in self._running_jobs() if j != job["id"]]
+        if running:  # the restart would interrupt them (they start again afterwards, from where they were)
+            await q.answer(f"Job {', '.join(f'#{j}' for j in running)} is running. Deploy after it finishes, "
+                           "or /stop it.", show_alert=True)
             return
         await q.answer("Deploying…")
         unit = f"friday-deploy-{datetime.now():%Y%m%d-%H%M%S}"
@@ -1103,8 +1272,8 @@ class Friday(WatchBot):
     def _is_own_repo(self, job) -> bool:
         return bool(self.own_repo and job["gh_repo"] and job["gh_repo"].lower() == self.own_repo.lower())
 
-    def _running_job_id(self) -> int | None:
-        return self._job_id if self._job_runner and not self._job_runner.done() else None
+    def _running_jobs(self) -> list[int]:
+        return sorted(j for j, t in self._jobs.items() if not t.done())
 
     async def _jobs_startup(self) -> None:
         try:
@@ -1122,10 +1291,20 @@ class Friday(WatchBot):
             finally:
                 self.store.delete("deploy_notify")
 
-        for jid in self.store.fail_interrupted_jobs():
+        # Jobs a restart (a deploy) interrupted start again where they were: the same worktree,
+        # and the agent's session when it had one. Not forever: a job that keeps getting cut off fails.
+        for jid in self.store.interrupted_jobs():
             job = self.store.job(jid)
-            await self._job_send(jid, f"⚠️ Friday restarted, so job #{jid} ({job['repo']}) stopped.\n"
-                                      "To try again, reply to this message with instructions.")
+            tries = int(self.store.get(f"job_resumes:{jid}") or 0)
+            if tries >= MAX_RESUMES:
+                self.store.update_job(jid, status="failed", error="Friday restarted while this job was running.")
+                await self._job_send(jid, f"⚠️ Friday restarted, so job #{jid} ({job['repo']}) stopped.\n"
+                                          "To try again, reply to this message with instructions.")
+                continue
+            self.store.set(f"job_resumes:{jid}", str(tries + 1))
+            self.store.update_job(jid, status="queued", followup=RESUME_NOTE if job["session_id"] else None)
+            await self._job_send(jid, f"🔁 Friday restarted while job #{jid} ({job['repo']}) was running; "
+                                      "it starts again where it was.")
 
     async def _job_send(self, jid: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
         """Message the owner about a job and remember the message ids, so a reply to any of them continues it."""
@@ -1148,13 +1327,12 @@ class Friday(WatchBot):
 
     async def job_loop(self) -> float:
         # Polled, because the MCP server (another process) can queue jobs too.
-        if self._running_job_id():
-            return 3
-        job = self.store.next_queued_job()
-        if job:
+        for jid in [j for j, t in self._jobs.items() if t.done()]:
+            del self._jobs[jid]
+        while len(self._jobs) < MAX_JOBS and (job := self.store.next_queued_job()):
             self.store.update_job(job["id"], status="running", error=None)
-            self._job_id = job["id"]
-            self._job_runner = asyncio.create_task(self._run_job(self.store.job(job["id"])), name=f"job-{job['id']}")
+            self._jobs[job["id"]] = asyncio.create_task(self._run_job(self.store.job(job["id"])),
+                                                        name=f"job-{job['id']}")
         return 3
 
     async def _run_job(self, job) -> None:
@@ -1171,9 +1349,9 @@ class Friday(WatchBot):
             await self.app.bot.edit_message_text(started, chat_id=self.owner, message_id=int(queued))  # type: ignore[union-attr]
         except Exception:  # no such message (a job from the chat agent), or it can't be edited
             await self._job_send(jid, started)
-        self._job_exec = asyncio.create_task(self.runner.execute(job))
+        self._job_execs[jid] = asyncio.create_task(self.runner.execute(job))
         try:
-            outcome = await self._job_exec
+            outcome = await self._job_execs[jid]
         except asyncio.CancelledError:
             if asyncio.current_task().cancelling():  # Friday is stopping, not /stop: next start reports it
                 raise
@@ -1185,7 +1363,7 @@ class Friday(WatchBot):
             log.exception("job %s crashed", jid)
             outcome = Outcome("failed", f"{type(e).__name__}: {e}")
         finally:
-            self._job_exec = None
+            self._job_execs.pop(jid, None)
 
         try:
             failed = outcome.status == "failed"
@@ -1565,29 +1743,32 @@ class Friday(WatchBot):
         rid = run["id"]
         await self._quiet(self.say(f"🌐 Browser run #{rid} started ({run['mode']}): {short(run['prompt'], 200)}"))
         prompt = instructions(self.cfg) + "\n---\n" + browser.run_prompt(run, tu.local_str(tu.now_utc(), self.tz))
-        try:
-            result = await run_turn(
-                replace(self.cfg, codex_timeout_seconds=browser.RUN_TIMEOUT_SECONDS), prompt,
-                model=self.store.get("model") or "", effort=self.store.get("effort") or "", run_id=rid,
-                toolsets={"browser"}, tz=self.tz,
-            )
-        except asyncio.CancelledError:
-            if self.store.scheduled_run(rid)["status"] != "cancelled":  # Friday is stopping: next start reports it
-                raise
-            await self._quiet(self.say(f"⏹ Browser run #{rid} stopped."))
-            return
-        except Exception as e:
-            log.exception("browser run %s crashed", rid)
-            result = AgentResult("", None, [f"{type(e).__name__}: {e}"])
-        text = result.text or "; ".join(result.errors) or "no reply"
-        self.store.set_run_status(rid, "done" if result.ok else "failed", text, only_from="running")
-        try:
-            shot = self.cfg.files_dir / "browser" / f"run-{rid}.png"
-            if await browser.screenshot(shot):
-                with shot.open("rb") as fh:
-                    await self.app.bot.send_photo(self.owner, fh, caption=f"🌐 #{rid} last screen")  # type: ignore[union-attr]
-        except Exception as e:
-            log.info("no screenshot for run %s: %s", rid, e)
+        # The browser is shared with chat turns: wait until none has it.
+        async with self.browser_lock:
+            self._browser_topic = f"scheduled browser run #{rid}"
+            try:
+                result = await run_turn(
+                    replace(self.cfg, codex_timeout_seconds=browser.RUN_TIMEOUT_SECONDS), prompt,
+                    model=self.store.get("model") or "", effort=self.store.get("effort") or "", run_id=rid,
+                    toolsets={"browser"}, tz=self.tz,
+                )
+            except asyncio.CancelledError:
+                if self.store.scheduled_run(rid)["status"] != "cancelled":  # Friday is stopping: next start reports it
+                    raise
+                await self._quiet(self.say(f"⏹ Browser run #{rid} stopped."))
+                return
+            except Exception as e:
+                log.exception("browser run %s crashed", rid)
+                result = AgentResult("", None, [f"{type(e).__name__}: {e}"])
+            text = result.text or "; ".join(result.errors) or "no reply"
+            self.store.set_run_status(rid, "done" if result.ok else "failed", text, only_from="running")
+            try:
+                shot = self.cfg.files_dir / "browser" / f"run-{rid}.png"
+                if await browser.screenshot(shot):
+                    with shot.open("rb") as fh:
+                        await self.app.bot.send_photo(self.owner, fh, caption=f"🌐 #{rid} last screen")  # type: ignore[union-attr]
+            except Exception as e:
+                log.info("no screenshot for run %s: %s", rid, e)
         head = f"✅ Browser run #{rid} done" if result.ok else f"❌ Browser run #{rid} failed"
         await self._quiet(self.say(f"{head}:\n\n{text}"))
 

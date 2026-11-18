@@ -59,6 +59,8 @@ def step_label(item: dict) -> str:
         return "running a command"
     if kind == "webSearch":
         return "searching the web"
+    if kind == "dynamicToolCall":
+        return str(item.get("tool") or "a tool").replace("_", " ")
     return str(kind or "")
 
 
@@ -89,7 +91,10 @@ class CodexServer:
         self._turns: dict[str, asyncio.Queue] = {}  # thread id -> notifications for its running turn
         self._closed: dict[str, asyncio.Event] = {}  # thread id -> set by thread/closed
         self._loaded: dict[str, dict] = {}  # thread id -> the config it was loaded with
-        self._lock = asyncio.Lock()  # one turn at a time
+        # Starting the server and opening threads, one at a time. Turns on different threads run
+        # at the same time (the bot's chat lanes); a thread has one turn at a time.
+        self._lock = asyncio.Lock()
+        self._keys: dict[str, str] = {}  # the caller's key for a running turn (a chat lane) -> thread id
         self._checked_at = 0.0
         self._broken_until = 0.0
 
@@ -163,6 +168,8 @@ class CodexServer:
         was upgraded since it started."""
         if self.running:
             restart = ""
+            if self._turns:  # not while other turns run: restarting would end them
+                return
             if self._env != (tz, self.cfg.codex_bin):
                 restart = "settings changed"
             elif time.monotonic() - self._checked_at > VERSION_CHECK_SECONDS:
@@ -334,32 +341,53 @@ class CodexServer:
         effort: str = "",
         toolsets: frozenset[str] | set[str] = frozenset(),
         tz: str = "",
-        chat: bool = True,
+        chat: bool | str = True,
         on_note: Callable[[str], None] | None = None,
-        on_step: Callable[[str], None] | None = None,
+        on_step: Callable[[str, str], None] | None = None,
+        key: str = "",
     ) -> AgentResult:
-        """One turn, like agent.run_codex. on_note gets the agent's progress lines ("checking X")
-        as they come, on_step each tool call it starts (step_label). Raises CodexServerError when
-        the server fails."""
+        """One turn, like agent.run_codex. Turns on different threads run at the same time.
+        on_note gets the agent's progress lines ("checking X") as they come; on_step(item id,
+        step_label) each tool call it starts and on_step(item id, "") when it ends. key names the
+        turn for stop_turn. Raises CodexServerError when the server fails."""
         async with self._lock:
             try:
                 await self._ensure(tz or self.cfg.default_tz)
                 config = codex_overrides(self.cfg, toolsets=toolsets, chat=chat, http=mcp_endpoints(toolsets))
                 model = model or self.cfg.codex_model
                 tid = await self._open(thread_id, config, model)
-                return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note,
-                                        on_step)
             except CodexServerError:
-                # The caller retries with `codex exec`, which writes to the thread on disk: the
-                # next turn here starts over and reloads it rather than using a stale copy.
-                await self._stop()
+                await self._recover(thread_id)
                 raise
+        try:
+            return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note,
+                                    on_step, key)
+        except CodexServerError:
+            async with self._lock:
+                await self._recover(tid)
+            raise
+
+    async def _recover(self, tid: str | None) -> None:
+        """After a server failure: the caller retries with `codex exec`, which writes to the thread
+        on disk, so the next turn here must reload it rather than use a stale copy. The server is
+        restarted, unless other turns are running on it: then only this thread is unloaded."""
+        if not self._turns or not self.running:
+            await self._stop()
+            return
+        if tid:
+            self._loaded.pop(tid, None)
+            try:
+                await self._request("thread/unsubscribe", {"threadId": tid})
+            except CodexServerError as e:
+                log.info("couldn't unload thread %s: %s", tid, e)
 
     async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str,
                     on_note: Callable[[str], None] | None = None,
-                    on_step: Callable[[str], None] | None = None) -> AgentResult:
+                    on_step: Callable[[str, str], None] | None = None, key: str = "") -> AgentResult:
         q: asyncio.Queue = asyncio.Queue()
         self._turns[tid] = q
+        if key:
+            self._keys[key] = tid
         messages: list[str] = []
         errors: list[str] = []
         servers: set[str] = set()
@@ -389,16 +417,20 @@ class CodexServer:
                 if p.get("turnId") not in (None, turn_id) and method != "turn/completed":
                     continue
                 item = p.get("item") or {}
-                if method == "item/started" and item.get("type") not in NOT_TOOLS:
+                tool = bool(item) and item.get("type") not in NOT_TOOLS
+                if tool and method == "item/started":
                     partial = True
                     if on_step:
-                        on_step(step_label(item))
+                        on_step(str(item.get("id")), step_label(item))
+                elif tool and method == "item/completed":
+                    if on_step:
+                        on_step(str(item.get("id")), "")
+                    if item.get("type") == "mcpToolCall":
+                        servers.add(item.get("server") or "")
                 elif method == "item/completed" and item.get("type") == "agentMessage":
                     messages.append(item.get("text", ""))
                     if on_note and item.get("phase") == "commentary":
                         on_note(item.get("text", ""))
-                elif method == "item/completed" and item.get("type") == "mcpToolCall":
-                    servers.add(item.get("server") or "")
                 elif method == "thread/tokenUsage/updated":
                     # The last model request's input: the context size (as agent.last_request_tokens).
                     tokens = int(((p.get("tokenUsage") or {}).get("last") or {}).get("inputTokens") or tokens)
@@ -424,16 +456,19 @@ class CodexServer:
             raise
         finally:
             self._turns.pop(tid, None)
+            if key and self._keys.get(key) == tid:
+                del self._keys[key]
         if errors:
             log.warning("codex errors: %s", errors)
         return AgentResult((messages[-1] if messages else "").strip(), tid, errors, servers, tokens)
 
-    def stop_turn(self) -> bool:
-        """Stop the running turn (the [Stop] button): it's interrupted and returns. False when no
-        turn has started yet."""
-        for q in self._turns.values():
+    def stop_turn(self, key: str) -> bool:
+        """Stop the turn run() was given this key for (the [Stop] button): it's interrupted and
+        returns. False when it hasn't started yet."""
+        q = self._turns.get(self._keys.get(key, ""))
+        if q:
             q.put_nowait(STOP)
-        return bool(self._turns)
+        return q is not None
 
     async def _interrupt(self, tid: str, turn_id: str, q: asyncio.Queue) -> None:
         """Stop a turn that ran too long; restart the server if it doesn't stop."""

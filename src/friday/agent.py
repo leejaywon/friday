@@ -77,7 +77,8 @@ the tool list first:
   When the user names a site or app to look at (a maps site, a site they use, a shop...) or asks you to
   do something on a website, use the browser; don't substitute web search. Pages are long: look
   things up with browser_find, or browser_snapshot with a target (or depth), rather than full
-  snapshots. When something visible isn't in the snapshot as a control (a player's play button, a
+  snapshots. Messages can be answered at the same time; only one turn has the browser. When a note
+  says it's busy and you need it, call use_tools("browser") and end your turn with "-". When something visible isn't in the snapshot as a control (a player's play button, a
   canvas, an icon), take a browser_take_screenshot, click it with browser_mouse_click_xy at its
   position in that screenshot, then take another screenshot to check it worked. Otherwise prefer
   snapshot refs: screenshots are slower and larger.
@@ -202,6 +203,9 @@ def github_read_token_var(cfg: Config) -> str | None:
 # costs ~10 tokens a turn); GitHub only once the conversation turned it on (use_tools). Friday's
 # own tools for the browser are hidden without it.
 TOOLSETS = ("browser", "github")
+# A browser tool call that hasn't answered by then fails, so the turn can go on (a mouse wheel on
+# a page that never goes idle hung for minutes). Friday's own tools wait longer (approvals).
+BROWSER_TOOL_TIMEOUT = 90
 FRIDAY_BROWSER_TOOLS = ["fill_login", "fill_login_field", "list_logins", "request_approval", "schedule_browser_run",
                         "start_browser_recording", "stop_browser_recording", "browser_recording_status",
                         "list_browser_recordings", "transcribe_browser_recording", "read_browser_transcript"]
@@ -223,7 +227,7 @@ def codex_overrides(
     cfg: Config,
     run_id: int | None = None,
     toolsets: frozenset[str] | set[str] = frozenset(),
-    chat: bool = False,
+    chat: bool | str = False,
     http: tuple[bool, bool] = (True, True),
     watch_id: int | None = None,
 ) -> dict[str, object]:
@@ -251,7 +255,9 @@ def codex_overrides(
         elif watch_id:  # a watch check: likewise its watch's logins, and it never asks
             headers[mcp_http.WATCH_HEADER] = str(watch_id)
         elif chat:
-            headers[mcp_http.CHAT_HEADER] = "1"
+            headers[mcp_http.CHAT_HEADER] = chat if isinstance(chat, str) else "1"  # the chat lane
+            if not browser_on:  # use_tools("browser") then waits for it (bot lanes)
+                headers[mcp_http.NO_BROWSER_HEADER] = "1"
         o["mcp_servers.friday.url"] = mcp_http.url(mcp_http.friday_port())
         o["mcp_servers.friday.bearer_token_env_var"] = mcp_http.TOKEN_VAR
         o["mcp_servers.friday.http_headers"] = headers
@@ -262,7 +268,9 @@ def codex_overrides(
         elif watch_id:
             env["FRIDAY_WATCH_ID"] = str(watch_id)
         elif chat:
-            env["FRIDAY_CHAT"] = "1"
+            env["FRIDAY_CHAT"] = chat if isinstance(chat, str) else "1"
+            if not browser_on:
+                env["FRIDAY_CHAT_NO_BROWSER"] = "1"
         o["mcp_servers.friday.command"] = sys.executable
         o["mcp_servers.friday.args"] = ["-m", "friday.mcp_server"]
         o["mcp_servers.friday.env"] = env
@@ -306,6 +314,7 @@ def codex_overrides(
             o["mcp_servers.playwright.args"] = pw[1:]
             o["mcp_servers.playwright.startup_timeout_sec"] = 60  # npx (no deploy.sh install) may download first
         o["mcp_servers.playwright.disabled_tools"] = browser.BLOCKED_TOOLS
+        o["mcp_servers.playwright.tool_timeout_sec"] = BROWSER_TOOL_TIMEOUT
         o["mcp_servers.playwright.default_tools_approval_mode"] = "approve"
     extra = mcp_config.load(cfg.mcp_config)
     if extra.problems:
@@ -344,7 +353,7 @@ def codex_args(
     effort: str = "",
     run_id: int | None = None,
     toolsets: frozenset[str] | set[str] = frozenset(),
-    chat: bool = False,
+    chat: bool | str = False,
     http: tuple[bool, bool] = (True, True),
     watch_id: int | None = None,
 ) -> list[str]:
@@ -419,7 +428,7 @@ async def run_codex(
     effort: str = "",
     run_id: int | None = None,
     toolsets: frozenset[str] | set[str] = frozenset(),
-    chat: bool = False,
+    chat: bool | str = False,
     watch_id: int | None = None,
     tz: str = "",
 ) -> AgentResult:
@@ -562,7 +571,7 @@ async def run_claude(
     effort: str = "",
     run_id: int | None = None,
     toolsets: frozenset[str] | set[str] = frozenset(),
-    chat: bool = False,
+    chat: bool | str = False,
     watch_id: int | None = None,
     tz: str = "",
 ) -> AgentResult:

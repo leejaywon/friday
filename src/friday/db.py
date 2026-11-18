@@ -607,12 +607,9 @@ class Store:
         row = self.conn.execute("SELECT job_id FROM job_messages WHERE message_id = ?", (message_id,)).fetchone()
         return row["job_id"] if row else None
 
-    def fail_interrupted_jobs(self) -> list[int]:
-        """Jobs left 'running' by a restart can't be resumed mid-run; mark them failed."""
-        ids = [r["id"] for r in self.conn.execute("SELECT id FROM jobs WHERE status = 'running'")]
-        for jid in ids:
-            self.update_job(jid, status="failed", error="Friday restarted while this job was running.")
-        return ids
+    def interrupted_jobs(self) -> list[int]:
+        """Jobs left 'running' by a restart (bot.jobs_startup starts them again)."""
+        return [r["id"] for r in self.conn.execute("SELECT id FROM jobs WHERE status = 'running' ORDER BY id")]
 
     # --- proposals (items the user confirms with a tap) -------------------
 

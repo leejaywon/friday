@@ -9,6 +9,9 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/friday/.venv/bin/friday bot
 Restart=always
 RestartSec=5
+# SIGTERM goes to Friday only, so it can stop coding jobs' agents itself and leave them 'running'
+# for the next start to resume (with the default, the agents were killed first and the job failed).
+KillMode=mixed
 
 [Install]
 WantedBy=default.target

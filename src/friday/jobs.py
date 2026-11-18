@@ -376,6 +376,13 @@ class Runner:
         self.store = store
         self.git = Git(cfg.github_code_token)
         self.gh = GitHub(cfg.github_code_token)
+        # Jobs run at the same time (bot.MAX_JOBS). Per project: git setup in the shared clone
+        # (clone, fetch, worktree add/remove) one at a time, and a local project, changed in
+        # place, one job at a time.
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def lock(self, repo: str) -> asyncio.Lock:
+        return self._locks.setdefault(self.repo_dir(repo).name, asyncio.Lock())
 
     @property
     def jobs_dir(self) -> Path:
@@ -442,9 +449,16 @@ class Runner:
 
     async def execute(self, job) -> Outcome:
         """Run a queued job (first run or follow-up) to the point where the user decides."""
+        resuming = bool(job["followup"] and job["worktree"] and Path(job["worktree"]).exists())
+        async with self.lock(job["repo"]):
+            pl = await self.place(job)
+        if pl.local:
+            async with self.lock(job["repo"]):
+                return await self._execute(job, pl, resuming)
+        return await self._execute(job, pl, resuming)
+
+    async def _execute(self, job, pl: Place, resuming: bool) -> Outcome:
         jid, followup = job["id"], job["followup"]
-        resuming = bool(followup and job["worktree"] and Path(job["worktree"]).exists())
-        pl = await self.place(job)
         prompt = followup if resuming else job["task"] + (f"\n\nAlso: {followup}" if followup else "")
         self.store.update_job(jid, worktree=str(pl.workdir), branch=pl.branch, base=pl.base,
                               gh_repo=pl.slug, followup=None)
@@ -503,6 +517,10 @@ class Runner:
 
     async def undo(self, job) -> None:
         """Revert a local job's commits, newest first, as new commits (history keeps both)."""
+        async with self.lock(job["repo"]):  # not while another job changes the folder
+            await self._undo(job)
+
+    async def _undo(self, job) -> None:
         path = Path(job["worktree"])
         if await self.git("status", "--porcelain", cwd=path):
             await self.commit(path, f"Save uncommitted work before undoing Friday job #{job['id']}")
@@ -518,7 +536,8 @@ class Runner:
         await self.gh.delete_branch(job["gh_repo"], job["branch"])
         await self.cleanup(job)
         try:  # keep the main clone current, but never touch work in progress there
-            await self.git("pull", "-q", "--ff-only", cwd=self.repo_dir(job["repo"]), timeout=300, auth=True)
+            async with self.lock(job["repo"]):
+                await self.git("pull", "-q", "--ff-only", cwd=self.repo_dir(job["repo"]), timeout=300, auth=True)
         except JobError as e:
             log.info("pull after merge skipped: %s", e)
 
@@ -534,8 +553,9 @@ class Runner:
         if not wt or not Path(wt).exists() or not Path(wt).resolve().is_relative_to(self.jobs_dir.resolve()):
             return
         try:
-            await self.git("worktree", "remove", "--force", wt, cwd=self.repo_dir(job["repo"]))
-            await self.git("branch", "-D", job["branch"], cwd=self.repo_dir(job["repo"]))
+            async with self.lock(job["repo"]):
+                await self.git("worktree", "remove", "--force", wt, cwd=self.repo_dir(job["repo"]))
+                await self.git("branch", "-D", job["branch"], cwd=self.repo_dir(job["repo"]))
         except JobError as e:
             log.warning("cleanup of job %s: %s", job["id"], e)
             shutil.rmtree(wt, ignore_errors=True)

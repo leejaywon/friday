@@ -176,7 +176,7 @@ def test_codex_args_attach_optional_toolsets_only_when_on(cfg):
     cfg = replace(cfg, github_token_set=True, browser_enabled=True)
     ov = _overrides(codex_args(cfg, None, [], chat=True))
     assert any(o.startswith("mcp_servers.friday.url=") for o in ov)
-    assert 'mcp_servers.friday.http_headers={"X-Friday-Chat" = "1"}' in ov
+    assert 'mcp_servers.friday.http_headers={"X-Friday-Chat" = "1", "X-Friday-No-Browser" = "1"}' in ov
     assert not any(o.startswith(("mcp_servers.github", "mcp_servers.playwright")) for o in ov)
     hidden = next(o for o in ov if o.startswith("mcp_servers.friday.disabled_tools="))
     assert '"fill_login"' in hidden and '"request_approval"' in hidden and "use_tools" not in hidden

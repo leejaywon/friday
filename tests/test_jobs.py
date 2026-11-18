@@ -66,8 +66,7 @@ def test_job_lifecycle(store):
     store.link_job_message(100, b)  # a message belongs to one job
     assert store.job_for_message(100) == b
 
-    assert store.fail_interrupted_jobs() == [a]
-    assert store.job(a)["status"] == "failed" and store.job(b)["status"] == "queued"
+    assert store.interrupted_jobs() == [a]
     with pytest.raises(ValueError):  # field names go into SQL: only known ones
         store.update_job(a, **{"status = 'merged', task": "x"})
 

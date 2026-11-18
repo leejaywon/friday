@@ -91,29 +91,41 @@ def _in_chat(ctx: Context | None) -> bool:
     return bool(_context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")) and not _run_id(ctx)
 
 
-TOOLSETS = ("github",)  # the browser is always attached in chat (bot.Friday._toolsets)
+TOOLSETS = ("github",)  # the browser is attached in chat unless another turn has it (bot lanes)
+
+
+def _lane(ctx: Context | None) -> str:
+    """The chat lane a call comes from (bot.Friday lanes): "1" is the main conversation."""
+    return _context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT") or "1"
 
 
 @server.tool()
-def use_tools(toolset: str, reason: str = "") -> str:
+def use_tools(toolset: str, reason: str = "", ctx: Context | None = None) -> str:
     """Turn on the 'github' toolset (the user's GitHub repos, issues and pull requests) for the
-    rest of this conversation. The tools are attached right after this turn and you are
-    continued automatically: call this as soon as you know you need them, then end your turn,
-    writing nothing but "-". The browser needs no turning on: its tools are already there.
+    rest of this conversation, or get the browser when another request has it ('browser'). The
+    tools are attached right after this turn and you are continued automatically: call this as
+    soon as you know you need them, then end your turn, writing nothing but "-".
 
     reason: a few words on what you need them for.
     """
     name = toolset.strip().lower()
+    key = mcp_http.toolsets_key(_lane(ctx))
     if name == "browser":
-        return ("The browser tools (mcp__playwright__*) are already attached" if cfg.browser_enabled
-                else "The browser is turned off on this server (FRIDAY_BROWSER=false).")
+        if not cfg.browser_enabled:
+            return "The browser is turned off on this server (FRIDAY_BROWSER=false)."
+        if not _context(ctx, mcp_http.NO_BROWSER_HEADER, "FRIDAY_CHAT_NO_BROWSER"):
+            return "The browser tools (mcp__playwright__*) are already attached."
+        on = set(json.loads(store.get(key) or "[]")) | {"browser"}
+        store.set(key, json.dumps(sorted(on)))
+        return ("Another request is using the browser. End your turn now, writing nothing but \"-\"; "
+                "you'll be continued with the browser as soon as it's free.")
     if name not in TOOLSETS:
         return f"Unknown toolset '{toolset}'. Toolsets: {', '.join(TOOLSETS)}."
     if name == "github" and not (cfg.github_token_set or cfg.github_code_token):
         return "GitHub isn't connected (no GITHUB_TOKEN on the server)."
-    on = set(json.loads(store.get("toolsets") or "[]"))
+    on = set(json.loads(store.get(key) or "[]"))
     on.add(name)
-    store.set("toolsets", json.dumps(sorted(on)))
+    store.set(key, json.dumps(sorted(on)))
     return (f"The {name} tools will be available in a moment. End your turn now, writing nothing but "
             "\"-\"; you'll be continued automatically with them attached.")
 
@@ -701,9 +713,10 @@ SENT = ("Sent to the user. When they answer you'll be continued automatically wi
         "end your turn now, writing nothing but \"-\" unless you have something else to tell them.")
 
 
-def _follow_up(kind: str, rid: int, tool: str) -> None:
-    """Mark a request the bot continues the chat thread for when it's answered (bot._request_done)."""
-    store.set(f"followup:{kind}:{rid}", json.dumps({"tool": tool, "at": tu.to_utc_iso(tu.now_utc())}))
+def _follow_up(kind: str, rid: int, tool: str, ctx: Context | None = None) -> None:
+    """Mark a request the bot continues the chat lane's thread for when it's answered (bot._request_done)."""
+    store.set(f"followup:{kind}:{rid}", json.dumps({"tool": tool, "at": tu.to_utc_iso(tu.now_utc()),
+                                                     "lane": _lane(ctx)}))
 
 
 async def _ask(kind: str, text: str, screenshot: Path | None = None) -> str:
@@ -829,7 +842,7 @@ async def _run_form(spec: dict, kind: str = "form", name: str = "", domain: str 
     wait: ('sent', {}), and the bot continues the thread with the answer."""
     rid = store.add_login_request(name, domain, spec["description"], kind=kind, spec=spec)
     if _in_chat(ctx):
-        _follow_up("login", rid, tool)
+        _follow_up("login", rid, tool, ctx)
         store.queue("login_request", text=str(rid))
         return "sent", {}
     store.queue("login_request", text=str(rid))
@@ -934,7 +947,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
     text = f"✋ {summary}" + (f"\n{url}" if url else "")
     if _in_chat(ctx):
         aid = store.add_approval("action", text)
-        _follow_up("approval", aid, "request_approval")
+        _follow_up("approval", aid, "request_approval", ctx)
         store.queue("approval", text=str(aid), path=str(shot) if url else None)
         return SENT
     status = await _ask("action", text, shot if url else None)

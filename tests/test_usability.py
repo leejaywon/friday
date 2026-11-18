@@ -1,10 +1,11 @@
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from friday import timeutil as tu
-from friday.agent import codex_args
+from friday.agent import AgentResult
 from friday.bot import Friday, plain_text
 
 
@@ -41,13 +42,34 @@ def test_markdown_becomes_plain_text():
                       "[https://a.kr](https://a.kr)") == "영업시간: 07:00~22:00 네이버 지도 https://map.naver.com/p/x https://a.kr"
 
 
-def test_chat_turns_always_have_the_browser(cfg, tools, store):
+def test_messages_run_at_once_and_one_turn_has_the_browser(cfg, tools, monkeypatch):
     bot = Friday(replace(cfg, browser_enabled=True))
-    assert bot._toolsets() == {"browser"}
-    ov = codex_args(bot.cfg, None, [], toolsets=bot._toolsets(), chat=True)
-    assert any(o.startswith("mcp_servers.playwright.url=") for o in ov)
-    assert "already attached" in tools.use_tools("browser") and store.get("toolsets") is None
-    assert not Friday(replace(cfg, browser_enabled=False))._toolsets()
+    monkeypatch.setattr(tools, "store", bot.store)
+    runs = []
+
+    async def codex_turn(prompt, thread, images, toolsets, status=None, lane="1"):
+        runs.append((lane, "browser" in toolsets, "browser is busy" in prompt))
+        if lane == "2" and len(runs) == 2:  # the second message asks for the browser, which the first has
+            assert "already attached" not in tools.use_tools("browser", ctx=SimpleNamespace(
+                headers={"X-Friday-Chat": "2", "X-Friday-No-Browser": "1"}))
+            return AgentResult("-", f"t{lane}", [])
+        await asyncio.sleep(0.05)
+        return AgentResult(f"done {lane}", f"t{lane}", [])
+
+    async def nothing(*a, **k):
+        pass
+
+    bot._codex_turn, bot.say, bot._keep_typing, bot.outbox_loop = codex_turn, nothing, nothing, nothing
+
+    async def go():
+        await asyncio.gather(bot.ask(1, "look this up on the website"), bot.ask(1, "and check that one too"))
+
+    asyncio.run(go())
+    # Both started at once; the second waited for the browser only after asking for it.
+    assert runs[:2] == [("1", True, False), ("2", False, True)] and runs[2] == ("2", True, False)
+    assert bot.lanes["2"].thread == "t2" and not bot.browser_lock.locked()
+    assert "done 2" in bot.store.get("meanwhile")  # the main conversation hears about it
+    bot.store.close()
 
 
 def test_new_instructions_start_a_fresh_thread_with_the_last_exchange(cfg, store):
@@ -56,7 +78,7 @@ def test_new_instructions_start_a_fresh_thread_with_the_last_exchange(cfg, store
     bot.store.set("thread_id", "t1")
     bot._note_exchange("안녕", "안녕!")
     turns = []
-    bot._turn = lambda chat, text, files, images: turns.append(bot._current_thread()) or asyncio.sleep(0)
+    bot._turn = lambda chat, text, files, images, lane: turns.append(bot._current_thread()) or asyncio.sleep(0)
     asyncio.run(bot.ask(1, "다음"))
     cfg.instructions_path.write_text(cfg.instructions_path.read_text() + "\n- new rule")
     asyncio.run(bot.ask(1, "다음"))
@@ -64,10 +86,10 @@ def test_new_instructions_start_a_fresh_thread_with_the_last_exchange(cfg, store
 
 
 def test_status_message_grows_a_stop_button_and_shrinks_back():
-    from friday.bot import STOP_BUTTON, TurnStatus
+    from friday.bot import TurnStatus, stop_button
 
-    async def turn(seconds, stopped=False):
-        shown, gone = [], []
+    async def turn(seconds, stopped=False, step_done=True):
+        shown, alerts = [], []
 
         async def send(text, stop):
             shown.append((text, stop))
@@ -76,22 +98,25 @@ def test_status_message_grows_a_stop_button_and_shrinks_back():
         async def edit(msg_id, text, stop):
             shown.append((text, stop))
 
-        status = TurnStatus(send, edit, lambda m: gone.append(m) or asyncio.sleep(0),
-                            note_after=0.05, status_after=0.1, every=10, tick=0.01)
+        status = TurnStatus(send, edit, lambda m: asyncio.sleep(0), alert=lambda t: alerts.append(t) or asyncio.sleep(0),
+                            note_after=0.05, status_after=0.1, every=10, stuck_after=0.15, tick=0.01)
         status.note("확인해볼게.")
         status.note("페이지를 여는 중이야.")
-        status.on_step("browser: click")
+        status.on_step("i1", "browser: click")
+        if step_done:
+            status.on_step("i1", "")
         await asyncio.sleep(seconds)
         await status.finish(stopped)
-        return shown, gone
+        return shown, alerts
 
     assert asyncio.run(turn(0.01)) == ([], [])  # quick answers stay one message
-    shown, _ = asyncio.run(turn(0.2))
+    shown, alerts = asyncio.run(turn(0.2))
     assert shown == [("페이지를 여는 중이야.", False), ("페이지를 여는 중이야.\n\n⏳ 0:00 · browser: click", True),
-                     ("페이지를 여는 중이야.", False)]
-    shown, _ = asyncio.run(turn(0.2, stopped=True))
+                     ("페이지를 여는 중이야.", False)] and not alerts
+    shown, alerts = asyncio.run(turn(0.2, stopped=True, step_done=False))  # a click that never answers
+    assert "⚠️ browser: click: no answer" in shown[-2][0] and len(alerts) == 1 and "browser: click" in alerts[0]
     assert shown[-1] == ("페이지를 여는 중이야.\n\n⏹ Stopped after 0:00", False)
-    assert STOP_BUTTON.inline_keyboard[0][0].callback_data == "turn:stop"
+    assert stop_button("2").inline_keyboard[0][0].callback_data == "turn:stop:2"
 
 
 def test_tree_leaves_out_ignored_files_and_folds_deep_folders(tmp_path):
