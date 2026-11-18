@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from friday import jobs
-from friday.jobs import RunResult, Runner, agent_env, github_slug, parse_claude, parse_code_args
+from friday.jobs import RunResult, Runner, agent_env, github_slug, job_step, parse_claude, parse_code_args, run
 
 
 def test_parse_code_args():
@@ -52,6 +52,23 @@ def test_parse_claude():
     assert (r.text, r.session_id, r.errors) == ("Fixed it.", "abc", [])
     r = parse_claude("Traceback: boom")
     assert r.errors and not r.text
+
+
+def test_job_steps_stream():
+    """A job's streamed output: each line's step reaches the caller as it comes, and the stream's
+    result event is the job's answer."""
+    tool = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Edit", "input": {"file_path": "/w/src/app.py"}}]}}
+    bash = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash",
+                                                          "input": {"command": "pytest -q"}}]}}
+    result = {"type": "result", "is_error": False, "result": "Done.", "session_id": "s9"}
+    lines = [json.dumps(x) for x in (tool, {"type": "user"}, bash, result)]
+    seen = []
+    code, out, _ = asyncio.run(run(["printf", "%s\\n", *lines], on_line=seen.append))
+    assert code == 0 and [job_step("claude", x) for x in seen][:3] == ["Edit app.py", None, "$ pytest -q"]
+    assert parse_claude(out).session_id == "s9"
+    started = {"type": "item.started", "item": {"type": "command_execution", "command": "npm test"}}
+    assert job_step("codex", json.dumps(started)) == "$ npm test"
 
 
 def test_job_lifecycle(store):

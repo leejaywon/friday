@@ -21,6 +21,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
@@ -37,6 +38,7 @@ REPO_ARG = re.compile(rf"^(?:{_NAME}/)?{_NAME}$")
 GITHUB_REMOTE = re.compile(r"github[^:/]*[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$", re.I)
 GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]  # nothing in a repo runs code
 FRIDAY_GIT_ID = ["-c", "user.name=Friday", "-c", "user.email=friday@localhost"]
+LINE_LIMIT = 1 << 25  # stream-json lines carry whole tool results
 SECRET_ENV = re.compile(r"TOKEN|SECRET|KEY|PASSWORD|PASSWD|CREDENTIAL", re.I)
 
 AGENT_RULES = """\
@@ -108,17 +110,37 @@ def short(text: str, limit: int = 60) -> str:
 
 
 async def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None,
-              stdin: str | None = None, timeout: float = 300) -> tuple[int, str, str]:
+              stdin: str | None = None, timeout: float = 300,
+              on_line: Callable[[str], None] | None = None) -> tuple[int, str, str]:
+    """Run a command; with on_line, each line of its output is passed on as it comes."""
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, env=env,
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True,  # so a timeout or /stop can kill the whole process group
+        limit=LINE_LIMIT,
     )
+
+    async def talk() -> tuple[bytes, bytes]:
+        if on_line is None:
+            return await proc.communicate(stdin.encode() if stdin is not None else None)
+        if stdin is not None:
+            proc.stdin.write(stdin.encode())  # type: ignore[union-attr]
+            await proc.stdin.drain()  # type: ignore[union-attr]
+            proc.stdin.close()  # type: ignore[union-attr]
+        err = asyncio.create_task(proc.stderr.read())  # type: ignore[union-attr]
+        out = []
+        async for raw in proc.stdout:  # type: ignore[union-attr]
+            out.append(raw)
+            try:
+                on_line(raw.decode(errors="replace"))
+            except Exception:
+                log.exception("on_line failed")
+        await proc.wait()
+        return b"".join(out), await err
+
     try:
-        out, err = await asyncio.wait_for(
-            proc.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
-        )
+        out, err = await asyncio.wait_for(talk(), timeout=timeout)
     except (TimeoutError, asyncio.CancelledError):
         _kill(proc)
         await proc.wait()
@@ -273,7 +295,8 @@ def claude_cmd(cfg: Config, prompt_rules: str, session_id: str | None,
         "disableClaudeAiConnectors": True,
     }
     cmd = [
-        cfg.claude_bin, "-p", "--output-format", "json",
+        # stream-json (it needs --verbose) so the job's message can show what the agent is doing.
+        cfg.claude_bin, "-p", "--output-format", "stream-json", "--verbose",
         # Edits inside the worktree go through; anything that would ask (edits elsewhere,
         # WebFetch...) is denied, since nobody is there to answer.
         "--permission-mode", "acceptEdits", "--permission-prompts", "none",
@@ -309,11 +332,17 @@ def codex_cmd(cfg: Config, workdir: Path, session_id: str | None, keep: tuple[Pa
 
 
 def parse_claude(stdout: str) -> RunResult:
-    try:
-        data = json.loads(stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
-        data = None
-    if not isinstance(data, dict):  # e.g. --verbose prints a JSON array
+    """The result event of `claude -p --output-format stream-json` (or the one object of json)."""
+    data = None
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict) and ev.get("type", "result") == "result":
+            data = ev
+            break
+    if data is None:
         return RunResult(errors=[f"unexpected Claude output: {stdout.strip()[-300:]}"])
     res = RunResult(text=str(data.get("result") or "").strip(), session_id=data.get("session_id"))
     if data.get("is_error"):
@@ -321,8 +350,48 @@ def parse_claude(stdout: str) -> RunResult:
     return res
 
 
+def _what(tool: str, args: dict) -> str:
+    for key in ("file_path", "path", "command", "pattern", "url", "query", "description"):
+        if isinstance(args.get(key), str) and args[key]:
+            v = args[key]
+            return Path(v).name if key in ("file_path", "path") else v
+    return ""
+
+
+def job_step(engine: str, line: str) -> str | None:
+    """What the agent is doing, from one line of its streamed output: 'Edit app.py',
+    '$ pytest -q', or what it said. None for lines that say nothing new."""
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(ev, dict):
+        return None
+    step = None
+    if engine == "claude" and ev.get("type") == "assistant":
+        for block in (ev.get("message") or {}).get("content") or []:
+            if block.get("type") == "tool_use":
+                args = block.get("input") if isinstance(block.get("input"), dict) else {}
+                name = str(block.get("name", ""))
+                step = ("$ " + _what(name, args)) if name == "Bash" else f"{name} {_what(name, args)}".strip()
+            elif block.get("type") == "text" and block.get("text", "").strip():
+                step = "💬 " + block["text"]
+    elif engine == "codex" and ev.get("type") in ("item.started", "item.completed"):
+        item = ev.get("item") or {}
+        kind = item.get("type")
+        if kind == "command_execution" and ev["type"] == "item.started":
+            step = "$ " + str(item.get("command", ""))
+        elif kind == "file_change" and ev["type"] == "item.completed":
+            names = [Path(c.get("path", "")).name for c in item.get("changes") or [] if isinstance(c, dict)]
+            step = "Edit " + ", ".join(n for n in names if n)
+        elif kind == "agent_message" and ev["type"] == "item.completed" and item.get("text", "").strip():
+            step = "💬 " + item["text"]
+    return short(step, 160) if step else None
+
+
 async def run_agent(cfg: Config, engine: str, workdir: Path, prompt: str, rules: str,
-                    session_id: str | None, keep: tuple[Path, ...] = ()) -> RunResult:
+                    session_id: str | None, keep: tuple[Path, ...] = (),
+                    on_step: Callable[[str], None] | None = None) -> RunResult:
     keep = (workdir, *keep)
     if engine == "claude":
         cmd, stdin = claude_cmd(cfg, rules, session_id, keep), prompt
@@ -330,8 +399,13 @@ async def run_agent(cfg: Config, engine: str, workdir: Path, prompt: str, rules:
         cmd = codex_cmd(cfg, workdir, session_id, keep)
         stdin = prompt if session_id else f"{rules}\n---\n{prompt}"
     try:
+        on_line = None
+        if on_step:
+            def on_line(line: str) -> None:
+                if step := job_step(engine, line):
+                    on_step(step)
         code, out, err = await run(cmd, cwd=workdir, env=agent_env(), stdin=stdin,
-                                   timeout=cfg.code_job_timeout_seconds)
+                                   timeout=cfg.code_job_timeout_seconds, on_line=on_line)
     except TimeoutError:
         return RunResult(session_id=session_id,
                          errors=[f"stopped after {cfg.code_job_timeout_seconds // 60} minutes"])
@@ -447,17 +521,18 @@ class Runner:
         await self.git("worktree", "add", "-q", "-B", branch, str(worktree), f"origin/{base}", cwd=repo_dir)
         return Place(worktree, repo_dir, branch, base, slug)
 
-    async def execute(self, job) -> Outcome:
-        """Run a queued job (first run or follow-up) to the point where the user decides."""
+    async def execute(self, job, on_step: Callable[[str], None] | None = None) -> Outcome:
+        """Run a queued job (first run or follow-up) to the point where the user decides.
+        on_step hears what the agent is doing as it works."""
         resuming = bool(job["followup"] and job["worktree"] and Path(job["worktree"]).exists())
         async with self.lock(job["repo"]):
             pl = await self.place(job)
         if pl.local:
             async with self.lock(job["repo"]):
-                return await self._execute(job, pl, resuming)
-        return await self._execute(job, pl, resuming)
+                return await self._execute(job, pl, resuming, on_step)
+        return await self._execute(job, pl, resuming, on_step)
 
-    async def _execute(self, job, pl: Place, resuming: bool) -> Outcome:
+    async def _execute(self, job, pl: Place, resuming: bool, on_step=None) -> Outcome:
         jid, followup = job["id"], job["followup"]
         prompt = followup if resuming else job["task"] + (f"\n\nAlso: {followup}" if followup else "")
         self.store.update_job(jid, worktree=str(pl.workdir), branch=pl.branch, base=pl.base,
@@ -473,7 +548,7 @@ class Runner:
             after = "Friday commits your changes and opens the pull request after you finish."
         rules = AGENT_RULES.format(where=where, after=after)
         res = await run_agent(self.cfg, job["engine"], pl.workdir, prompt, rules, job["session_id"],
-                              keep=(pl.repo_dir,))
+                              keep=(pl.repo_dir,), on_step=on_step)
         self.store.update_job(jid, session_id=res.session_id, summary=res.text or None)
         if res.errors and not res.text:
             raise JobError("; ".join(res.errors))

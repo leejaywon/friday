@@ -41,7 +41,7 @@ class Config:
     code_dir: Path = Path.home() / "code"
     code_engine: str = "claude"  # claude | codex
     claude_bin: str = "claude"
-    code_job_timeout_seconds: int = 3600
+    code_job_timeout_seconds: int = 4 * 3600  # long work projects run for hours
     # Write token for pushing branches and opening PRs. Kept out of os.environ (see load_config)
     # so neither the chat agent nor the coding agents can see it.
     github_code_token: str = field(default="", repr=False)
@@ -207,7 +207,7 @@ def load_config() -> Config:
         code_dir=Path(os.environ.get("CODE_DIR") or Path.home() / "code").expanduser(),
         code_engine=(os.environ.get("CODE_ENGINE", "claude").strip().lower() or "claude"),
         claude_bin=os.environ.get("CLAUDE_BIN", "claude"),
-        code_job_timeout_seconds=int(_setting("CODE_JOB_TIMEOUT_SECONDS", "3600")),
+        code_job_timeout_seconds=int(_setting("CODE_JOB_TIMEOUT_SECONDS", "14400")),
         github_code_token=os.environ.pop("GITHUB_CODE_TOKEN", "").strip(),
         transcribe_provider=transcribe_provider,
         transcribe_model=os.environ.get("TRANSCRIBE_MODEL", "").strip(),

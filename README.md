@@ -176,9 +176,16 @@ on every message, so no restart is needed; `/status` shows what loaded. Tokens g
 - Local projects (no GitHub remote): the agent changes the folder itself, and the result has an
   ↩️ Undo button that reverts the job's commits.
 
-Jobs run one at a time and stop after `CODE_JOB_TIMEOUT_SECONDS` (1 hour). The agents run in a
-sandbox: they write only in the project, reach only GitHub, PyPI and npm, and can't read `.env`,
-Friday's data, SSH keys or the agents' logins.
+Up to `CODING_JOBS` jobs run at once, each stopping after `CODE_JOB_TIMEOUT_SECONDS` (4 hours).
+While one runs, its message shows the minutes so far and the agent's latest step, with a ⏹ Stop
+button. The agents run in a sandbox: they write only in the project, reach only GitHub, PyPI and
+npm, and can't read `.env`, Friday's data, SSH keys or the agents' logins.
+
+**From the laptop**: in the Claude desktop app, add an SSH connection to the server and open a
+session in a project folder under `~/code` (or a job's worktree, which the job's message names).
+`/resume` there lists the Claude Code jobs that ran in that folder, so you can carry on a job's
+conversation by hand. Don't work in a local project's folder from the laptop while a job is
+changing it.
 
 **Passwords**: Friday refuses to save passwords, keys, card or ID numbers, both by instruction
 and by a check inside its tools. Website logins go only in the vault.
