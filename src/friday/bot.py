@@ -336,6 +336,9 @@ class Friday(WatchBot):
         self._lane_free = asyncio.Condition()  # a lane's turn ended (messages wait when all are busy)
         # The shared browser, one chat turn or scheduled run at a time (two would drive the same tabs).
         self.browser_lock = asyncio.Lock()
+        # outbox_loop runs on its timer and after each turn: one at a time, or a row still being
+        # sent (a file upload) was sent again by the other.
+        self._outbox_lock = asyncio.Lock()
         self._browser_topic = ""
         # Chat turns' Codex: one app-server process, started on the first message (codex_server.py)
         self.codex = CodexServer(cfg) if cfg.codex_server and cfg.chat_engine == "codex" else None
@@ -2115,30 +2118,31 @@ class Friday(WatchBot):
         return 15 if nxt is None else min(15, max(0.5, (nxt - tu.now_utc()).total_seconds() + 0.05))
 
     async def outbox_loop(self) -> float:
-        for row in self.store.pending_outbox():
-            if row["kind"] == "file":
-                path = Path(row["path"])
-                if path.is_file():
-                    problem = await self._send_path(path, row["text"])
-                    if problem:
-                        await self.say(f"⚠️ {problem}")
-            elif row["kind"] == "proposal":
-                await self._send_proposal(int(row["text"]))
-            elif row["kind"] == "approval":  # text holds the approval id, path an optional screenshot
-                await self._send_approval(int(row["text"]), row["path"])
-            elif row["kind"] == "login_request":  # text holds the login request id
-                await self._send_login_request(int(row["text"]))
-            elif row["kind"] == "login_expired":  # request_form / request_code gave up waiting
-                await self._close_login_request(int(row["text"]), "⌛ This request timed out")
-            elif row["kind"] == "html":  # show_tree: already escaped, too long ones split as plain text
-                if len(row["text"]) <= TELEGRAM_LIMIT:
-                    await self.app.bot.send_message(self.owner, row["text"], parse_mode="HTML")  # type: ignore[union-attr]
-                else:
-                    await self.say(html.unescape(re.sub(r"<[^>]+>", "", row["text"])))
-            elif row["text"]:
-                await self.say(row["text"])
-            self.store.mark_sent(row["id"])
-        return 3
+        async with self._outbox_lock:
+            for row in self.store.pending_outbox():
+                if row["kind"] == "file":
+                    path = Path(row["path"])
+                    if path.is_file():
+                        problem = await self._send_path(path, row["text"])
+                        if problem:
+                            await self.say(f"⚠️ {problem}")
+                elif row["kind"] == "proposal":
+                    await self._send_proposal(int(row["text"]))
+                elif row["kind"] == "approval":  # text holds the approval id, path an optional screenshot
+                    await self._send_approval(int(row["text"]), row["path"])
+                elif row["kind"] == "login_request":  # text holds the login request id
+                    await self._send_login_request(int(row["text"]))
+                elif row["kind"] == "login_expired":  # request_form / request_code gave up waiting
+                    await self._close_login_request(int(row["text"]), "⌛ This request timed out")
+                elif row["kind"] == "html":  # show_tree: already escaped, too long ones split as plain text
+                    if len(row["text"]) <= TELEGRAM_LIMIT:
+                        await self.app.bot.send_message(self.owner, row["text"], parse_mode="HTML")  # type: ignore[union-attr]
+                    else:
+                        await self.say(html.unescape(re.sub(r"<[^>]+>", "", row["text"])))
+                elif row["text"]:
+                    await self.say(row["text"])
+                self.store.mark_sent(row["id"])
+            return 3
 
     async def calendar_loop(self) -> float:
         if not gcal.is_connected(self.cfg.google_token):

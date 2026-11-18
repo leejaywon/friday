@@ -60,3 +60,22 @@ def test_message_typed_during_the_wait_takes_the_files(friday):
     [(prompt, images)] = friday.runs  # one reply, not two
     assert "what do you think about that?" in prompt and rel in prompt
     assert images == [friday.cfg.workspace / rel]
+
+
+def test_a_file_in_the_outbox_is_sent_once(friday, tmp_path):
+    path = tmp_path / "shot.png"
+    path.write_bytes(b"x")
+    friday.store.queue("file", text="screen", path=str(path))
+    sent = []
+
+    async def send_path(p, caption=None, chat_id=None):
+        sent.append(p)
+        await asyncio.sleep(0.05)  # an upload takes a while
+
+    friday._send_path = send_path
+
+    async def go():  # the timer and the end of a turn at the same time
+        await asyncio.gather(botmod.Friday.outbox_loop(friday), botmod.Friday.outbox_loop(friday))
+
+    asyncio.run(go())
+    assert sent == [path]
