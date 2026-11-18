@@ -106,7 +106,8 @@ def test_tree_leaves_out_ignored_files_and_folds_deep_folders(tmp_path):
     (root / ".gitignore").write_text("node_modules/\n")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     plain, msg = show(root, depth=2)
-    assert "node_modules" not in plain and "utils/  (2 files)" in plain and "README.md" in plain
+    assert "node_modules" not in plain and "utils/" in plain and "README.md" in plain
+    assert "a.py" not in plain and "deep/" not in plain
     assert msg.startswith("<b>") and "<pre>app/\n" in msg
 
 
