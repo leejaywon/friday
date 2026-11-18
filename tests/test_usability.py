@@ -59,16 +59,35 @@ def test_messages_run_at_once_and_one_turn_has_the_browser(cfg, tools, monkeypat
     async def nothing(*a, **k):
         pass
 
-    bot._codex_turn, bot.say, bot._keep_typing, bot.outbox_loop = codex_turn, nothing, nothing, nothing
+    async def light(prompt, timeout=45):  # the small model that routes messages
+        return "1" if "the photo" in prompt else "new"
+
+    steered, said = [], []
+
+    async def steer(key, text, images):
+        steered.append((key, text))
+        return True
+
+    async def say(text, chat_id=None):
+        said.append(text)
+
+    bot._codex_turn, bot.say, bot._keep_typing, bot.outbox_loop, bot._light = codex_turn, say, nothing, nothing, light
+    bot.codex = SimpleNamespace(steer=steer)
 
     async def go():
-        await asyncio.gather(bot.ask(1, "look this up on the website"), bot.ask(1, "and check that one too"))
+        first = asyncio.create_task(bot.ask(1, "look this up on the website"))
+        await asyncio.sleep(0)
+        await asyncio.gather(bot.ask(1, "and check that one too"), bot.ask(1, "here's the photo for it"))
+        await first
 
     asyncio.run(go())
-    # Both started at once; the second waited for the browser only after asking for it.
+    # Both requests started at once; the second waited for the browser only after asking for it.
     assert runs[:2] == [("1", True, False), ("2", False, True)] and runs[2] == ("2", True, False)
     assert bot.lanes["2"].thread == "t2" and not bot.browser_lock.locked()
     assert "done 2" in bot.store.get("meanwhile")  # the main conversation hears about it
+    # The photo continues the first request: it goes into that turn, not a new one.
+    assert [k for k, _ in steered] == ["1"] and "here's the photo for it" in steered[0][1] and len(runs) == 3
+    assert any(t.startswith("↪️") for t in said)
     bot.store.close()
 
 

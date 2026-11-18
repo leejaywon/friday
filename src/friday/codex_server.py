@@ -29,7 +29,7 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
-from .agent import DISABLED_FEATURES, AgentResult, codex_env, codex_overrides, light_config, mcp_endpoints
+from .agent import DISABLED_FEATURES, AgentResult, codex_env, codex_overrides, light_config, mcp_endpoints, tool_args
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -105,6 +105,7 @@ class CodexServer:
         # at the same time (the bot's chat lanes); a thread has one turn at a time.
         self._lock = asyncio.Lock()
         self._keys: dict[str, str] = {}  # the caller's key for a running turn (a chat lane) -> thread id
+        self._turn_ids: dict[str, str] = {}  # thread id -> its running turn's id (steer)
         self._checked_at = 0.0
         self._broken_until = 0.0
 
@@ -429,6 +430,7 @@ class CodexServer:
         messages: list[str] = []
         errors: list[str] = []
         servers: set[str] = set()
+        calls: list[tuple[str, dict]] = []
         tokens, partial, turn_id = 0, False, ""
         try:
             params: dict = {"threadId": tid, "input": [{"type": "localImage", "path": str(p)} for p in images]
@@ -438,6 +440,7 @@ class CodexServer:
             if effort:
                 params["effort"] = effort
             turn_id = (await self._request("turn/start", params)).get("turn", {}).get("id", "")
+            self._turn_ids[tid] = turn_id
             deadline = time.monotonic() + self.cfg.codex_timeout_seconds
             while True:
                 try:
@@ -445,12 +448,12 @@ class CodexServer:
                 except TimeoutError:
                     await self._interrupt(tid, turn_id, q)
                     return AgentResult("", tid, [f"Codex took longer than {self.cfg.codex_timeout_seconds}s and was stopped."],
-                                       servers, tokens)
+                                       servers, tokens, calls)
                 if isinstance(msg, CodexServerError):
                     raise CodexServerError(str(msg), partial)
                 if msg is STOP:
                     await self._interrupt(tid, turn_id, q)
-                    return AgentResult("", tid, ["stopped"], servers, tokens)
+                    return AgentResult("", tid, ["stopped"], servers, tokens, calls)
                 method, p = msg.get("method"), msg.get("params") or {}
                 if p.get("turnId") not in (None, turn_id) and method != "turn/completed":
                     continue
@@ -465,6 +468,8 @@ class CodexServer:
                         on_step(str(item.get("id")), "")
                     if item.get("type") == "mcpToolCall":
                         servers.add(item.get("server") or "")
+                        if item.get("server") == "friday":
+                            calls.append((str(item.get("tool") or ""), tool_args(item.get("arguments"))))
                 elif method == "item/completed" and item.get("type") == "agentMessage":
                     messages.append(item.get("text", ""))
                     if on_note and item.get("phase") == "commentary":
@@ -494,11 +499,29 @@ class CodexServer:
             raise
         finally:
             self._turns.pop(tid, None)
+            self._turn_ids.pop(tid, None)
             if key and self._keys.get(key) == tid:
                 del self._keys[key]
         if errors:
             log.warning("codex errors: %s", errors)
-        return AgentResult((messages[-1] if messages else "").strip(), tid, errors, servers, tokens)
+        return AgentResult((messages[-1] if messages else "").strip(), tid, errors, servers, tokens, calls)
+
+    async def steer(self, key: str, text: str, images: list[Path] | None = None) -> bool:
+        """Add the user's new message to the turn run() was given this key for, while it runs
+        (turn/steer). False when that turn isn't running (any more)."""
+        tid = self._keys.get(key, "")
+        turn_id = self._turn_ids.get(tid, "")
+        if not turn_id:
+            return False
+        try:
+            await self._request("turn/steer", {
+                "threadId": tid, "expectedTurnId": turn_id,
+                "input": [{"type": "localImage", "path": str(p)} for p in images or []]
+                + [{"type": "text", "text": text, "text_elements": []}]})
+            return True
+        except CodexServerError as e:
+            log.info("steer failed: %s", e)
+            return False
 
     def stop_turn(self, key: str) -> bool:
         """Stop the turn run() was given this key for (the [Stop] button): it's interrupted and

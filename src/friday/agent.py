@@ -175,6 +175,8 @@ class AgentResult:
     # The context size: the turn's last model request (last_request_tokens), else the total
     # over all its requests, which is all --json reports.
     input_tokens: int = 0
+    # Friday's own tools the turn called: (tool, arguments), oldest first.
+    calls: list[tuple[str, dict]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -377,8 +379,18 @@ def codex_args(
     return args + ["-"]  # prompt comes from stdin
 
 
+def tool_args(raw: object) -> dict:
+    """An MCP tool call's arguments, which may come as a JSON string."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def parse_events(lines: list[str]) -> AgentResult:
-    thread_id, messages, errors, servers, tokens = None, [], [], set(), 0
+    thread_id, messages, errors, servers, tokens, calls = None, [], [], set(), 0, []
     for line in lines:
         try:
             ev = json.loads(line)
@@ -392,6 +404,8 @@ def parse_events(lines: list[str]) -> AgentResult:
             messages.append(item.get("text", ""))
         elif kind == "item.completed" and item.get("type") == "mcp_tool_call":
             servers.add(item.get("server") or "")
+            if item.get("server") == "friday":
+                calls.append((str(item.get("tool") or ""), tool_args(item.get("arguments"))))
         elif kind == "turn.completed":
             tokens += int((ev.get("usage") or {}).get("input_tokens") or 0)
         elif kind == "turn.failed":
@@ -399,7 +413,7 @@ def parse_events(lines: list[str]) -> AgentResult:
         elif kind == "error":
             errors.append(str(ev.get("message", "error")))
     return AgentResult(text=(messages[-1] if messages else "").strip(), thread_id=thread_id, errors=errors,
-                       mcp_servers=servers, input_tokens=tokens)
+                       mcp_servers=servers, input_tokens=tokens, calls=calls)
 
 
 def last_request_tokens(thread_id: str) -> int:
@@ -551,7 +565,10 @@ def parse_claude_events(lines: list[str]) -> AgentResult:
             msg = ev.get("message") or {}
             for block in msg.get("content") or []:
                 if block.get("type") == "tool_use" and str(block.get("name", "")).startswith("mcp__"):
-                    res.mcp_servers.add(block["name"].split("__")[1])
+                    _, server, tool = (block["name"].split("__") + ["", ""])[:3]
+                    res.mcp_servers.add(server)
+                    if server == "friday":
+                        res.calls.append((tool, tool_args(block.get("input"))))
             u = msg.get("usage") or {}
             res.input_tokens = sum(int(u.get(k) or 0) for k in
                                    ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
