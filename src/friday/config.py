@@ -66,7 +66,9 @@ class Config:
     # per message; exec stays the fallback. Env: FRIDAY_CODEX_SERVER
     codex_server: bool = True
     # Chat messages answered at the same time (bot.Friday lanes), at least 1. Env: CHAT_LANES
-    chat_lanes: int = 3
+    chat_lanes: int = 6
+    # Coding jobs running at once (bot.Friday.job_loop), at least 1. Env: CODING_JOBS
+    coding_jobs: int = 6
     # The small model that writes "here's where it is" updates during a long chat turn; empty = the
     # fastest one listed (models.light_model), "off" = no updates. Env: PROGRESS_MODEL
     progress_model: str = ""
@@ -216,7 +218,8 @@ def load_config() -> Config:
         transcribe_timeout_seconds=float(os.environ.get("TRANSCRIBE_TIMEOUT_SECONDS", "120")),
         browser_enabled=os.environ.get("FRIDAY_BROWSER", "true").strip().lower() not in ("0", "false", "no", "off"),
         codex_server=os.environ.get("FRIDAY_CODEX_SERVER", "true").strip().lower() not in ("0", "false", "no", "off"),
-        chat_lanes=max(1, int(os.environ.get("CHAT_LANES", "3"))),
+        chat_lanes=max(1, int(os.environ.get("CHAT_LANES", "6"))),
+        coding_jobs=max(1, int(os.environ.get("CODING_JOBS", "6"))),
         progress_model=os.environ.get("PROGRESS_MODEL", "").strip(),
     )
 

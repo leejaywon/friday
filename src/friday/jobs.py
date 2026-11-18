@@ -376,7 +376,7 @@ class Runner:
         self.store = store
         self.git = Git(cfg.github_code_token)
         self.gh = GitHub(cfg.github_code_token)
-        # Jobs run at the same time (bot.MAX_JOBS). Per project: git setup in the shared clone
+        # Jobs run at the same time (CODING_JOBS). Per project: git setup in the shared clone
         # (clone, fetch, worktree add/remove) one at a time, and a local project, changed in
         # place, one job at a time.
         self._locks: dict[str, asyncio.Lock] = {}

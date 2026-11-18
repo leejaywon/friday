@@ -96,7 +96,6 @@ Running now: {now}
 # Chat turns run at once in lanes (cfg.chat_lanes, CHAT_LANES): the main conversation (lane "1")
 # and side lanes for messages that arrive while it's busy. Only one turn at a time has the browser
 # (Friday.browser_lock).
-MAX_JOBS = 3  # coding jobs at once (each in its own worktree; a local project takes one at a time)
 # Jobs a restart interrupted start again, at most this many times each (jobs_startup).
 MAX_RESUMES = 2
 RESUME_NOTE = ("(Friday restarted while you were working on this. Look at the files as they are now and "
@@ -1200,7 +1199,7 @@ class Friday(WatchBot):
             return
         jid = self.store.add_job(repo, task, engine)
         busy = self._running_jobs()
-        note = f" Starts when one of {len(busy)} running jobs is done." if len(busy) >= MAX_JOBS else ""
+        note = f" Starts when one of {len(busy)} running jobs is done." if len(busy) >= self.cfg.coding_jobs else ""
         msg = await update.message.reply_text(f"🛠 Job #{jid} queued: {repo} ({engine})…{note}")
         self.store.link_job_message(msg.message_id, jid)
         self.store.set(f"job_queued_msg:{jid}", str(msg.message_id))  # _run_job edits it into "started"
@@ -1400,7 +1399,7 @@ class Friday(WatchBot):
         # Polled, because the MCP server (another process) can queue jobs too.
         for jid in [j for j, t in self._jobs.items() if t.done()]:
             del self._jobs[jid]
-        while len(self._jobs) < MAX_JOBS and (job := self.store.next_queued_job()):
+        while len(self._jobs) < self.cfg.coding_jobs and (job := self.store.next_queued_job()):
             self.store.update_job(job["id"], status="running", error=None)
             self._jobs[job["id"]] = asyncio.create_task(self._run_job(self.store.job(job["id"])),
                                                         name=f"job-{job['id']}")
