@@ -38,7 +38,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import browser, gcal, mcp_config, mcp_http, miniapp
+from . import browser, gcal, mcp_config, mcp_http, miniapp, planner
 from . import timeutil as tu
 from . import workspace as wsfiles
 from .agent import BROWSER_TOOL_TIMEOUT, AgentResult, engine_status, instructions, light_reply, run_turn
@@ -101,7 +101,7 @@ MAX_RESUMES = 2
 # Friday's tools that ask the user something and return at once in chat (the answer continues the
 # thread), and those that list things for the user to tap (the reply only says it was sent).
 REQUEST_TOOLS = {"request_form", "request_code", "request_approval"}
-LISTING_TOOLS = {"propose_items", "show_tree"}
+LISTING_TOOLS = {"propose_items", "show_tree", "add_task", "add_reminder", "calendar_create_event"}
 # Tools that only look things up: left out of what a side lane tells the others it did.
 READ_ONLY_TOOL = re.compile(r"^(list_|read_|get_|find_|recall|calendar_events|browser_recording_status|show_tree|use_tools)")
 # A side conversation that ended this recently can still be continued (Friday._route).
@@ -170,7 +170,8 @@ Talk to me in any language. I keep track of tasks and deadlines, reminders, Goog
 events, things to remember and files you send. Voice messages work too.
 
 /today - today's events, tasks and reminders
-/tasks - open tasks and deadlines
+/tasks - open tasks: tap to finish, move to tomorrow or remove
+/plan - this week's tasks, events and reminders in one screen to edit
 /reminders - upcoming reminders
 /new - start a fresh conversation
 /model [name] [effort] - show or change the model, e.g. /model low
@@ -191,6 +192,7 @@ events, things to remember and files you send. Voice messages work too.
 COMMANDS = [
     ("today", "Today's events, tasks and reminders"),
     ("tasks", "Open tasks and deadlines"),
+    ("plan", "This week: tasks, events, reminders"),
     ("reminders", "Upcoming reminders"),
     ("model", "Show or change the model"),
     ("code", "Coding job: /code [claude|codex] <repo> <task>"),
@@ -451,6 +453,9 @@ class Friday(WatchBot):
         app.add_handler(CommandHandler("reminders", self.cmd_reminders, filters=me))
         app.add_handler(CommandHandler("tasks", self.cmd_tasks, filters=me))
         app.add_handler(CallbackQueryHandler(self.on_task_button, pattern=r"^task:(done|snooze):\d+$"))
+        app.add_handler(CommandHandler("plan", self.cmd_plan, filters=me))
+        app.add_handler(CallbackQueryHandler(self.on_card_button,
+                                             pattern=r"^(tl:(d|m|x):\d+:\d+|tl:p:-?\d+|tl:plan|tc:(d|m|x):\d+|rc:x:\d+|ev:x:\d+)$"))
         app.add_handler(CommandHandler("today", self.cmd_today, filters=me))
         app.add_handler(CommandHandler("tz", self.cmd_tz, filters=me))
         app.add_handler(CommandHandler("model", self.cmd_model, filters=me))
@@ -995,6 +1000,11 @@ class Friday(WatchBot):
         if job:
             await self._job_followup(msg, job)
             return
+        # [Cancel] next to [🗓 Open planner]: close its keyboard.
+        if (msg.text or "").strip() == CANCEL_TEXT and self.store.get("planner_open") and not self._keyboard_request():
+            self.store.delete("planner_open")
+            await msg.reply_text("Closed.", reply_markup=ReplyKeyboardRemove())
+            return
         # The [Cancel] button next to a request's [📝 Open form]: cancel it, never pass it to the agent.
         if (msg.text or "").strip() == CANCEL_TEXT and (req := self._keyboard_request()):
             if self.store.finish_login_request(req["id"], "cancelled"):
@@ -1170,16 +1180,128 @@ class Friday(WatchBot):
         await self.say("\n".join(r.describe(self.tz) for r in rs) or "No upcoming reminders.", update.effective_chat.id)
 
     async def cmd_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        text, markup = planner.tasks_card(self.store.open_tasks(), self.tz, tu.now_utc())
+        await update.message.reply_text(text, reply_markup=markup)
+
+    async def on_card_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Buttons on the task list (tl:), a task card (tc:), a reminder card (rc:) and an event card
+        (ev:) (planner.py). The message is edited to show what happened."""
+        q = update.callback_query
+        if not q.from_user or q.from_user.id not in self.cfg.allowed_user_ids:
+            await q.answer()
+            return
+        parts, now = q.data.split(":"), tu.now_utc()
+        kind, action = parts[0], parts[1]
+        note = ""
+        if kind == "tl" and action == "plan":
+            await q.answer()
+            await self._open_planner(q.message.chat_id)
+            return
+        if kind in ("tl", "tc") and action in ("d", "m", "x"):
+            t = self.store.task(int(parts[2]))
+            if t and t.status == "open":
+                if action == "d" and self.store.complete_task(t.id):
+                    note = f"✅ {t.title}"
+                elif action == "m" and (moved := planner.move_to_tomorrow(self.store, t, self.tz, now)):
+                    note = f"➡️ {t.title}: {planner.when(moved.due_at, self.tz, now)}"
+                elif action == "x" and self.store.cancel_task(t.id):
+                    note = f"🗑 {t.title}"
+                if note:
+                    self._tell_lanes(f"the user tapped a button: {note}")
+            if kind == "tc" and (t := self.store.task(int(parts[2]))):
+                text, markup = planner.task_card(t, self.tz, now)
+                await self._quiet(q.edit_message_text(text, reply_markup=markup))
+        if kind == "rc":
+            rid = int(parts[2])
+            r = next((x for x in self.store.active_reminders() if x.id == rid), None)
+            if r and self.store.cancel_reminder(rid):
+                note = f"🔕 {r.text}"
+                self._tell_lanes(f"the user cancelled reminder #{rid} ({r.text})")
+                await self._quiet(q.edit_message_text(f"🔕 {r.text} (cancelled)"))
+        if kind == "ev":
+            raw = self.store.get(f"event_card:{parts[2]}")
+            if raw:
+                ev = json.loads(raw)
+                try:
+                    await asyncio.to_thread(gcal.delete_event, self.cfg.google_token, ev["id"])
+                except Exception as e:
+                    await q.answer(f"Couldn't remove it: {type(e).__name__}", show_alert=True)
+                    return
+                self.store.delete(f"event_card:{parts[2]}")
+                note = f"🗑 {ev.get('title', '')}"
+                self._tell_lanes(f"the user removed the calendar event {ev.get('title')!r} ({ev.get('when')})")
+                text, _ = planner.event_card(ev, parts[2], removed=True)
+                await self._quiet(q.edit_message_text(text))
+        if kind == "tl":
+            page = int(parts[-1]) if action != "p" else int(parts[2])
+            text, markup = planner.tasks_card(self.store.open_tasks(), self.tz, now, page)
+            await self._quiet(q.edit_message_text(text, reply_markup=markup))
+        await q.answer(note[:190])
+
+    async def cmd_plan(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._open_planner(update.effective_chat.id)
+
+    async def _open_planner(self, chat_id: int) -> None:
+        """The Mini App planner: this week's tasks, events and reminders (planner.spec). It has to be
+        opened from a reply-keyboard button for sendData to work; [Cancel] closes the keyboard."""
+        if not self.cfg.app_url:
+            await self.say("The Mini App is turned off (FRIDAY_APP_URL), so there's no planner. Try /tasks.", chat_id)
+            return
         now, zone = tu.now_utc(), ZoneInfo(self.tz)
-        lines = []
-        for t in self.store.open_tasks():
-            due = ""
-            if t.due_at:
-                due = ("⚠️ overdue " if t.due_at < now else "") + f"{t.due_at.astimezone(zone):%a %m/%d %H:%M}  "
-            lines.append(f"#{t.id} {due}{t.title}")
-        text = "\n".join(lines) or "No open tasks. 🎉"
-        await self.say(text + ("\n\nSay \"#3 is done\" or \"finished the report\" to mark one done." if lines else ""),
-                       update.effective_chat.id)
+        start, end = planner.week_window(now, self.tz)
+        events = []
+        if gcal.is_connected(self.cfg.google_token):
+            try:
+                events = await asyncio.to_thread(gcal.list_events, self.cfg.google_token, start, end, zone)
+            except Exception as e:
+                log.info("planner without the calendar: %s", e)
+        tasks, reminders = self.store.open_tasks(), self.store.active_reminders(until=end)
+        rid = int(self.store.get("planner_seq") or 0) + 1
+        self.store.set("planner_seq", str(rid))
+        limit = planner.MAX_ITEMS
+        while True:  # a URL Telegram refuses (too long): fewer of each, down to a few
+            spec, snap = planner.spec(tasks, events, reminders, self.tz, now, limit)
+            self.store.set(f"planner:{rid}", json.dumps({"tasks": snap.tasks, "events": snap.events,
+                                                         "reminders": snap.reminders,
+                                                         "titles": {e.id: e.title for e in events[:limit]}}))
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton("🗓 Open planner", web_app=WebAppInfo(miniapp.url(self.cfg.app_url, self.cfg.vault_dir,
+                                                                                 rid, spec))),
+                  KeyboardButton(CANCEL_TEXT)]], resize_keyboard=True, one_time_keyboard=True)
+            text = (f"🗓 This week: {len(snap.tasks)} tasks, {len(snap.events)} events, {len(snap.reminders)} "
+                    "reminders. Tap 🗓 Open planner below to check off, move, remove or add, then Save.")
+            try:
+                await self.app.bot.send_message(chat_id, text, reply_markup=keyboard)  # type: ignore[union-attr]
+                break
+            except Exception as e:
+                if limit <= 5:
+                    log.warning("planner couldn't open: %s", e)
+                    await self.say("Couldn't open the planner. Try /tasks.", chat_id)
+                    return
+                limit //= 2
+        self.store.set("planner_open", str(rid))
+
+    async def _planner_saved(self, chat_id: int, rid: int, values: dict) -> None:
+        bot = self.app.bot  # type: ignore[union-attr]
+        raw = self.store.get(f"planner:{rid}")
+        self.store.delete("planner_open")
+        if not raw:
+            await bot.send_message(chat_id, "This planner is out of date; open it again with /plan.",
+                                   reply_markup=ReplyKeyboardRemove())
+            return
+        self.store.delete(f"planner:{rid}")
+        snap = json.loads(raw)
+        lines, gone = planner.apply(self.store, values, planner.Snapshot(snap["tasks"], snap["events"], snap["reminders"]),
+                                    self.tz, tu.now_utc(), snap.get("titles"))
+        for eid in gone:
+            try:
+                await asyncio.to_thread(gcal.delete_event, self.cfg.google_token, eid)
+            except Exception as e:
+                lines.append(f"⚠️ Couldn't remove an event: {type(e).__name__}")
+        if lines:
+            self._tell_lanes("the user changed things in the planner: " + "; ".join(lines))
+        text = ("Saved:\n" + "\n".join(lines)) if lines else "Nothing changed."
+        await bot.send_message(chat_id, text[:TELEGRAM_LIMIT], reply_markup=ReplyKeyboardRemove())
 
     async def on_task_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -1207,7 +1329,11 @@ class Friday(WatchBot):
         await self.app.bot.send_message(self.owner, text, reply_markup=buttons)  # type: ignore[union-attr]
 
     async def cmd_today(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await self.say(await self.brief(), update.effective_chat.id)
+        buttons = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Tasks", callback_data="tl:p:0"),
+                                         InlineKeyboardButton("🗓 Planner", callback_data="tl:plan")]])
+        chunks = split_message(await self.brief())
+        for i, chunk in enumerate(chunks):
+            await update.message.reply_text(chunk, reply_markup=buttons if i == len(chunks) - 1 else None)
 
     async def cmd_tz(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if ctx.args:
@@ -1755,6 +1881,9 @@ class Friday(WatchBot):
             log.warning("Mini App answer unreadable (%s)", e)
             await bot.send_message(msg.chat_id, "❌ I couldn't read what you entered. Please try again.")
             return
+        if payload.get("kind") == "planner":
+            await self._planner_saved(msg.chat_id, payload["rid"], payload["values"])
+            return
         req = self.store.login_request(payload["rid"])
         if not req or req["status"] != "pending":
             await bot.send_message(msg.chat_id, "This request has already ended, so nothing was saved.",
@@ -2285,6 +2414,8 @@ class Friday(WatchBot):
                             await self.say(f"⚠️ {problem}")
                 elif row["kind"] == "proposal":
                     await self._send_proposal(int(row["text"]))
+                elif row["kind"] in ("task_card", "reminder_card", "event_card"):
+                    await self._send_card(row["kind"], row["text"])
                 elif row["kind"] == "approval":  # text holds the approval id, path an optional screenshot
                     await self._send_approval(int(row["text"]), row["path"])
                 elif row["kind"] == "login_request":  # text holds the login request id
@@ -2302,6 +2433,26 @@ class Friday(WatchBot):
                 self.store.unclaim_outbox(row["id"])
                 raise
         return 3
+
+    async def _send_card(self, kind: str, text: str) -> None:
+        """What the chat agent added, as a card with buttons (planner.py)."""
+        now = tu.now_utc()
+        if kind == "task_card":
+            t = self.store.task(int(text))
+            if not t:
+                return
+            body, markup = planner.task_card(t, self.tz, now)
+        elif kind == "reminder_card":
+            r = next((x for x in self.store.active_reminders() if x.id == int(text)), None)
+            if not r:
+                return
+            body, markup = planner.reminder_card(r, self.tz, now)
+        else:
+            key = str(int(self.store.get("event_card_seq") or 0) + 1)  # the id is too long for a button
+            self.store.set("event_card_seq", key)
+            self.store.set(f"event_card:{key}", text)
+            body, markup = planner.event_card(json.loads(text), key)
+        await self.app.bot.send_message(self.owner, body, reply_markup=markup)  # type: ignore[union-attr]
 
     async def calendar_loop(self) -> float:
         if not gcal.is_connected(self.cfg.google_token):

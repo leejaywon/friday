@@ -1,7 +1,7 @@
 // Friday's Mini App: the part every component shares (src/friday/miniapp.py is the server side).
 // The spec arrives in the URL fragment: {v: 1, kind, rid, key, title, description, site, submit,
 // ...what the component needs}. The page shows the header, lets the component render its body,
-// and sends {rid, values} back encrypted to the owner's server through Telegram.WebApp.sendData.
+// and sends {rid, kind, values} back encrypted to the owner's server through Telegram.WebApp.sendData.
 //
 // A component is one file in components/ that calls
 //   FridayApp.register(kind, function (spec, app) { ...; return { collect, submitLabel } })
@@ -59,6 +59,10 @@ window.FridayApp = (function () {
     info: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 11v5.5M12 7.5v.01"/></svg>',
     alert: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5V13M12 16.5v.01"/></svg>',
     lock: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>',
+    check: '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+    trash: '<svg viewBox="0 0 24 24"><path d="M4.5 7h15M10 11v6M14 11v6M6.5 7l1 12.5a1.5 1.5 0 0 0 1.5 1.5h6a1.5 1.5 0 0 0 1.5-1.5l1-12.5M9.5 7V4.5h5V7"/></svg>',
+    bell: '<svg viewBox="0 0 24 24"><path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15zM10 20.5a2 2 0 0 0 4 0"/></svg>',
+    plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
   };
 
   const can = (v) => inTelegram && tg.isVersionAtLeast && tg.isVersionAtLeast(v);
@@ -159,7 +163,7 @@ window.FridayApp = (function () {
       tg.MainButton.showProgress(false);
       tg.MainButton.disable();
       try {
-        const data = await encryptForServer(spec.key, { rid: spec.rid, values: answer.values });
+        const data = await encryptForServer(spec.key, { rid: spec.rid, kind: spec.kind || "form", values: answer.values });
         if (data.length > LIMIT) throw new Error("too long");
         haptic("success");
         if (can("6.2")) tg.disableClosingConfirmation();

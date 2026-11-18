@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from . import browser, browser_audio, contacts, gcal, mcp_http
+from . import browser, browser_audio, contacts, gcal, mcp_http, planner
 from . import timeutil as tu
 from . import watches as wt
 from . import workspace as wsfiles
@@ -94,6 +94,12 @@ def _in_chat(ctx: Context | None) -> bool:
 TOOLSETS = ("github",)  # the browser is attached in chat unless another turn has it (bot lanes)
 
 
+def _card(ctx: Context | None, kind: str, text: str) -> None:
+    """In chat, show what a tool added as a card with buttons (bot.outbox_loop, planner.py)."""
+    if _in_chat(ctx):
+        store.queue(kind, text=text)
+
+
 def _lane(ctx: Context | None) -> str:
     """The chat lane a call comes from (bot.Friday lanes): "1" is the main conversation."""
     return _context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT") or "1"
@@ -146,7 +152,7 @@ def set_timezone(timezone: str) -> str:
 
 
 @server.tool()
-def add_reminder(text: str, when: str, repeat: str = "", skip_dates: str = "") -> str:
+def add_reminder(text: str, when: str, repeat: str = "", skip_dates: str = "", ctx: Context | None = None) -> str:
     """Schedule a Telegram reminder: a message at a time, optionally repeating.
 
     For something the user must get done by a deadline, use add_task instead.
@@ -182,6 +188,7 @@ def add_reminder(text: str, when: str, repeat: str = "", skip_dates: str = "") -
         r = store.add_reminder(text, dt, tz, repeat or None, skip)
     except ValueError as e:
         return f"Not scheduled: {e}"
+    _card(ctx, "reminder_card", str(r.id))
     if not r.rrule:
         return f"Scheduled #{r.id} '{r.text}' for {r.preview(tz)[0]}."
     return f"Scheduled #{r.id} '{r.text}'. Next 3 alerts (tell the user): {'; '.join(r.preview(tz))}"
@@ -225,12 +232,15 @@ def calendar_events(start: str, end: str) -> str:
 
 
 @server.tool()
-def calendar_create_event(title: str, start: str, end: str, description: str = "", location: str = "") -> str:
+def calendar_create_event(title: str, start: str, end: str, description: str = "", location: str = "",
+                          ctx: Context | None = None) -> str:
     """Add an event to the user's Google Calendar. Confirm details with the user first if anything is unclear."""
     tz = _tz()
-    ev = gcal.create_event(
-        cfg.google_token, title, tu.parse_when(start, tz), tu.parse_when(end, tz), description, location
-    )
+    start_dt, end_dt = tu.parse_when(start, tz), tu.parse_when(end, tz)
+    ev = gcal.create_event(cfg.google_token, title, start_dt, end_dt, description, location)
+    span = f"{planner.when(start_dt, tz, tu.now_utc())}–{end_dt.astimezone(ZoneInfo(tz)):%H:%M}"
+    _card(ctx, "event_card", json.dumps({"id": ev.get("id"), "title": ev.get("summary") or title, "when": span,
+                                         "location": location}, ensure_ascii=False))
     return f"Created '{ev.get('summary')}' [id={ev.get('id')}] {ev.get('htmlLink', '')}"
 
 
@@ -242,7 +252,7 @@ def calendar_delete_event(event_id: str) -> str:
 
 
 @server.tool()
-def add_task(title: str, due: str = "", remind: str = "", notes: str = "") -> str:
+def add_task(title: str, due: str = "", remind: str = "", notes: str = "", ctx: Context | None = None) -> str:
     """Add a to-do: something the user has to get done, optionally by a deadline ("by Friday").
 
     title: short description, e.g. 'finish the report'.
@@ -265,6 +275,7 @@ def add_task(title: str, due: str = "", remind: str = "", notes: str = "") -> st
     else:
         remind_dt = tu.default_task_reminder(due_dt, tz, now) if due_dt else None
     t = store.add_task(title, due_dt, remind_dt, notes)
+    _card(ctx, "task_card", str(t.id))
     return f"Added task {t.describe(tz)}"
 
 

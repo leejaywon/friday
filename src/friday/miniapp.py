@@ -24,7 +24,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 DEFAULT_URL = "https://leejaywon.github.io/friday/app/"
-KINDS = ("form",)  # the components site/app/ can show
+KINDS = ("form", "planner")  # the components site/app/ can show
 OAEP = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
 
 
@@ -66,7 +66,7 @@ class AppKey:
         return b64url(der)
 
     def decrypt(self, data: str) -> dict:
-        """sendData's {v, k, iv, ct} -> {rid, values}. Raises ValueError on anything malformed."""
+        """sendData's {v, k, iv, ct} -> {rid, kind, values}. Raises ValueError on anything malformed."""
         try:
             msg = json.loads(data)
             if msg.get("v") != 1:
