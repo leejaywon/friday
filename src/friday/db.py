@@ -566,8 +566,14 @@ class Store:
     def pending_outbox(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY id").fetchall()
 
-    def mark_sent(self, oid: int) -> None:
-        self.conn.execute("UPDATE outbox SET sent_at = ? WHERE id = ?", (self._now(), oid))
+    def claim_outbox(self, oid: int) -> bool:
+        """Take a row to send (marked sent now); False when another sender already took it."""
+        cur = self.conn.execute("UPDATE outbox SET sent_at = ? WHERE id = ? AND sent_at IS NULL", (self._now(), oid))
+        return cur.rowcount == 1
+
+    def unclaim_outbox(self, oid: int) -> None:
+        """Sending it failed: it's sent again next time."""
+        self.conn.execute("UPDATE outbox SET sent_at = NULL WHERE id = ?", (oid,))
 
     # --- coding jobs -------------------------------------------------------
 

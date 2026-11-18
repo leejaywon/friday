@@ -49,6 +49,25 @@ def available_models(path: Path | None = None, engine: str = "codex") -> list[Mo
     return out
 
 
+# Words in a model's slug that mark the small, fast one (progress updates).
+LIGHT_HINTS = ("luna", "mini", "nano", "haiku", "affordable", "easier tasks")
+
+
+def light_model(engine: str = "codex", override: str = "", path: Path | None = None) -> tuple[str, str]:
+    """(model, effort) for short side jobs like progress updates: `override` (PROGRESS_MODEL), else
+    the first listed model that looks small and fast, at its lowest effort. ("", "") when Codex
+    hasn't listed its models yet: then the chat model is used."""
+    if engine == "claude":
+        return override or "haiku", ""
+    models = available_models(path)
+    pick = find(models, override) if override else None
+    if not pick and not override:
+        pick = next((m for m in models if any(h in m.slug.lower() for h in LIGHT_HINTS)), None)
+    if not pick:
+        return override, ""
+    return pick.slug, (pick.efforts[0] if pick.efforts else "")
+
+
 def find(models: list[Model], slug: str) -> Model | None:
     slug = slug.lower()
     return next((m for m in models if m.slug.lower() == slug), None)

@@ -50,6 +50,7 @@ def test_turn_result_errors_and_timeout(server, tmp_path):
             await asyncio.sleep(0.01)
         assert (await hung).errors == ["stopped"] and steps == ["browser: click"]
         ok = await server.run("again", "t1")  # the server is still usable
+        assert await server.light("sum up", "small-model", "low") == "reply: sum up (0 images)"
         await server.close()
         return ok
 

@@ -67,6 +67,9 @@ class Config:
     codex_server: bool = True
     # Chat messages answered at the same time (bot.Friday lanes), at least 1. Env: CHAT_LANES
     chat_lanes: int = 3
+    # The small model that writes "here's where it is" updates during a long chat turn; empty = the
+    # fastest one listed (models.light_model), "off" = no updates. Env: PROGRESS_MODEL
+    progress_model: str = ""
 
     # The Mini App (miniapp.py) as an https URL; empty = requests are only answered by reply.
     # Env: FRIDAY_APP_URL (unset: the page this repo publishes, miniapp.DEFAULT_URL)
@@ -214,6 +217,7 @@ def load_config() -> Config:
         browser_enabled=os.environ.get("FRIDAY_BROWSER", "true").strip().lower() not in ("0", "false", "no", "off"),
         codex_server=os.environ.get("FRIDAY_CODEX_SERVER", "true").strip().lower() not in ("0", "false", "no", "off"),
         chat_lanes=max(1, int(os.environ.get("CHAT_LANES", "3"))),
+        progress_model=os.environ.get("PROGRESS_MODEL", "").strip(),
     )
 
 

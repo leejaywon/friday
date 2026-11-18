@@ -29,7 +29,7 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
-from .agent import DISABLED_FEATURES, AgentResult, codex_env, codex_overrides, mcp_endpoints
+from .agent import DISABLED_FEATURES, AgentResult, codex_env, codex_overrides, light_config, mcp_endpoints
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,17 @@ def step_label(item: dict) -> str:
     if kind == "mcpToolCall":
         server = str(item.get("server") or "")
         tool = str(item.get("tool") or "").removeprefix("browser_").replace("_", " ")
-        return f"{SERVER_NAMES.get(server, server)}: {tool}"
+        args = item.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {}
+        # What it acts on: the page, the element, the text it looks for.
+        what = next((str(args[k]) for k in ("url", "element", "text", "key", "query", "name")
+                     if isinstance(args, dict) and args.get(k)), "")
+        what = " ".join(re.sub(r"^https?://(www\.)?", "", what).split())
+        return f"{SERVER_NAMES.get(server, server)}: {tool}" + (f" «{what[:50]}»" if what else "")
     if kind == "commandExecution":
         return "running a command"
     if kind == "webSearch":
@@ -314,7 +324,8 @@ class CodexServer:
                 return thread_id
             log.info("reloading thread %s with new config", thread_id)
             await self._unload(thread_id, wait=True)
-        for other in [t for t in self._loaded if t != thread_id]:  # one chat thread loaded at a time
+        # Idle threads are unloaded (they hold MCP connections); not ones with a turn running.
+        for other in [t for t in self._loaded if t != thread_id and t not in self._turns]:
             await self._unload(other, wait=False)
         params: dict = {"cwd": str(self.cfg.workspace), "config": config}
         if model:
@@ -366,6 +377,33 @@ class CodexServer:
             async with self._lock:
                 await self._recover(tid)
             raise
+
+    async def light(self, prompt: str, model: str = "", effort: str = "", timeout: float = 45) -> str:
+        """A short answer from a small model in a throwaway thread with no tools (progress updates,
+        agent.light_reply); "" when it fails. Runs alongside the chat's turns."""
+        tid = ""
+        try:
+            async with self._lock:
+                await self._ensure(self._env[0] if self.running else self.cfg.default_tz)
+                params: dict = {"cwd": str(self.cfg.workspace), "config": light_config(self.cfg), "ephemeral": True}
+                if model:
+                    params["model"] = model
+                r = await self._request("thread/start", params, THREAD_TIMEOUT)
+                tid = (r.get("thread") or {}).get("id") or ""
+            if not tid:
+                return ""
+            res = await asyncio.wait_for(self._turn(tid, prompt, [], model, effort), timeout)
+            return res.text if res.ok else ""
+        except (CodexServerError, TimeoutError) as e:
+            log.info("light reply failed: %s", e)
+            return ""
+        finally:
+            if tid and self.running:
+                try:
+                    async with self._lock:
+                        await self._unload(tid, wait=False)
+                except CodexServerError:
+                    pass
 
     async def _recover(self, tid: str | None) -> None:
         """After a server failure: the caller retries with `codex exec`, which writes to the thread

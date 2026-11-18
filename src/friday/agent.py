@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -615,6 +616,54 @@ async def run_claude(
     if result.errors:
         log.warning("claude errors: %s", result.errors)
     return result
+
+
+def light_config(cfg: Config) -> dict[str, object]:
+    """Codex config for a short reply with no tools: the chat's sandbox, no MCP servers, no web."""
+    o = {k: v for k, v in codex_overrides(cfg).items() if not k.startswith("mcp_servers.")}
+    o["web_search"] = "disabled"
+    return o
+
+
+async def light_reply(cfg: Config, prompt: str, model: str = "", effort: str = "", timeout: float = 45) -> str:
+    """A short answer from a small model with no tools (progress updates), with `codex exec` or
+    `claude -p`; "" when it fails. The app-server does the same faster (CodexServer.light)."""
+    if cfg.chat_engine == "claude":
+        settings = {"permissions": {"deny": ["Bash", "Edit", "Write", "Read", "WebFetch", "WebSearch"]},
+                    "disableClaudeAiConnectors": True}
+        cmd = [cfg.claude_bin, "-p", "--output-format", "text", "--permission-prompts", "none",
+               "--settings", json.dumps(settings), "--strict-mcp-config", "--model", model or "haiku"]
+        out_file = None
+    else:
+        fd, name = tempfile.mkstemp(prefix="friday-light-", suffix=".txt")
+        os.close(fd)
+        out_file = Path(name)
+        cmd = [cfg.codex_bin, "exec", *DISABLED_FEATURES, "--skip-git-repo-check", "-o", str(out_file)]
+        for key, value in light_config(cfg).items():
+            cmd += ["-c", f"{key}={mcp_config.toml_value(value)}"]
+        if model:
+            cmd += ["-m", model]
+        if effort:
+            cmd += ["-c", f"model_reasoning_effort={mcp_config.toml_value(effort)}"]
+        cmd.append("-")
+    env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, cwd=cfg.workspace, env=env, stdin=asyncio.subprocess.PIPE,
+                                                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
+        except (TimeoutError, asyncio.CancelledError):
+            proc.kill()
+            await proc.wait()
+            raise
+        text = out_file.read_text() if out_file else out.decode(errors="replace")
+        return text.strip() if proc.returncode == 0 else ""
+    except (OSError, TimeoutError) as e:
+        log.info("light reply failed: %s", e)
+        return ""
+    finally:
+        if out_file:
+            out_file.unlink(missing_ok=True)
 
 
 async def engine_status(cfg: Config) -> tuple[bool, str]:

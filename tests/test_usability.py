@@ -98,8 +98,13 @@ def test_status_message_grows_a_stop_button_and_shrinks_back():
         async def edit(msg_id, text, stop):
             shown.append((text, stop))
 
+        async def summarize(progress):
+            assert progress["steps"] == ["browser: click"] and progress["notes"][-1] == "페이지를 여는 중이야."
+            return "로그인은 끝났고\n목록을 여는 중이에요."
+
         status = TurnStatus(send, edit, lambda m: asyncio.sleep(0), alert=lambda t: alerts.append(t) or asyncio.sleep(0),
-                            note_after=0.05, status_after=0.1, every=10, stuck_after=0.15, tick=0.01)
+                            summarize=summarize if not step_done else None, note_after=0.05, status_after=0.1,
+                            every=10, stuck_after=0.15, tick=0.01)
         status.note("확인해볼게.")
         status.note("페이지를 여는 중이야.")
         status.on_step("i1", "browser: click")
@@ -115,6 +120,7 @@ def test_status_message_grows_a_stop_button_and_shrinks_back():
                      ("페이지를 여는 중이야.", False)] and not alerts
     shown, alerts = asyncio.run(turn(0.2, stopped=True, step_done=False))  # a click that never answers
     assert "⚠️ browser: click: no answer" in shown[-2][0] and len(alerts) == 1 and "browser: click" in alerts[0]
+    assert any("💬 로그인은 끝났고 목록을 여는 중이에요.\n⏳" in text for text, _ in shown)  # the small model's line
     assert shown[-1] == ("페이지를 여는 중이야.\n\n⏹ Stopped after 0:00", False)
     assert stop_button("2").inline_keyboard[0][0].callback_data == "turn:stop:2"
 
@@ -145,3 +151,18 @@ def test_phone_book(tools):
     assert tools.add_contact("민수", ["01012345678"]).startswith("Not saved: this looks like an existing contact")
     out = tools.update_contact(1, phones=["010-1234-5678", "+44 20 7946 0958"])
     assert "010-1234-5678 · +442079460958" in out and "고등학교 친구" in out
+
+
+def test_progress_updates_use_the_small_fast_model(tmp_path):
+    import json
+
+    from friday.models import light_model
+
+    cache = tmp_path / "models_cache.json"
+    cache.write_text(json.dumps({"models": [
+        {"slug": "gpt-6.2-sol", "visibility": "list", "supported_reasoning_levels": [{"effort": "low"}]},
+        {"slug": "gpt-6-luna", "visibility": "list", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+    ]}))
+    assert light_model("codex", path=cache) == ("gpt-6-luna", "low")
+    assert light_model("codex", "gpt-6.2-sol", path=cache) == ("gpt-6.2-sol", "low")
+    assert light_model("claude") == ("haiku", "")
