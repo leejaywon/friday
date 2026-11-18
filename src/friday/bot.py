@@ -75,9 +75,9 @@ STATUS_EVERY = 15.0
 # A tool call running this long is reported (a message of its own, so it notifies), except
 # Friday's own tools, which wait for the owner (approvals, forms).
 STUCK_AFTER = 45.0
-# Chat turns that run at once: the main conversation (lane "1") and side lanes for messages that
-# arrive while it's busy. Only one turn at a time has the browser (Friday.browser_lock).
-LANES = ("1", "2", "3")
+# Chat turns run at once in lanes (cfg.chat_lanes, CHAT_LANES): the main conversation (lane "1")
+# and side lanes for messages that arrive while it's busy. Only one turn at a time has the browser
+# (Friday.browser_lock).
 MAX_JOBS = 3  # coding jobs at once (each in its own worktree; a local project takes one at a time)
 # Jobs a restart interrupted start again, at most this many times each (jobs_startup).
 MAX_RESUMES = 2
@@ -332,7 +332,7 @@ class Friday(WatchBot):
         self.cfg = cfg
         ensure_dirs(cfg)
         self.store = Store(cfg.db_path)
-        self.lanes = {k: Lane(k) for k in LANES}
+        self.lanes = {str(i): Lane(str(i)) for i in range(1, cfg.chat_lanes + 1)}
         self._lane_free = asyncio.Condition()  # a lane's turn ended (messages wait when all are busy)
         # The shared browser, one chat turn or scheduled run at a time (two would drive the same tabs).
         self.browser_lock = asyncio.Lock()
@@ -381,7 +381,7 @@ class Friday(WatchBot):
         app.add_handler(CommandHandler("jobs", self.cmd_jobs, filters=me))
         app.add_handler(CommandHandler("stop", self.cmd_stop, filters=me))
         app.add_handler(CommandHandler("runs", self.cmd_runs, filters=me))
-        app.add_handler(CallbackQueryHandler(self.on_stop_button, pattern=r"^turn:stop(:\d)?$"))
+        app.add_handler(CallbackQueryHandler(self.on_stop_button, pattern=r"^turn:stop(:\d{1,2})?$"))
         app.add_handler(CallbackQueryHandler(self.on_approval_button, pattern=r"^appr:(yes|no):\d+$"))
         app.add_handler(CommandHandler("login", self.cmd_login, filters=me))
         app.add_handler(CommandHandler("logins", self.cmd_logins, filters=me))
@@ -570,7 +570,7 @@ class Friday(WatchBot):
                 images.append(path)
         lane = self._free_lane()
         if lane is None:
-            await self._quiet(self.say(f"⏳ {len(LANES)} requests are already running; this one starts as soon as "
+            await self._quiet(self.say(f"⏳ {len(self.lanes)} requests are already running; this one starts as soon as "
                                        "one of them finishes.", chat_id))
             async with self._lane_free:
                 await self._lane_free.wait_for(lambda: self._free_lane() is not None)

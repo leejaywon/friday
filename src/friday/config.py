@@ -65,6 +65,8 @@ class Config:
     # Chat turns in one long-lived `codex app-server` (codex_server.py) rather than a `codex exec`
     # per message; exec stays the fallback. Env: FRIDAY_CODEX_SERVER
     codex_server: bool = True
+    # Chat messages answered at the same time (bot.Friday lanes), at least 1. Env: CHAT_LANES
+    chat_lanes: int = 3
 
     # The Mini App (miniapp.py) as an https URL; empty = requests are only answered by reply.
     # Env: FRIDAY_APP_URL (unset: the page this repo publishes, miniapp.DEFAULT_URL)
@@ -211,6 +213,7 @@ def load_config() -> Config:
         transcribe_timeout_seconds=float(os.environ.get("TRANSCRIBE_TIMEOUT_SECONDS", "120")),
         browser_enabled=os.environ.get("FRIDAY_BROWSER", "true").strip().lower() not in ("0", "false", "no", "off"),
         codex_server=os.environ.get("FRIDAY_CODEX_SERVER", "true").strip().lower() not in ("0", "false", "no", "off"),
+        chat_lanes=max(1, int(os.environ.get("CHAT_LANES", "3"))),
     )
 
 
