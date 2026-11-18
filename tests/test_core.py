@@ -182,7 +182,7 @@ def test_codex_args_attach_optional_toolsets_only_when_on(cfg):
     assert '"fill_login"' in hidden and '"request_approval"' in hidden and "use_tools" not in hidden
 
     ov = _overrides(codex_args(cfg, None, [], toolsets={"browser", "github"}, chat=True))
-    assert any(o.startswith("mcp_servers.playwright.url=") for o in ov)
+    assert 'mcp_servers.playwright.args=["-m", "friday.browser_proxy"]' in ov  # through Friday's proxy
     assert any(o.startswith("mcp_servers.github.url=") for o in ov)
     assert not any(o.startswith("mcp_servers.friday.disabled_tools=") for o in ov)
 

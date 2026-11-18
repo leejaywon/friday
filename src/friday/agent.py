@@ -82,12 +82,26 @@ the tool list first:
   says it's busy and you need it, call use_tools("browser") and end your turn with "-". When something visible isn't in the snapshot as a control (a player's play button, a
   canvas, an icon), take a browser_take_screenshot, click it with browser_mouse_click_xy at its
   position in that screenshot, then take another screenshot to check it worked. Otherwise prefer
-  snapshot refs: screenshots are slower and larger.
+  snapshot refs: screenshots are slower and larger. A failed click comes back with Friday's note:
+  why it failed, what Friday already tried (often a mouse click at the element's position) and a
+  screenshot. Read it and don't repeat the same call.
+  Video and audio: browser_media(action="play") starts the page's player and says within ~5
+  seconds whether it really plays, or why not; "status" shows position and loading. Use it rather
+  than clicking a player and waiting to see. When it says the site isn't sending the video,
+  waiting or reloading won't help: say so.
+  browser_evaluate (page JavaScript) needs the owner's approval of each script: only when no
+  other tool can do it.
+- Notes that start with "[Friday]" or "[Friday supervisor]" arrive while you work: Friday watches
+  for steps that fail or hang. Follow them. Don't spend more than about 30 seconds on something
+  that makes no progress: then stop and tell the user what you tried and the concrete reason.
 - Browser audio: start_browser_recording(title?, max_minutes?) records audible Chrome output
   (default 60, maximum 120 minutes). stop_browser_recording(recording_id?) saves a playable M4A;
   browser_recording_status(recording_id?), list_browser_recordings() show ids and paths.
   send_file sends a saved recording when requested. All audible Chrome tabs mix: keep unrelated
   tabs quiet. Recording does not start/pause a video or collect microphone input.
+  For what is said in a YouTube video, first get its transcript: on the watch page open the
+  description ("...more"), then "Show transcript", and read the transcript panel (browser_find or a
+  targeted snapshot). Record and transcribe audio only when there is no transcript.
   For listening to/understanding a lecture: record the requested interval, stop, then call
   transcribe_browser_recording(recording_id?, max_parts?) using the existing Groq/STT provider.
   Repeat while remaining_parts > 0; read_browser_transcript(recording_id?, offset?, limit?) pages
@@ -212,7 +226,10 @@ def github_read_token_var(cfg: Config) -> str | None:
 TOOLSETS = ("browser", "github")
 # A browser tool call that hasn't answered by then fails, so the turn can go on (a mouse wheel on
 # a page that never goes idle hung for minutes). Friday's own tools wait longer (approvals).
-BROWSER_TOOL_TIMEOUT = 90
+# Through browser_proxy (the normal case) the proxy gives each step 30 seconds itself and Codex
+# waits longer, for browser_evaluate's approval.
+BROWSER_TOOL_TIMEOUT = 30
+PROXY_TOOL_TIMEOUT = 330
 FRIDAY_BROWSER_TOOLS = ["fill_login", "fill_login_field", "list_logins", "request_approval", "schedule_browser_run",
                         "start_browser_recording", "stop_browser_recording", "browser_recording_status",
                         "list_browser_recordings", "transcribe_browser_recording", "read_browser_transcript"]
@@ -313,15 +330,22 @@ def codex_overrides(
     if browser_on:
         # The shared browser (deploy/friday-browser.service) through the Playwright MCP server.
         if http[1]:
-            o["mcp_servers.playwright.url"] = mcp_http.url(mcp_http.playwright_port())
+            # Through browser_proxy: it diagnoses failed clicks, adds browser_media and asks the
+            # owner before page JavaScript (browser_evaluate).
+            o["mcp_servers.playwright.command"] = sys.executable
+            o["mcp_servers.playwright.args"] = ["-m", "friday.browser_proxy"]
+            o["mcp_servers.playwright.env"] = {"FRIDAY_PLAYWRIGHT_URL": mcp_http.url(mcp_http.playwright_port()),
+                                               "FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir)}
             o["mcp_servers.playwright.startup_timeout_sec"] = 20
         else:
             pw = browser.playwright_mcp_command(cfg)
             o["mcp_servers.playwright.command"] = pw[0]
             o["mcp_servers.playwright.args"] = pw[1:]
             o["mcp_servers.playwright.startup_timeout_sec"] = 60  # npx (no deploy.sh install) may download first
-        o["mcp_servers.playwright.disabled_tools"] = browser.BLOCKED_TOOLS
-        o["mcp_servers.playwright.tool_timeout_sec"] = BROWSER_TOOL_TIMEOUT
+        # The proxy offers browser_evaluate only behind an approval; the rest stay hidden either way.
+        o["mcp_servers.playwright.disabled_tools"] = [t for t in browser.BLOCKED_TOOLS
+                                                      if not (http[1] and t == "browser_evaluate")]
+        o["mcp_servers.playwright.tool_timeout_sec"] = PROXY_TOOL_TIMEOUT if http[1] else BROWSER_TOOL_TIMEOUT
         o["mcp_servers.playwright.default_tools_approval_mode"] = "approve"
     extra = mcp_config.load(cfg.mcp_config)
     if extra.problems:

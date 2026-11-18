@@ -61,7 +61,7 @@ def step_label(item: dict) -> str:
             except ValueError:
                 args = {}
         # What it acts on: the page, the element, the text it looks for.
-        what = next((str(args[k]) for k in ("url", "element", "text", "key", "query", "name")
+        what = next((str(args[k]) for k in ("url", "element", "text", "key", "action", "query", "name")
                      if isinstance(args, dict) and args.get(k)), "")
         what = " ".join(re.sub(r"^https?://(www\.)?", "", what).split())
         return f"{SERVER_NAMES.get(server, server)}: {tool}" + (f" «{what[:50]}»" if what else "")
@@ -72,6 +72,18 @@ def step_label(item: dict) -> str:
     if kind == "dynamicToolCall":
         return str(item.get("tool") or "a tool").replace("_", " ")
     return str(kind or "")
+
+
+def item_error(item: dict) -> str:
+    """Why a finished tool item failed ("" when it didn't): its error, or an MCP result marked isError."""
+    if item.get("status") == "failed" or item.get("error"):
+        err = item.get("error")
+        return str((err or {}).get("message") if isinstance(err, dict) else err or "failed")[:500]
+    result = item.get("result")
+    if isinstance(result, dict) and result.get("isError"):
+        return " ".join(str(c.get("text", "")) for c in result.get("content") or []
+                        if isinstance(c, dict))[:500] or "failed"
+    return ""
 
 
 class CodexServerError(Exception):
@@ -465,7 +477,8 @@ class CodexServer:
                         on_step(str(item.get("id")), step_label(item))
                 elif tool and method == "item/completed":
                     if on_step:
-                        on_step(str(item.get("id")), "")
+                        failed = item_error(item)
+                        on_step(str(item.get("id")), "", failed) if failed else on_step(str(item.get("id")), "")
                     if item.get("type") == "mcpToolCall":
                         servers.add(item.get("server") or "")
                         if item.get("server") == "friday":

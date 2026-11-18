@@ -185,3 +185,38 @@ def test_progress_updates_use_the_small_fast_model(tmp_path):
     assert light_model("codex", path=cache) == ("gpt-6-luna", "low")
     assert light_model("codex", "gpt-6.2-sol", path=cache) == ("gpt-6.2-sol", "low")
     assert light_model("claude") == ("haiku", "")
+
+
+def test_watchdog_rethinks_then_stops_a_turn_that_makes_no_progress():
+    """Failed steps with nothing succeeding after: advice at 20s, an order to stop at 30s, and at
+    50s Friday stops the turn itself. A step that gets somewhere resets it."""
+    from friday.bot import TurnStatus
+
+    async def main():
+        nudges, ended = [], []
+        async def nudge(text, images):
+            nudges.append(text)
+        async def advise(facts):
+            return "Open the video's transcript instead."
+        async def give_up(facts):
+            ended.append(facts["errors"][-1])
+        st = TurnStatus(lambda *a: asyncio.sleep(0), lambda *a: asyncio.sleep(0), lambda m: asyncio.sleep(0),
+                        nudge=nudge, advise=advise, give_up=give_up, tick=3600)
+        st.on_step("1", "browser: click «Play»")
+        st.on_step("1", "", "Timeout 5000ms exceeded")
+        t0 = st.trouble_since
+        for at in (5, 21, 31, 51):
+            await st._watch(t0 + at)
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert nudges[0].startswith("[Friday supervisor] Open the video's transcript") and "Stop trying now" in nudges[1]
+        assert ended == ["browser: click «Play»: Timeout 5000ms exceeded"]
+        st.on_step("2", "browser: snapshot")
+        st.on_step("2", "")
+        assert st.trouble_since == t0  # looking isn't progress
+        st.on_step("3", "browser: navigate «youtube.com/watch»")
+        st.on_step("3", "")
+        assert st.trouble_since is None and st.stage == 0
+        await st.finish()
+
+    asyncio.run(main())
