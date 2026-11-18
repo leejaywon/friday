@@ -215,7 +215,11 @@ def start(cfg: Config, title: str = "", max_minutes: int = 60) -> dict:
                   "--property=UMask=0077", "--property=MemoryMax=256M",
                   f"--setenv=PULSE_SERVER={_pulse()}",
                   "/usr/bin/ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
-                  "-f", "pulse", "-i", "friday_browser.monitor", "-t", str(seconds),
+                  # A VPS needs a bounded input queue. Derive encoder PTS from sample counts,
+                  # since Pulse's wall clock can jump backwards as its latency changes.
+                  "-thread_queue_size", "512", "-f", "pulse", "-sample_rate", "48000",
+                  "-channels", "2", "-fragment_size", "19200", "-wallclock", "0",
+                  "-i", "friday_browser.monitor", "-t", str(seconds), "-af", "asetpts=N/SR/TB",
                   "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "48k",
                   "-f", "segment", "-segment_time", str(PART_SECONDS), "-reset_timestamps", "1",
                   "-segment_format", "mp4", "-segment_format_options", "movflags=+faststart",

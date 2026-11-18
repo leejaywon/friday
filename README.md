@@ -220,6 +220,11 @@ speaker and does not read login cookies.
 Chrome alone is configured to send output there; FFmpeg records its monitor source. Microphone
 input and other applications' default audio outputs are not captured. All audible Chrome tabs
 share that sink, so pause unrelated tabs before recording. Muted/paused media produces silence.
+Chrome uses an 8192-frame output buffer so a VPS scheduler has enough time to supply audio;
+FFmpeg uses sample-based timestamps to avoid clock jumps when PulseAudio changes its latency.
+To check for actual gaps in the captured audio, run
+`ssh friday 'cd ~/friday && .venv/bin/python deploy/check-browser-audio.py'` with other tabs paused.
+This records a generated tone, checks its continuity and playback clock, then removes the test.
 
 Examples to send Friday:
 

@@ -15,6 +15,7 @@ Environment=PULSE_SINK=friday_browser
 ExecStart=/usr/bin/google-chrome-stable \
   --headless --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
   --user-data-dir=%h/friday-data/browser --restore-last-session --no-first-run --no-default-browser-check \
+  --audio-buffer-size=8192 \
   --lang=ko-KR --window-size=1280,900 about:blank
 Restart=always
 RestartSec=5
