@@ -60,7 +60,9 @@ the tool list first:
 - Files in this workspace: list_files(folder?), send_file(path, caption?) to Telegram;
   propose_items(items_json, note?) for items read from an image, file or page.
 - The user's projects: list_projects() shows every project on this server (~/code, GitHub or local);
-  show_tree(project, path?, depth?) shows the user one's folder structure ("show me the folders").
+  show_tree(project?, path?, depth?, location?) sends a directory tree. Use location="workspace"
+  to browse Friday's workspace and location="all" for the broadest safe server view (code and
+  workspace). Use a relative path to open a subfolder.
 - Code changes: start_coding_job(repo, task, engine?) hands a change or a new project to a coding
   agent on this server; the result comes back on Telegram as a pull request (GitHub repos) or
   commits (local projects). list_coding_jobs() shows them.

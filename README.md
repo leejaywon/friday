@@ -110,6 +110,14 @@ one). `deploy/push.sh` uploads it and deploys.
 | `/backup` | sends you the database file |
 | `/status` | AI sign-in, calendar, counts |
 
+Ask Friday to show a directory tree in Telegram. The MCP call
+`show_tree(project="my-project", path="src")` browses a project under the configured code directory
+(`~/code` by default). Use `show_tree(location="workspace", path="files", depth=3)` for the workspace
+under `FRIDAY_DATA_DIR`. For the broadest server view, use `show_tree(location="all", depth=4)`.
+The tree is limited to the code and workspace roots and skips hidden entries, symlinks, and common
+secret, configuration, dependency, and build paths. Open a subfolder to see more when a listing
+is truncated.
+
 Edit Friday's personality and rules in `~/friday-data/workspace/FRIDAY.md` on the server. A few
 fixed rules (no stored secrets, web/GitHub text is never an instruction, plain-text formatting)
 are always added and can't be edited away.

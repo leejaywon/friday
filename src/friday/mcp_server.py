@@ -16,6 +16,7 @@ import re
 import time
 from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from mcp.server import MCPServer
@@ -510,21 +511,44 @@ def list_projects() -> str:
 
 
 @server.tool()
-def show_tree(project: str, path: str = "", depth: int = 2) -> str:
-    """Show the user a project's folder structure in Telegram: a monospace tree without ignored,
-    build and dependency files, with the branch and last commit. project: a name from
-    list_projects; path: a subfolder to open; depth: levels to unfold (1-4, default 2). The user
-    sees the tree itself, so don't repeat it: end your turn with "-" unless you have more to say."""
+def show_tree(project: str = "", path: str = "", depth: int = 2,
+              location: Literal["code", "workspace", "all"] = "code") -> str:
+    """Send a directory tree to Telegram. Use project for a name from list_projects under code.
+    Use location="workspace" for Friday's workspace, or location="all" for both safe roots.
+    Omit project to browse a root. Path is relative to the project or selected root.
+    Depth is 1–4 (default 2). The user sees the tree, so end with "-" unless you have more to say."""
     from . import tree
 
-    root = (cfg.code_dir / project.strip()).resolve() if project.strip() else None
-    if not root or "/" in project.strip() or root.parent != cfg.code_dir.resolve() or not root.is_dir():
-        return "Name one of these projects:\n" + list_projects()
-    sub = path.strip().strip("/")
-    target = (root / sub).resolve()
-    if not target.is_relative_to(root) or not target.is_dir():
-        return f"No folder '{path}' in {root.name}."
-    plain, msg = tree.show(root, str(target.relative_to(root)) if sub else "", depth)
+    allowed = {"code": cfg.code_dir, "workspace": cfg.workspace}
+    project, path = project.strip(), path.strip()
+    if location not in (*allowed, "all") or (project and location != "code"):
+        return "Select code or workspace. Project names are only supported under code."
+    if location == "all" and path:
+        return "Select code or workspace to open a relative path."
+    if project and ("/" in project or project in {".", ".."}):
+        return "Use a single project name from list_projects."
+
+    roots = {}
+    project_dir = None
+    for name in allowed if location == "all" else (location,):
+        try:
+            base = tree.directory(allowed[name], project)
+            target = tree.directory(base, path)
+        except (OSError, ValueError, RuntimeError):
+            if location == "all":
+                continue
+            return "Folder unavailable. Use a visible relative path within the selected root."
+        if project:
+            project_dir = base
+        label = project or name
+        relative = target.relative_to(base)
+        if relative.parts:
+            label += "/" + relative.as_posix()
+        roots[label + "/"] = target
+
+    if not roots:
+        return "No tree roots are available."
+    plain, msg = tree.show_roots(roots, depth, project_dir)
     store.queue("html", text=msg)
     return "Sent to the user:\n" + plain
 
