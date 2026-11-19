@@ -160,6 +160,17 @@ def test_tree_leaves_out_ignored_files_and_folds_deep_folders(tmp_path):
     assert msg.startswith("<b>") and "<pre>app/\n" in msg
 
 
+def test_tree_of_a_workspace_folder_is_sent_as_a_tree(tools, cfg, store):
+    """Not only projects: a workspace folder too, as one monospace message (not a hand-written tree)."""
+    for f in ("konkuk/보안/과제.pdf", "konkuk/다이어트/기말과제.md"):
+        (cfg.workspace / f).parent.mkdir(parents=True, exist_ok=True)
+        (cfg.workspace / f).write_text("x")
+    assert "기말과제.md" in tools.show_tree("konkuk")
+    sent = store.conn.execute("SELECT text FROM outbox WHERE kind = 'html'").fetchone()["text"]
+    assert sent.startswith("<pre>konkuk/\n") and "기말과제.md" in sent
+    assert tools.show_tree("../..").startswith("No project or workspace folder")
+
+
 def test_phone_book(tools):
     out = tools.add_contact("김민수", ["휴대폰: 010-1234-5678", "회사 02-123-4567"], ["Minsu Kim", "민수형"],
                             notes="고등학교 친구")

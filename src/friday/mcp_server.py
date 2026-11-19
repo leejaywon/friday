@@ -534,15 +534,22 @@ def list_projects() -> str:
 
 @server.tool()
 def show_tree(project: str, path: str = "", depth: int = 2) -> str:
-    """Show the user a project's folder structure in Telegram: a monospace tree without ignored,
-    build and dependency files, with the branch and last commit. project: a name from
-    list_projects; path: a subfolder to open; depth: levels to unfold (1-4, default 2). The user
-    sees the tree itself, so don't repeat it: end your turn with "-" unless you have more to say."""
+    """Show the user a folder's structure in Telegram as a monospace tree: a project (a name from
+    list_projects; without ignored, build and dependency files, with the branch and last commit)
+    or a workspace folder ('konkuk', 'files/inbox', '.' for the whole workspace). path: a
+    subfolder to open; depth: levels to unfold (1-4, default 2). Use this for any "show me the
+    folders/directory", never a tree written by hand. The user sees the tree itself, so don't
+    repeat it: end your turn with "-" unless you have more to say."""
     from . import tree
 
-    root = (cfg.code_dir / project.strip()).resolve() if project.strip() else None
-    if not root or "/" in project.strip() or root.parent != cfg.code_dir.resolve() or not root.is_dir():
-        return "Name one of these projects:\n" + list_projects()
+    name = project.strip().strip("/") or "."
+    code = (cfg.code_dir / name).resolve()
+    if "/" not in name and name != "." and code.parent == cfg.code_dir.resolve() and code.is_dir():
+        root = code
+    elif (ws := wsfiles.inside(cfg.workspace, name)) is not None and ws.is_dir():
+        root = ws  # a workspace folder
+    else:
+        return f"No project or workspace folder '{project}'. Projects:\n{list_projects()}"
     sub = path.strip().strip("/")
     target = (root / sub).resolve()
     if not target.is_relative_to(root) or not target.is_dir():
