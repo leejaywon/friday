@@ -12,6 +12,9 @@ A personal assistant that lives on your own server and talks to you over Telegra
 
 - **Chat** in any language. Friday runs on your ChatGPT plan (Codex) or your Claude plan
   (Claude Code), whichever you have.
+- **Web research**: uses the agent's built-in web search for public facts, comparisons and
+  current information, with follow-up searches and source links. The browser is attached only
+  when a request needs a signed-in page or interaction with a website.
 - **Reminders** that always arrive: a scheduler on the server sends them, independent of the AI.
   Repeats are supported ("every weekday at 9").
 - **Google Calendar**: read and add events, heads-up before meetings, morning brief.

@@ -91,7 +91,7 @@ def _in_chat(ctx: Context | None) -> bool:
     return bool(_context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")) and not _run_id(ctx)
 
 
-TOOLSETS = ("github",)  # the browser is attached in chat unless another turn has it (bot lanes)
+TOOLSETS = ("github",)  # browser requests are handled separately: one chat turn at a time
 
 
 def _card(ctx: Context | None, kind: str, text: str) -> None:
@@ -108,7 +108,8 @@ def _lane(ctx: Context | None) -> str:
 @server.tool()
 def use_tools(toolset: str, reason: str = "", ctx: Context | None = None) -> str:
     """Turn on the 'github' toolset (the user's GitHub repos, issues and pull requests) for the
-    rest of this conversation, or get the browser when another request has it ('browser'). The
+    rest of this conversation, or attach the browser for this turn ('browser'). Public research
+    uses the agent's built-in web search; request the browser for signed-in pages or UI work. The
     tools are attached right after this turn and you are continued automatically: call this as
     soon as you know you need them, then end your turn, writing nothing but "-".
 
@@ -123,8 +124,8 @@ def use_tools(toolset: str, reason: str = "", ctx: Context | None = None) -> str
             return "The browser tools (mcp__playwright__*) are already attached."
         on = set(json.loads(store.get(key) or "[]")) | {"browser"}
         store.set(key, json.dumps(sorted(on)))
-        return ("Another request is using the browser. End your turn now, writing nothing but \"-\"; "
-                "you'll be continued with the browser as soon as it's free.")
+        return ("Browser requested. End your turn now, writing nothing but \"-\"; "
+                "you'll be continued with the browser tools attached as soon as it's free.")
     if name not in TOOLSETS:
         return f"Unknown toolset '{toolset}'. Toolsets: {', '.join(TOOLSETS)}."
     if name == "github" and not (cfg.github_token_set or cfg.github_code_token):

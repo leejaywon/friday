@@ -46,14 +46,20 @@ def test_messages_run_at_once_and_one_turn_has_the_browser(cfg, tools, monkeypat
     bot = Friday(replace(cfg, browser_enabled=True))
     monkeypatch.setattr(tools, "store", bot.store)
     runs = []
+    first_has_browser, second_requested = asyncio.Event(), asyncio.Event()
 
     async def codex_turn(prompt, thread, images, toolsets, status=None, lane="1"):
         runs.append((lane, "browser" in toolsets, "browser is busy" in prompt))
-        if lane == "2" and len(runs) == 2:  # the second message asks for the browser, which the first has
+        if "browser" not in toolsets:  # each request starts without reserving the browser
             assert "already attached" not in tools.use_tools("browser", ctx=SimpleNamespace(
-                headers={"X-Friday-Chat": "2", "X-Friday-No-Browser": "1"}))
+                headers={"X-Friday-Chat": lane, "X-Friday-No-Browser": "1"}))
+            if lane == "2":
+                second_requested.set()
             return AgentResult("-", f"t{lane}", [])
-        await asyncio.sleep(0.05)
+        if lane == "1":
+            first_has_browser.set()
+            await second_requested.wait()
+            await asyncio.sleep(0.05)  # the photo can steer this request while it is still working
         return AgentResult(f"done {lane}", f"t{lane}", [])
 
     async def nothing(*a, **k):
@@ -76,18 +82,75 @@ def test_messages_run_at_once_and_one_turn_has_the_browser(cfg, tools, monkeypat
 
     async def go():
         first = asyncio.create_task(bot.ask(1, "look this up on the website"))
-        await asyncio.sleep(0)
+        await first_has_browser.wait()
         await asyncio.gather(bot.ask(1, "and check that one too"), bot.ask(1, "here's the photo for it"))
         await first
 
     asyncio.run(go())
-    # Both requests started at once; the second waited for the browser only after asking for it.
-    assert runs[:2] == [("1", True, False), ("2", False, True)] and runs[2] == ("2", True, False)
+    # Both start without it; each gets it only on request, and the second waits for the first.
+    assert runs == [("1", False, False), ("1", True, False), ("2", False, True), ("2", True, False)]
     assert bot.lanes["2"].thread == "t2" and not bot.browser_lock.locked()
     assert "done 2" in bot.store.get("meanwhile")  # the main conversation hears about it
     # The photo continues the first request: it goes into that turn, not a new one.
-    assert [k for k, _ in steered] == ["1"] and "here's the photo for it" in steered[0][1] and len(runs) == 3
+    assert [k for k, _ in steered] == ["1"] and "here's the photo for it" in steered[0][1]
     assert any(t.startswith("↪️") for t in said)
+    bot.store.close()
+
+
+def test_public_research_never_reserves_browser_and_browser_access_expires_after_turn(cfg, tools, monkeypatch):
+    bot = Friday(replace(cfg, browser_enabled=True))
+    monkeypatch.setattr(tools, "store", bot.store)
+    runs = []
+
+    async def turn(prompt, thread, images, toolsets, status=None, lane="1"):
+        attached = "browser" in toolsets
+        runs.append((attached, bot.browser_lock.locked()))
+        if "my orders" in prompt:
+            tools.use_tools("browser", ctx=SimpleNamespace(
+                headers={"X-Friday-Chat": lane, "X-Friday-No-Browser": "1"}))
+            return AgentResult("-", "t1")
+        if not attached:
+            assert "Browser tools are not attached" in prompt
+        return AgentResult("done", "t1")
+
+    async def nothing(*a, **k):
+        pass
+
+    bot._codex_turn, bot.say, bot._keep_typing, bot.outbox_loop = turn, nothing, nothing, nothing
+
+    async def go():
+        await bot.ask(1, "Research the latest Claude policy")
+        await bot.ask(1, "Check my orders on the shop")
+        await bot.ask(1, "Compare the public prices on that shop")
+
+    asyncio.run(go())
+    assert runs == [(False, False), (False, False), (True, True), (False, False)]
+    assert not bot.browser_lock.locked() and "browser" not in bot._toolsets()
+    bot.store.close()
+
+
+def test_public_research_finishes_while_another_request_holds_browser(cfg):
+    bot = Friday(replace(cfg, browser_enabled=True))
+
+    async def turn(prompt, thread, images, toolsets, status=None, lane="1"):
+        assert "browser" not in toolsets and bot.browser_lock.locked()
+        assert "browser is busy" in prompt
+        return AgentResult("research done", "t1")
+
+    async def nothing(*a, **k):
+        pass
+
+    bot._codex_turn, bot.say, bot._keep_typing, bot.outbox_loop = turn, nothing, nothing, nothing
+
+    async def go():
+        await bot.browser_lock.acquire()
+        try:
+            await asyncio.wait_for(bot.ask(1, "Research the latest Claude policy"), 1)
+            assert bot.browser_lock.locked()  # the other request still owns it
+        finally:
+            bot.browser_lock.release()
+
+    asyncio.run(go())
     bot.store.close()
 
 

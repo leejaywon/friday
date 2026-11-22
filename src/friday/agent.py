@@ -67,7 +67,11 @@ the tool list first:
   agent on this server; the result comes back on Telegram as a pull request (GitHub repos) or
   commits (local projects). list_coding_jobs() shows them.
 - Settings: set_timezone(timezone), set_model(model?, effort?).
-- Web search for anything current.
+- Public web research: use the built-in web search for current facts, news, prices, comparisons
+  and questions about sites or apps. Read relevant sources, refine the query or search again
+  when evidence is missing or conflicts, and give source links. A site or app name alone does
+  not mean you need its browser UI. Do not open a search engine in the browser for ordinary
+  research. Use the browser if a source needs interaction to read, or the user asks to use its UI.
 - Watches: "tell me when/if X" that needs checking something periodically (a site, GitHub, seats)
   is add_watch (list_watches, cancel_watch); a plain time stays a reminder. Email isn't connected:
   say so and offer what you can (e.g. a watch on the webmail site in the browser).
@@ -76,11 +80,14 @@ the tool list first:
   with the user's saved logins (list_logins(), fill_login(name), fill_login_field(name, field)),
   request_approval(summary) before irreversible steps, and schedule_browser_run for browser work
   later. Only the browser_* tools are mcp__playwright__; the rest are mcp__friday__. For logging in, checking or submitting on a site.
-  When the user names a site or app to look at (a maps site, a site they use, a shop...) or asks you to
-  do something on a website, use the browser; don't substitute web search. Pages are long: look
+  Use it for signed-in account information, interacting with a page, or inspecting the actual
+  screen (including a map or player). Public information about a named site or app still starts
+  with web search. Respect an explicit request to use a particular site's UI. Browser tools are
+  attached only when needed: call use_tools("browser") and end your turn with "-"; you are
+  continued with them attached as soon as the browser is free. Pages are long: look
   things up with browser_find, or browser_snapshot with a target (or depth), rather than full
   snapshots. Messages can be answered at the same time; only one turn has the browser. When a note
-  says it's busy and you need it, call use_tools("browser") and end your turn with "-". When something visible isn't in the snapshot as a control (a player's play button, a
+  says it's busy, continue any research that doesn't need it before requesting it. When something visible isn't in the snapshot as a control (a player's play button, a
   canvas, an icon), take a browser_take_screenshot, click it with browser_mouse_click_xy at its
   position in that screenshot, then take another screenshot to check it worked. Otherwise prefer
   snapshot refs: screenshots are slower and larger. A failed click comes back with Friday's note:
@@ -221,9 +228,8 @@ def github_read_token_var(cfg: Config) -> str | None:
     return CODE_TOKEN_VAR if cfg.github_code_token else None
 
 
-# Optional toolsets. Chat always attaches the browser (Codex defers MCP tool definitions, so it
-# costs ~10 tokens a turn); GitHub only once the conversation turned it on (use_tools). Friday's
-# own tools for the browser are hidden without it.
+# Optional toolsets. A chat requests the browser for the current turn with use_tools; GitHub
+# stays on for the conversation once requested. Friday's browser tools are hidden without it.
 TOOLSETS = ("browser", "github")
 # A browser tool call that hasn't answered by then fails, so the turn can go on (a mouse wheel on
 # a page that never goes idle hung for minutes). Friday's own tools wait longer (approvals).
@@ -281,7 +287,7 @@ def codex_overrides(
             headers[mcp_http.WATCH_HEADER] = str(watch_id)
         elif chat:
             headers[mcp_http.CHAT_HEADER] = chat if isinstance(chat, str) else "1"  # the chat lane
-            if not browser_on:  # use_tools("browser") then waits for it (bot lanes)
+            if not browser_on:  # use_tools("browser") attaches it on demand (bot lanes)
                 headers[mcp_http.NO_BROWSER_HEADER] = "1"
         o["mcp_servers.friday.url"] = mcp_http.url(mcp_http.friday_port())
         o["mcp_servers.friday.bearer_token_env_var"] = mcp_http.TOKEN_VAR

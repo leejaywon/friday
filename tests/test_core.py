@@ -178,6 +178,7 @@ def test_codex_args_attach_optional_toolsets_only_when_on(cfg):
     assert any(o.startswith("mcp_servers.friday.url=") for o in ov)
     assert 'mcp_servers.friday.http_headers={"X-Friday-Chat" = "1", "X-Friday-No-Browser" = "1"}' in ov
     assert not any(o.startswith(("mcp_servers.github", "mcp_servers.playwright")) for o in ov)
+    assert 'web_search="live"' in ov  # public research works without attaching a browser
     hidden = next(o for o in ov if o.startswith("mcp_servers.friday.disabled_tools="))
     assert '"fill_login"' in hidden and '"request_approval"' in hidden and "use_tools" not in hidden
 

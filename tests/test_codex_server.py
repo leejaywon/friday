@@ -98,11 +98,16 @@ def test_new_toolset_reloads_the_thread(server):
         r = await server.run("one", None, toolsets={"browser"})
         await server.run("two", r.thread_id, toolsets={"browser"})  # same config: no reload
         await server.run("three", r.thread_id, toolsets={"browser", "github"})
+        await server.run("public research", r.thread_id, toolsets={"github"})
         await server.close()
 
     asyncio.run(go())
     calls = [c for c in server.calls() if c["method"].startswith("thread/")]
-    assert [c["method"] for c in calls] == ["thread/start", "thread/unsubscribe", "thread/resume"]
+    assert [c["method"] for c in calls] == ["thread/start", "thread/unsubscribe", "thread/resume",
+                                          "thread/unsubscribe", "thread/resume"]
     assert "mcp_servers.github.url" not in calls[0]["params"]["config"]
     assert calls[0]["params"]["config"]["mcp_servers.friday.http_headers"] == {"X-Friday-Chat": "1"}
     assert "mcp_servers.github.url" in calls[2]["params"]["config"]
+    assert "mcp_servers.playwright.command" not in calls[4]["params"]["config"]
+    assert calls[4]["params"]["config"]["web_search"] == "live"
+    assert calls[4]["params"]["config"]["mcp_servers.friday.http_headers"]["X-Friday-No-Browser"] == "1"

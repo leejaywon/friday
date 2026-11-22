@@ -658,12 +658,17 @@ class Friday(WatchBot):
 
     # --- conversation ------------------------------------------------------
 
-    def _wrap(self, text: str, files: list[str], new_thread: bool, lane: str = "1", browser_busy: bool = False) -> str:
+    def _wrap(self, text: str, files: list[str], new_thread: bool, lane: str = "1", browser_busy: bool = False,
+              browser_attached: bool = False) -> str:
         head = [f"[Now: {tu.local_str(tu.now_utc(), self.tz)} ({self.tz})]"]
         others = [short(x.topic, 120) for x in self.lanes.values() if x.key != lane and x.lock.locked() and x.topic]
         if others:
             head.append("[Also in progress in parallel, as other turns of yours: " + "; ".join(f"«{t}»" for t in others)
                         + ". Don't start that work again here; if asked about it, say it's still running.]")
+        if self.cfg.browser_enabled and not browser_attached:
+            head.append('[Browser tools are not attached to this turn. Use built-in web search for public '
+                        'research. If you need a signed-in page or UI interaction, call use_tools("browser") '
+                        'and end your turn with "-"; you will be continued with the tools attached.]')
         if browser_busy:
             head.append(f"[The browser is busy with another request («{short(self._browser_topic, 120)}»). If "
                         "this one needs it, call use_tools(\"browser\"); you're continued when it's free.]")
@@ -746,8 +751,7 @@ class Friday(WatchBot):
         self.store.delete("thread_id")
 
     def _toolsets(self, lane: str = "1") -> set[str]:
-        """Toolsets this chat lane turned on (mcp_server.use_tools); "browser" there means it asked
-        for the browser while another turn had it."""
+        """Toolsets this chat lane turned on; "browser" is an unfulfilled on-demand request."""
         return set(json.loads(self.store.get(mcp_http.toolsets_key(lane)) or "[]"))
 
     def _drop_browser_request(self, lane: str) -> None:
@@ -844,8 +848,8 @@ class Friday(WatchBot):
     async def _turn(self, chat_id: int, text: str, files: list[str] | None = None,
                     images: list[Path] | None = None, lane: Lane | None = None) -> None:
         """Answer a message (or continue after a note) in a chat lane's Codex thread. Lanes run at
-        the same time; only one turn has the browser, and another one that needs it asks with
-        use_tools("browser") and waits. When the agent turns on a toolset, the thread is continued
+        the same time; the browser is acquired only after use_tools("browser"), and only one turn
+        has it. When the agent turns on a toolset, the thread is continued
         right away with it attached, at most MAX_CONTINUATIONS times; only the last reply is sent."""
         lane = lane or self.lanes["1"]
         async with lane.lock:
@@ -859,11 +863,10 @@ class Friday(WatchBot):
                 if self.cfg.browser_enabled and "browser" in self._toolsets(lane.key):
                     self._drop_browser_request(lane.key)  # asked for it before (e.g. a request's answer)
                     has_browser = await self._take_browser(lane, status)
-                elif self.cfg.browser_enabled and not self.browser_lock.locked():
-                    has_browser = await self._take_browser(lane, status)
                 stopped = lane.stopping
                 prompt = self._wrap(text, files or [], thread is None, lane.key,
-                                    browser_busy=self.cfg.browser_enabled and not has_browser)
+                                    browser_busy=self.cfg.browser_enabled and self.browser_lock.locked() and not has_browser,
+                                    browser_attached=has_browser)
                 for step in range(0 if stopped else MAX_CONTINUATIONS + 1):
                     toolsets = (self._toolsets(lane.key) - {"browser"}) | ({"browser"} if has_browser else set())
                     lane.task = asyncio.create_task(self._codex_turn(
