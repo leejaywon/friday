@@ -122,7 +122,7 @@ def doctor(cfg) -> None:
 
     line(*asyncio.run(engine_status(cfg)))
     line(gcal.is_connected(cfg.google_token), f"Google Calendar token: {cfg.google_token}")
-    print(f"  --   timezone {cfg.default_tz}, meeting heads-up {cfg.meeting_lead_min} min, "
+    print(f"  --   timezone {cfg.default_tz}, "
           f"morning brief {cfg.morning_brief_at or 'off'}")
 
 

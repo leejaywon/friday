@@ -94,10 +94,15 @@ def _in_chat(ctx: Context | None) -> bool:
 TOOLSETS = ("github",)  # browser requests are handled separately: one chat turn at a time
 
 
-def _card(ctx: Context | None, kind: str, text: str) -> None:
-    """In chat, show what a tool added as a card with buttons (bot.outbox_loop, planner.py)."""
+def _receipt(ctx: Context | None, line: str) -> None:
+    """In chat, a line for the turn's receipt: what really changed, which the bot adds under the
+    agent's reply (bot._turn), so a reply that says otherwise is caught at a glance."""
     if _in_chat(ctx):
-        store.queue(kind, text=text)
+        store.queue("receipt", text=line, path=_lane(ctx))
+
+
+def _when(dt) -> str:
+    return planner.when(dt, _tz(), tu.now_utc())
 
 
 def _lane(ctx: Context | None) -> str:
@@ -189,7 +194,7 @@ def add_reminder(text: str, when: str, repeat: str = "", skip_dates: str = "", c
         r = store.add_reminder(text, dt, tz, repeat or None, skip)
     except ValueError as e:
         return f"Not scheduled: {e}"
-    _card(ctx, "reminder_card", str(r.id))
+    _receipt(ctx, f"⏰ {planner.short(r.text, 80)} · {_when(r.next_at)}" + (" · repeats" if r.rrule else ""))
     if not r.rrule:
         return f"Scheduled #{r.id} '{r.text}' for {r.preview(tz)[0]}."
     return f"Scheduled #{r.id} '{r.text}'. Next 3 alerts (tell the user): {'; '.join(r.preview(tz))}"
@@ -207,13 +212,17 @@ def list_reminders() -> str:
 
 
 @server.tool()
-def cancel_reminder(reminder_id: int) -> str:
+def cancel_reminder(reminder_id: int, ctx: Context | None = None) -> str:
     """Cancel a reminder (all future repeats too) by id."""
-    return "Cancelled." if store.cancel_reminder(reminder_id) else "No active reminder with that id."
+    r = next((x for x in store.active_reminders() if x.id == reminder_id), None)
+    if not r or not store.cancel_reminder(reminder_id):
+        return "No active reminder with that id."
+    _receipt(ctx, f"🔕 {planner.short(r.text, 80)}")
+    return "Cancelled."
 
 
 @server.tool()
-def reschedule_reminder(reminder_id: int, when: str) -> str:
+def reschedule_reminder(reminder_id: int, when: str, ctx: Context | None = None) -> str:
     """Move a reminder to a new ISO 8601 time. For a repeating reminder this also moves the series.
     A one-off that already went off is re-armed, so "push it back 30 minutes" is this one call."""
     tz = _tz()
@@ -221,6 +230,8 @@ def reschedule_reminder(reminder_id: int, when: str) -> str:
     if dt < tu.now_utc() - timedelta(minutes=1):
         return f"Not rescheduled: {tu.local_str(dt, tz)} is in the past."
     r = store.reschedule_reminder(reminder_id, dt)
+    if r:
+        _receipt(ctx, f"⏰ {planner.short(r.text, 80)} → {_when(r.next_at)}")
     return f"Rescheduled #{r.id} '{r.text}': next {'; '.join(r.preview(tz))}." if r else "No reminder with that id."
 
 
@@ -240,15 +251,15 @@ def calendar_create_event(title: str, start: str, end: str, description: str = "
     start_dt, end_dt = tu.parse_when(start, tz), tu.parse_when(end, tz)
     ev = gcal.create_event(cfg.google_token, title, start_dt, end_dt, description, location)
     span = f"{planner.when(start_dt, tz, tu.now_utc())}–{end_dt.astimezone(ZoneInfo(tz)):%H:%M}"
-    _card(ctx, "event_card", json.dumps({"id": ev.get("id"), "title": ev.get("summary") or title, "when": span,
-                                         "location": location}, ensure_ascii=False))
+    _receipt(ctx, f"📅 {planner.short(ev.get('summary') or title, 80)} · {span}")
     return f"Created '{ev.get('summary')}' [id={ev.get('id')}] {ev.get('htmlLink', '')}"
 
 
 @server.tool()
-def calendar_delete_event(event_id: str) -> str:
+def calendar_delete_event(event_id: str, ctx: Context | None = None) -> str:
     """Delete a Google Calendar event by id. Only do this when the user clearly asked for it."""
-    gcal.delete_event(cfg.google_token, event_id)
+    title = gcal.delete_event(cfg.google_token, event_id)
+    _receipt(ctx, f"🗑 📅 {planner.short(title, 80)}")
     return "Deleted."
 
 
@@ -276,7 +287,7 @@ def add_task(title: str, due: str = "", remind: str = "", notes: str = "", ctx: 
     else:
         remind_dt = tu.default_task_reminder(due_dt, tz, now) if due_dt else None
     t = store.add_task(title, due_dt, remind_dt, notes)
-    _card(ctx, "task_card", str(t.id))
+    _receipt(ctx, f"＋ {planner.short(t.title, 80)}" + (f" · due {_when(t.due_at)}" if t.due_at else ""))
     return f"Added task {t.describe(tz)}"
 
 
@@ -291,13 +302,18 @@ def list_tasks(include_done: bool = False) -> str:
 
 
 @server.tool()
-def complete_task(task_id: int) -> str:
+def complete_task(task_id: int, ctx: Context | None = None) -> str:
     """Mark a to-do as done (when the user says they finished it). Find the id with list_tasks."""
-    return "Marked done." if store.complete_task(task_id) else "No open task with that id."
+    t = store.task(task_id)
+    if not t or not store.complete_task(task_id):
+        return "No open task with that id."
+    _receipt(ctx, f"✅ {planner.short(t.title, 80)}")
+    return "Marked done."
 
 
 @server.tool()
-def update_task(task_id: int, title: str = "", due: str = "", remind: str = "", notes: str = "") -> str:
+def update_task(task_id: int, title: str = "", due: str = "", remind: str = "", notes: str = "",
+                ctx: Context | None = None) -> str:
     """Change an open to-do. Only the fields you pass change; remind='none' removes the heads-up."""
     if looks_secret(f"{title} {notes}"):
         return REFUSAL
@@ -310,13 +326,20 @@ def update_task(task_id: int, title: str = "", due: str = "", remind: str = "", 
         remind=tu.parse_when(remind, tz) if remind and remind.lower() != "none" else None,
         clear_remind=remind.lower() == "none",
     )
-    return f"Updated {t.describe(tz)}" if t else "No open task with that id."
+    if not t:
+        return "No open task with that id."
+    _receipt(ctx, f"✎ {planner.short(t.title, 80)}" + (f" · due {_when(t.due_at)}" if t.due_at else ""))
+    return f"Updated {t.describe(tz)}"
 
 
 @server.tool()
-def cancel_task(task_id: int) -> str:
+def cancel_task(task_id: int, ctx: Context | None = None) -> str:
     """Drop a to-do the user no longer needs to do."""
-    return "Cancelled." if store.cancel_task(task_id) else "No open task with that id."
+    t = store.task(task_id)
+    if not t or not store.cancel_task(task_id):
+        return "No open task with that id."
+    _receipt(ctx, f"🗑 {planner.short(t.title, 80)}")
+    return "Cancelled."
 
 
 @server.tool()

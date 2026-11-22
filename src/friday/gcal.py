@@ -118,5 +118,9 @@ def create_event(
     return _service(token_path).events().insert(calendarId=calendar_id, body=body).execute()
 
 
-def delete_event(token_path: Path, event_id: str, calendar_id: str = "primary") -> None:
-    _service(token_path).events().delete(calendarId=calendar_id, eventId=event_id).execute()
+def delete_event(token_path: Path, event_id: str, calendar_id: str = "primary") -> str:
+    """Delete an event; returns its title."""
+    svc = _service(token_path)
+    title = svc.events().get(calendarId=calendar_id, eventId=event_id).execute().get("summary", "(no title)")
+    svc.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+    return title

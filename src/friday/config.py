@@ -31,7 +31,6 @@ class Config:
     web_search: str  # live | cached | disabled
     github_token_set: bool
     github_readonly: bool
-    meeting_lead_min: int
     morning_brief_at: str  # "HH:MM" in the user's timezone, or "" to turn it off
     # The agent behind chat, browser runs and watch checks: codex (a ChatGPT plan) or claude (a
     # Claude plan, through Claude Code). Env: CHAT_ENGINE, CLAUDE_MODEL (claude's default model)
@@ -202,7 +201,6 @@ def load_config() -> Config:
         # The token itself stays in the environment; Codex reads it from GITHUB_TOKEN.
         github_token_set=bool(os.environ.get("GITHUB_TOKEN", "").strip()),
         github_readonly=os.environ.get("GITHUB_READONLY", "true").strip().lower() not in ("0", "false", "no"),
-        meeting_lead_min=int(os.environ.get("MEETING_LEAD_MIN", "10")),
         morning_brief_at=os.environ.get("MORNING_BRIEF_AT", "08:00").strip(),
         code_dir=Path(os.environ.get("CODE_DIR") or Path.home() / "code").expanduser(),
         code_engine=(os.environ.get("CODE_ENGINE", "claude").strip().lower() or "claude"),

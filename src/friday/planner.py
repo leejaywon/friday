@@ -2,8 +2,9 @@
 App's planner (site/app/components/planner.js).
 
 Cards: /tasks is one message listing open tasks, a row of buttons each ([✅ title] [➡️] [🗑]),
-edited in place as they're tapped. When the chat agent adds a task, a reminder or an event, the
-bot shows it as a card with its own buttons (outbox kinds task_card, reminder_card, event_card).
+edited in place as they're tapped. What the chat agent adds or changes is no card: a plain receipt
+under its reply (mcp_server._receipt). task_card, reminder_card and event_card still update the
+cards older messages carry when their buttons are tapped.
 
 Planner: /plan opens the Mini App with this week's tasks, events and reminders in the URL fragment
 (miniapp.py). The owner checks, moves, removes and adds things there, and Save sends the changes

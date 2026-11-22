@@ -17,7 +17,7 @@ A personal assistant that lives on your own server and talks to you over Telegra
   when a request needs a signed-in page or interaction with a website.
 - **Reminders** that always arrive: a scheduler on the server sends them, independent of the AI.
   Repeats are supported ("every weekday at 9").
-- **Google Calendar**: read and add events, heads-up before meetings, morning brief.
+- **Google Calendar**: read and add events, morning brief.
 - **Memory**: Friday saves lasting facts about you and recalls them later.
 - **Files and photos**: send them to the bot; they land in `files/inbox/` for Friday to use. A
   photo of a schedule, notice or invoice turns into a list of deadlines and events you add with one tap.

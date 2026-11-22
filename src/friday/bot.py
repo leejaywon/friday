@@ -1,5 +1,5 @@
 """The Telegram bot: chat with Codex, coding jobs, browser runs and approvals, and delivery of
-reminders, task alerts, meeting heads-ups and the morning brief."""
+reminders, task alerts and the morning brief."""
 
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ MAX_RESUMES = 2
 # Friday's tools that ask the user something and return at once in chat (the answer continues the
 # thread), and those that list things for the user to tap (the reply only says it was sent).
 REQUEST_TOOLS = {"request_form", "request_code", "request_approval"}
-LISTING_TOOLS = {"propose_items", "show_tree", "add_task", "add_reminder", "calendar_create_event"}
+LISTING_TOOLS = {"propose_items", "show_tree"}
 # Tools that only look things up: left out of what a side lane tells the others it did.
 READ_ONLY_TOOL = re.compile(r"^(list_|read_|get_|find_|recall|calendar_events|browser_recording_status|show_tree|use_tools)")
 # A side conversation that ended this recently can still be continued (Friday._route).
@@ -614,7 +614,7 @@ class Friday(WatchBot):
             await self._runs_startup()
         except Exception:
             log.exception("browser runs startup failed")
-        for loop in (self.reminder_loop, self.outbox_loop, self.calendar_loop, self.brief_loop, self.job_loop,
+        for loop in (self.reminder_loop, self.outbox_loop, self.brief_loop, self.job_loop,
                      self.browser_run_loop, self.watch_loop):
             self._tasks.append(asyncio.create_task(self._forever(loop), name=loop.__name__))
         log.info("Friday started; tz=%s, allowed=%s", self.tz, self.cfg.allowed_user_ids)
@@ -864,6 +864,7 @@ class Friday(WatchBot):
                     self._drop_browser_request(lane.key)  # asked for it before (e.g. a request's answer)
                     has_browser = await self._take_browser(lane, status)
                 stopped = lane.stopping
+                self.store.take_receipts(lane.key)  # left by a turn that never finished (a restart)
                 prompt = self._wrap(text, files or [], thread is None, lane.key,
                                     browser_busy=self.cfg.browser_enabled and self.browser_lock.locked() and not has_browser,
                                     browser_attached=has_browser)
@@ -908,8 +909,11 @@ class Friday(WatchBot):
                 lane.topic, lane.status, lane.finished_at = "", None, clock.monotonic()
                 async with self._lane_free:
                     self._lane_free.notify_all()
+            receipt = "\n".join(self.store.take_receipts(lane.key))
             if stopped:
                 self._note_exchange(text, "(stopped by the user)", lane.key, calls)
+                if receipt:
+                    await self.say(receipt, chat_id)
                 return
             # This turn's own tools (other lanes run at the same time), not what's new in the store.
             tools = {tool for tool, _ in calls}
@@ -921,11 +925,11 @@ class Friday(WatchBot):
                     self._continue_fresh()
                 else:
                     lane.thread = None
-        if result.text:
-            # A one-liner next to a proposal or a tree (show_tree) only says it was sent.
-            if self._worth_sending(result.text, made_request, bool(tools & LISTING_TOOLS)):
-                await self.say(plain_text(result.text), chat_id)
-        elif result.errors or not made_request:
+        reply = plain_text(result.text) if result.text and self._worth_sending(
+            result.text, made_request, bool(tools & LISTING_TOOLS)) else ""  # a one-liner next to a proposal only says it was sent
+        if reply or receipt:
+            await self.say("\n\n".join(x for x in (reply, receipt) if x), chat_id)
+        if not result.text and (result.errors or not (made_request or receipt)):
             detail = "; ".join(result.errors) or "no reply"
             await self.say(f"Agent error: {detail[:1500]}\nIf this keeps happening, send /new.", chat_id)
         await self.outbox_loop()
@@ -2598,6 +2602,8 @@ class Friday(WatchBot):
         # Runs on its timer and after each turn, at the same time: each row is claimed before it is
         # sent, so one being sent (a file upload) isn't sent again by the other, and nothing waits for it.
         for row in self.store.pending_outbox():
+            if row["kind"] == "receipt":  # the turn adds these under its reply (_turn)
+                continue
             if not self.store.claim_outbox(row["id"]):
                 continue
             try:
@@ -2609,8 +2615,6 @@ class Friday(WatchBot):
                             await self.say(f"⚠️ {problem}")
                 elif row["kind"] == "proposal":
                     await self._send_proposal(int(row["text"]))
-                elif row["kind"] in ("task_card", "reminder_card", "event_card"):
-                    await self._send_card(row["kind"], row["text"])
                 elif row["kind"] == "approval":  # text holds the approval id, path an optional screenshot
                     await self._send_approval(int(row["text"]), row["path"])
                 elif row["kind"] == "login_request":  # text holds the login request id
@@ -2628,50 +2632,6 @@ class Friday(WatchBot):
                 self.store.unclaim_outbox(row["id"])
                 raise
         return 3
-
-    async def _send_card(self, kind: str, text: str) -> None:
-        """What the chat agent added, as a card with buttons (planner.py)."""
-        now = tu.now_utc()
-        if kind == "task_card":
-            t = self.store.task(int(text))
-            if not t:
-                return
-            body, markup = planner.task_card(t, self.tz, now)
-        elif kind == "reminder_card":
-            r = next((x for x in self.store.active_reminders() if x.id == int(text)), None)
-            if not r:
-                return
-            body, markup = planner.reminder_card(r, self.tz, now)
-        else:
-            key = str(int(self.store.get("event_card_seq") or 0) + 1)  # the id is too long for a button
-            self.store.set("event_card_seq", key)
-            self.store.set(f"event_card:{key}", text)
-            body, markup = planner.event_card(json.loads(text), key)
-        await self.app.bot.send_message(self.owner, body, reply_markup=markup)  # type: ignore[union-attr]
-
-    async def calendar_loop(self) -> float:
-        if not gcal.is_connected(self.cfg.google_token):
-            return 300
-        zone, lead = ZoneInfo(self.tz), timedelta(minutes=self.cfg.meeting_lead_min)
-        now = tu.now_utc()
-        try:
-            events = await asyncio.to_thread(gcal.list_events, self.cfg.google_token, now, now + lead, zone)
-        except Exception as e:
-            if self.store.get("gcal_error") != str(e):
-                self.store.set("gcal_error", str(e))
-                await self.say(f"Google Calendar isn't working: {e}")
-            raise
-        self.store.delete("gcal_error")
-        for ev in events:
-            if ev.start and now < ev.start <= now + lead and self.store.claim_event_notice(ev.id, ev.start.isoformat()):
-                mins = max(1, round((ev.start - now).total_seconds() / 60))
-                lines = [f"📅 In {mins} min: {ev.title}"]
-                if ev.location:
-                    lines.append(ev.location)
-                if ev.link:
-                    lines.append(ev.link)
-                await self.say("\n".join(lines))
-        return 60
 
     async def brief_loop(self) -> float:
         if not self.cfg.morning_brief_at:

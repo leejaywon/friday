@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE TABLE IF NOT EXISTS outbox (
     id         INTEGER PRIMARY KEY,
-    kind       TEXT NOT NULL,           -- text | file | proposal | approval | login_request | login_expired
+    kind       TEXT NOT NULL,           -- text | file | proposal | approval | login_request | login_expired | receipt
     text       TEXT,                    -- message or caption; for the others, the row id to send
     path       TEXT,
     created_at TEXT NOT NULL,
@@ -58,12 +58,6 @@ CREATE TABLE IF NOT EXISTS outbox (
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS notified_events (
-    event_id TEXT NOT NULL,
-    start    TEXT NOT NULL,
-    PRIMARY KEY (event_id, start)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -575,6 +569,12 @@ class Store:
         """Sending it failed: it's sent again next time."""
         self.conn.execute("UPDATE outbox SET sent_at = NULL WHERE id = ?", (oid,))
 
+    def take_receipts(self, lane: str) -> list[str]:
+        """A chat lane's receipt lines (mcp_server._receipt), oldest first, marked sent."""
+        rows = self.conn.execute("SELECT id, text FROM outbox WHERE kind = 'receipt' AND path = ? AND sent_at IS NULL "
+                                 "ORDER BY id", (lane,)).fetchall()
+        return [r["text"] for r in rows if self.claim_outbox(r["id"])]
+
     # --- coding jobs -------------------------------------------------------
 
     def add_job(self, repo: str, task: str, engine: str) -> int:
@@ -745,15 +745,6 @@ class Store:
         for rid in ids:
             self.set_run_status(rid, "failed", "Friday restarted while this run was going.")
         return ids
-
-    # --- calendar notifications --------------------------------------------
-
-    def claim_event_notice(self, event_id: str, start: str) -> bool:
-        """True the first time an event occurrence is seen, so each meeting is announced once."""
-        cur = self.conn.execute(
-            "INSERT OR IGNORE INTO notified_events(event_id, start) VALUES(?, ?)", (event_id, start)
-        )
-        return cur.rowcount > 0
 
     # --- watches ("tell me when X", see watches.py) ----------------------------
 
