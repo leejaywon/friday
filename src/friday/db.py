@@ -571,6 +571,11 @@ class Store:
                               [(cur.lastrowid, role, text, at) for role, text, at in messages])
         return cur.lastrowid  # type: ignore[return-value]
 
+    def delete_conversations(self, ids: list[int]) -> None:
+        for cid in ids:
+            self.conn.execute("DELETE FROM messages WHERE conversation_id = ?", (cid,))
+            self.conn.execute("DELETE FROM conversations WHERE id = ?", (cid,))
+
     def all_messages(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM messages ORDER BY id").fetchall()
 

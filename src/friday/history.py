@@ -2,7 +2,7 @@
 
 Friday logs each chat turn (bot._turn). Chats from before that are only in Codex's session files
 (~/.codex/sessions/**/rollout-*.jsonl, one per thread); import_codex_sessions copies the user's
-messages and Friday's final replies from those into the log once, so recall finds them too.
+messages and Friday's final replies from those into the log, so recall finds them too.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ VOICE_NOTE = "[The user sent this as a voice message; it was transcribed automat
 _FILES = "[Files the user sent, saved in the workspace: "
 # What bot._wrap writes when the user sent only files (IMAGES_ONLY, FILES_ONLY) or steered with them.
 DUPLICATE = timedelta(minutes=30)
+IDLE = timedelta(hours=6)  # this much silence ends a conversation (bot._current_thread)
 _ONLY_FILES = ("[The user sent the image(s) above without a message", "(The user sent only the files above",
                "(only the files above)")
 
@@ -57,34 +58,42 @@ def codex_sessions_dir() -> Path:
 
 
 def import_codex_sessions(store: Store, sessions: Path, workspace: Path) -> int:
-    """Chat threads from Codex's session files into the log, up to where the log begins (so
-    nothing is there twice); each thread becomes a closed conversation, summarized later
-    (bot._summarize_conversations). Returns how many were imported."""
-    first = store.first_message_at()
-    seen = {(m["role"], m["text"]): m["at"] for m in store.all_messages()}
-    count = 0
+    """The chats from Codex's session files that are older than the log, as conversations the way
+    the log cuts them (IDLE apart, whichever thread they were in: a deploy, a full context or a side
+    lane starts a new thread mid-conversation). Conversations a previous import made from these
+    files are replaced. Summarized later (bot._summarize_conversations). Returns how many."""
+    found: list[tuple[str, str, str]] = []
     for path in sorted(sessions.rglob("rollout-*.jsonl")):
         try:
             messages, cwd = _read_session(path)
         except (OSError, ValueError) as e:
             log.warning("skipped %s: %s", path, e)
             continue
-        if cwd != str(workspace):  # coding jobs run elsewhere
+        if cwd == str(workspace):  # coding jobs run elsewhere
+            found += messages
+    keys = set(found)
+    earlier = {}
+    for m in store.all_messages():
+        earlier.setdefault(m["conversation_id"], []).append((m["role"], m["text"], m["at"]))
+    store.delete_conversations([cid for cid, ms in earlier.items() if set(ms) <= keys])
+
+    first = store.first_message_at()
+    seen = {(m["role"], m["text"]): m["at"] for m in store.all_messages()}
+    groups: list[list[tuple[str, str, str]]] = []
+    for role, text, at in sorted(found, key=lambda m: m[2]):
+        # Already there: a thread that replays earlier messages (with new times), a turn retried in
+        # a new thread. A short reply ("고마워") may really come twice, hours apart.
+        before = seen.get((role, text))
+        if (first and at >= first) or (before and (len(text) >= 20 or abs(tu.from_iso(at) - tu.from_iso(before)) < DUPLICATE)):
             continue
-        kept = []
-        for role, text, at in messages:
-            # Already there: a thread that replays earlier messages (with new times), a turn retried in
-            # a new thread. A short reply ("고마워") may really come twice, hours apart.
-            before = seen.get((role, text))
-            if (first and at >= first) or (before and (len(text) >= 20 or abs(tu.from_iso(at) - tu.from_iso(before)) < DUPLICATE)):
-                continue
-            seen[(role, text)] = at
-            kept.append((role, text, at))
-        messages = kept
+        seen[(role, text)] = at
+        if not groups or tu.from_iso(at) - tu.from_iso(groups[-1][-1][2]) > IDLE:
+            groups.append([])
+        groups[-1].append((role, text, at))
+    for messages in groups:
         if any(role == "user" for role, _, _ in messages):
             store.add_conversation(messages)
-            count += 1
-    return count
+    return sum(any(role == "user" for role, _, _ in ms) for ms in groups)
 
 
 def _read_session(path: Path) -> tuple[list[tuple[str, str, str]], str]:

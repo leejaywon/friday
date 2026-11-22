@@ -46,7 +46,7 @@ from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
 from .forms import SKIP, SKIPPED_KEY, check_values, login_spec, outcome, vault_values
-from .history import VOICE_NOTE, codex_sessions_dir, import_codex_sessions, said
+from .history import IDLE, VOICE_NOTE, codex_sessions_dir, import_codex_sessions, said
 from .jobs import JobError, Outcome, Runner, github_slug, parse_code_args, short
 from .jobs import run as run_cmd
 from .models import available_models, light_model, model_list
@@ -64,7 +64,7 @@ DOWNLOAD_LIMIT = 20 * 1024 * 1024
 UPLOAD_LIMIT = 50 * 1024 * 1024
 UPLOAD_TIMEOUT = 300.0
 FILES_PAGE = 8  # entries per /files page
-IDLE_NEW_THREAD = timedelta(hours=6)  # start a fresh Codex thread after this much silence
+IDLE_NEW_THREAD = IDLE  # start a fresh Codex thread (and conversation) after this much silence
 # Also start one (carrying the last exchange) once the context is this big (AgentResult.input_tokens).
 # Not after every browser turn: follow-ups ("and on Sunday?") need what the page said.
 MAX_TURN_INPUT_TOKENS = 60_000
@@ -779,15 +779,16 @@ class Friday(WatchBot):
                 + "; ".join(items) + "]")
 
     async def _import_history(self) -> None:
-        """Once: the chats from before the conversation log, from Codex's session files. Then
-        summarize what is closed and unsummarized (also conversations that closed before a restart)."""
-        if self.cfg.chat_engine == "codex" and not self.store.get("history_imported"):
+        """Once: the chats from before the conversation log, from Codex's session files ("2": cut
+        into conversations by silence; "1" was one per thread, which this replaces). Then summarize
+        what is closed and unsummarized (also conversations that closed before a restart)."""
+        if self.cfg.chat_engine == "codex" and self.store.get("history_imported") != "2":
             try:
                 n = await asyncio.to_thread(import_codex_sessions, self.store, codex_sessions_dir(), self.cfg.workspace)
                 log.info("imported %d earlier conversations from Codex's sessions", n)
             except Exception:
                 log.exception("importing earlier conversations failed")
-            self.store.set("history_imported", "1")
+            self.store.set("history_imported", "2")
         await self._summarize_conversations()
 
     def _summarize_soon(self) -> None:
