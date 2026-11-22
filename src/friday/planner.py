@@ -2,8 +2,8 @@
 App's planner (site/app/components/planner.js).
 
 Cards: /tasks is one message listing open tasks, a row of buttons each ([✅ title] [➡️] [🗑]),
-edited in place as they're tapped. What the chat agent adds or changes is no card: a plain receipt
-under its reply (mcp_server._receipt). task_card, reminder_card and event_card still update the
+edited in place as they're tapped. What the chat agent adds or changes gets no card: its reply says
+what it did. task_card, reminder_card and event_card still update the
 cards older messages carry when their buttons are tapped.
 
 Planner: /plan opens the Mini App with this week's tasks, events and reminders in the URL fragment

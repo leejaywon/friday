@@ -864,7 +864,6 @@ class Friday(WatchBot):
                     self._drop_browser_request(lane.key)  # asked for it before (e.g. a request's answer)
                     has_browser = await self._take_browser(lane, status)
                 stopped = lane.stopping
-                self.store.take_receipts(lane.key)  # left by a turn that never finished (a restart)
                 prompt = self._wrap(text, files or [], thread is None, lane.key,
                                     browser_busy=self.cfg.browser_enabled and self.browser_lock.locked() and not has_browser,
                                     browser_attached=has_browser)
@@ -909,11 +908,8 @@ class Friday(WatchBot):
                 lane.topic, lane.status, lane.finished_at = "", None, clock.monotonic()
                 async with self._lane_free:
                     self._lane_free.notify_all()
-            receipt = "\n".join(self.store.take_receipts(lane.key))
             if stopped:
                 self._note_exchange(text, "(stopped by the user)", lane.key, calls)
-                if receipt:
-                    await self.say(receipt, chat_id)
                 return
             # This turn's own tools (other lanes run at the same time), not what's new in the store.
             tools = {tool for tool, _ in calls}
@@ -925,11 +921,11 @@ class Friday(WatchBot):
                     self._continue_fresh()
                 else:
                     lane.thread = None
-        reply = plain_text(result.text) if result.text and self._worth_sending(
-            result.text, made_request, bool(tools & LISTING_TOOLS)) else ""  # a one-liner next to a proposal only says it was sent
-        if reply or receipt:
-            await self.say("\n\n".join(x for x in (reply, receipt) if x), chat_id)
-        if not result.text and (result.errors or not (made_request or receipt)):
+        if result.text:
+            # A one-liner next to a proposal or a tree (show_tree) only says it was sent.
+            if self._worth_sending(result.text, made_request, bool(tools & LISTING_TOOLS)):
+                await self.say(plain_text(result.text), chat_id)
+        elif result.errors or not made_request:
             detail = "; ".join(result.errors) or "no reply"
             await self.say(f"Agent error: {detail[:1500]}\nIf this keeps happening, send /new.", chat_id)
         await self.outbox_loop()
@@ -2602,8 +2598,6 @@ class Friday(WatchBot):
         # Runs on its timer and after each turn, at the same time: each row is claimed before it is
         # sent, so one being sent (a file upload) isn't sent again by the other, and nothing waits for it.
         for row in self.store.pending_outbox():
-            if row["kind"] == "receipt":  # the turn adds these under its reply (_turn)
-                continue
             if not self.store.claim_outbox(row["id"]):
                 continue
             try:

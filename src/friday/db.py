@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE TABLE IF NOT EXISTS outbox (
     id         INTEGER PRIMARY KEY,
-    kind       TEXT NOT NULL,           -- text | file | proposal | approval | login_request | login_expired | receipt
+    kind       TEXT NOT NULL,           -- text | file | proposal | approval | login_request | login_expired
     text       TEXT,                    -- message or caption; for the others, the row id to send
     path       TEXT,
     created_at TEXT NOT NULL,
@@ -568,12 +568,6 @@ class Store:
     def unclaim_outbox(self, oid: int) -> None:
         """Sending it failed: it's sent again next time."""
         self.conn.execute("UPDATE outbox SET sent_at = NULL WHERE id = ?", (oid,))
-
-    def take_receipts(self, lane: str) -> list[str]:
-        """A chat lane's receipt lines (mcp_server._receipt), oldest first, marked sent."""
-        rows = self.conn.execute("SELECT id, text FROM outbox WHERE kind = 'receipt' AND path = ? AND sent_at IS NULL "
-                                 "ORDER BY id", (lane,)).fetchall()
-        return [r["text"] for r in rows if self.claim_outbox(r["id"])]
 
     # --- coding jobs -------------------------------------------------------
 

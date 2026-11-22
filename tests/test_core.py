@@ -69,14 +69,6 @@ def test_invalid_rules_are_rejected(store):
             store.add_reminder("x", local("2026-11-17T09:00"), SEOUL, rule)
 
 
-def test_receipts_are_taken_once_per_lane(store):
-    store.queue("receipt", text="＋ report", path="1")
-    store.queue("receipt", text="＋ other lane", path="2")
-    assert store.take_receipts("1") == ["＋ report"]
-    assert store.take_receipts("1") == []
-    assert store.take_receipts("2") == ["＋ other lane"]
-
-
 # --- tasks and memories ----------------------------------------------------------
 
 def test_task_lifecycle(store):
