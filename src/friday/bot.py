@@ -46,6 +46,7 @@ from .codex_server import CodexServer, CodexServerError
 from .config import PROJECT_ROOT, Config, ensure_dirs
 from .db import Store, Task
 from .forms import SKIP, SKIPPED_KEY, check_values, login_spec, outcome, vault_values
+from .history import VOICE_NOTE, codex_sessions_dir, import_codex_sessions, said
 from .jobs import JobError, Outcome, Runner, github_slug, parse_code_args, short
 from .jobs import run as run_cmd
 from .models import available_models, light_model, model_list
@@ -220,7 +221,6 @@ REQUEST_ECHO = re.compile(r"보냈|보낼게|요청|입력|sent|request|form|fil
 # Before the message when a chat turn is retried with `codex exec` after the app-server died mid-turn.
 RETRY_NOTE = ("[Your previous attempt at this message was cut off by an error after you had started using tools. "
               "Check what was already done (e.g. list_reminders, list_tasks) before doing anything again.]\n")
-VOICE_NOTE = "[The user sent this as a voice message; it was transcribed automatically and may contain recognition errors.]\n"
 HELP = """\
 Talk to me in any language. I keep track of tasks and deadlines, reminders, Google Calendar
 events, things to remember and files you send. Voice messages work too.
@@ -632,7 +632,9 @@ class Friday(WatchBot):
         for loop in (self.reminder_loop, self.outbox_loop, self.brief_loop, self.job_loop,
                      self.browser_run_loop, self.watch_loop):
             self._tasks.append(asyncio.create_task(self._forever(loop), name=loop.__name__))
-        self._summarize_soon()  # conversations that closed before a restart
+        task = asyncio.create_task(self._import_history())
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
         log.info("Friday started; tz=%s, allowed=%s", self.tz, self.cfg.allowed_user_ids)
 
     async def _on_stop(self, app: Application) -> None:
@@ -753,13 +755,6 @@ class Friday(WatchBot):
             self.store.set("last_exchange", note)
         self._tell_lanes(f"in another conversation of yours, {note}", but=lane)
 
-    @staticmethod
-    def _said(text: str, files: list[str]) -> str:
-        """The user's message as the conversation log keeps it."""
-        if text.startswith(VOICE_NOTE):
-            text = "(voice) " + text.removeprefix(VOICE_NOTE)
-        return text + (f"\n[files: {', '.join(files)}]" if files else "")
-
     def _memory_context(self) -> str:
         rows, size = self.store.memories("", 500), 0
         shown = []
@@ -782,6 +777,18 @@ class Friday(WatchBot):
         items = [f"#{r['id']} {tu.from_iso(r['started_at']).astimezone(zone):%m/%d} {short(r['title'], 60)}" for r in rows]
         return ("[Earlier conversations, newest first (recall searches them, recall(conversation=id) reads one): "
                 + "; ".join(items) + "]")
+
+    async def _import_history(self) -> None:
+        """Once: the chats from before the conversation log, from Codex's session files. Then
+        summarize what is closed and unsummarized (also conversations that closed before a restart)."""
+        if self.cfg.chat_engine == "codex" and not self.store.get("history_imported"):
+            try:
+                n = await asyncio.to_thread(import_codex_sessions, self.store, codex_sessions_dir(), self.cfg.workspace)
+                log.info("imported %d earlier conversations from Codex's sessions", n)
+            except Exception:
+                log.exception("importing earlier conversations failed")
+            self.store.set("history_imported", "1")
+        await self._summarize_conversations()
 
     def _summarize_soon(self) -> None:
         task = asyncio.create_task(self._summarize_conversations())
@@ -893,6 +900,7 @@ class Friday(WatchBot):
         if lane and lane.lock.locked() and self.codex:
             # A follow-up to a request in progress: into that turn, which answers both.
             if await self.codex.steer(lane.key, self._steer_text(text, files), images):
+                self.store.log_message("user", said(text, files))
                 lane.topic += f" / {short(' '.join(text.split()) or '(files)', 200)}"
                 await self._quiet(self.say(f"↪️ Added to what I'm working on: «{short(lane.topic, 80)}»", chat_id))
                 return
@@ -933,6 +941,7 @@ class Friday(WatchBot):
         right away with it attached, at most MAX_CONTINUATIONS times; only the last reply is sent.
         from_user: text is the user's message (logged for recall), not a note from Friday."""
         lane = lane or self.lanes["1"]
+        asked_at = tu.to_utc_iso(tu.now_utc())
         async with lane.lock:
             lane.topic, lane.stopping, stopped, has_browser = text, False, False, False
             typing = asyncio.create_task(self._keep_typing(chat_id))
@@ -990,7 +999,7 @@ class Friday(WatchBot):
                 async with self._lane_free:
                     self._lane_free.notify_all()
             if from_user:
-                self.store.log_message("user", self._said(text, files or []))
+                self.store.log_message("user", said(text, files or []), asked_at)
             if stopped:
                 self._note_exchange(text, "(stopped by the user)", lane.key, calls)
                 return

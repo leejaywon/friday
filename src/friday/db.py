@@ -558,10 +558,25 @@ class Store:
         self.conn.execute("UPDATE conversations SET ended_at = ? WHERE id = ?", (self._now(), int(cid)))
         return int(cid)
 
-    def log_message(self, role: str, text: str) -> None:
+    def log_message(self, role: str, text: str, at: str = "") -> None:
         if text.strip():
             self.conn.execute("INSERT INTO messages(conversation_id, role, text, at) VALUES(?, ?, ?, ?)",
-                              (self.conversation_id(), role, text.strip(), self._now()))
+                              (self.conversation_id(), role, text.strip(), at or self._now()))
+
+    def add_conversation(self, messages: list[tuple[str, str, str]]) -> int:
+        """A closed conversation from earlier (history.py): (role, text, UTC ISO time), oldest first."""
+        cur = self.conn.execute("INSERT INTO conversations(started_at, ended_at) VALUES(?, ?)",
+                                (messages[0][2], messages[-1][2]))
+        self.conn.executemany("INSERT INTO messages(conversation_id, role, text, at) VALUES(?, ?, ?, ?)",
+                              [(cur.lastrowid, role, text, at) for role, text, at in messages])
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def all_messages(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM messages ORDER BY id").fetchall()
+
+    def first_message_at(self) -> str:
+        row = self.conn.execute("SELECT MIN(at) FROM messages").fetchone()
+        return row[0] or ""
 
     def unsummarized_conversations(self) -> list[int]:
         return [r["id"] for r in self.conn.execute(
@@ -575,8 +590,8 @@ class Store:
 
     def recent_conversations(self, limit: int = 5) -> list[sqlite3.Row]:
         """Closed and summarized conversations, newest first."""
-        return self.conn.execute("SELECT * FROM conversations WHERE title IS NOT NULL ORDER BY id DESC LIMIT ?",
-                                 (limit,)).fetchall()
+        return self.conn.execute("SELECT * FROM conversations WHERE title IS NOT NULL ORDER BY started_at DESC "
+                                 "LIMIT ?", (limit,)).fetchall()
 
     def messages(self, cid: int, after: int = 0, before: int = 0, limit: int = 50) -> list[sqlite3.Row]:
         """A conversation's messages in order: from its start, after an id, or the last ones before an id."""
@@ -602,7 +617,7 @@ class Store:
             where.append("at < ?")
             args.append(until)
         return self.conn.execute(
-            f"SELECT *, ({score}) AS score FROM messages WHERE {' AND '.join(where)} ORDER BY score DESC, id DESC LIMIT ?",
+            f"SELECT *, ({score}) AS score FROM messages WHERE {' AND '.join(where)} ORDER BY score DESC, at DESC LIMIT ?",
             (*terms, *args, limit)).fetchall()
 
     def search_conversations(self, query: str, limit: int = 5) -> list[sqlite3.Row]:
@@ -613,7 +628,7 @@ class Store:
         score = " + ".join("(instr(lower(title || ' ' || summary), ?) > 0)" for _ in terms)
         return self.conn.execute(
             f"SELECT *, ({score}) AS score FROM conversations WHERE title IS NOT NULL AND ({score}) > 0 "
-            "ORDER BY score DESC, id DESC LIMIT ?", (*terms, *terms, limit)).fetchall()
+            "ORDER BY score DESC, started_at DESC LIMIT ?", (*terms, *terms, limit)).fetchall()
 
     # --- contacts ------------------------------------------------------------
 

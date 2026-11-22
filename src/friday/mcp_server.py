@@ -424,7 +424,9 @@ def recall(query: str = "", conversation: int = 0, after: int = 0, before: int =
                 f"{_snippet(m['text'], terms)}" for m in hits[1:]]
         out.append("Read more with recall(conversation=…, after=… or before=…).")
     if not out:
-        return (f"Nothing matches '{query}' in {store.memory_count()} memories or the conversation log. "
+        first = store.first_message_at()
+        since_when = f" (it goes back to {_at(first)})" if first else " (it is empty)"
+        return (f"Nothing matches '{query}' in {store.memory_count()} memories or the conversation log{since_when}. "
                 "Try other words, a shorter form or the other language's name.")
     text = "\n".join(out)
     return text if len(text) <= RECALL_BUDGET else text[:RECALL_BUDGET - 1] + "…"

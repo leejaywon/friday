@@ -1,3 +1,4 @@
+import json
 import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
@@ -302,3 +303,31 @@ def test_watchdog_rethinks_then_stops_a_turn_that_makes_no_progress():
         await st.finish()
 
     asyncio.run(main())
+
+
+def test_chats_from_before_the_log_are_imported_once(tmp_path, store):
+    from friday.history import import_codex_sessions
+    ws = tmp_path / "workspace"
+
+    def item(role, text, at, phase=None):
+        p = {"type": "message", "role": role, "content": [{"type": "input_text", "text": text}]}
+        if phase:
+            p["phase"] = phase
+        return {"timestamp": at, "type": "response_item", "payload": p}
+
+    rows = [{"timestamp": "2026-11-18T07:00:00Z", "type": "session_meta", "payload": {"cwd": str(ws)}},
+            item("user", "<environment_context>…</environment_context>", "2026-11-18T07:00:01Z"),
+            item("user", "You are Friday… the [Now: …] line…\n---\n[Now: Wed 2026-11-18 16:10 (Asia/Seoul)]\n"
+                 "[Files the user sent, saved in the workspace: files/inbox/a.jpg]\n\n실외 CCTV 추천해줘", "2026-11-18T07:00:02Z"),
+            item("assistant", "찾아볼게.", "2026-11-18T07:00:03Z", "commentary"),
+            item("assistant", "Tapo C320WS가 제일 나아.", "2026-11-18T07:00:09Z", "final_answer"),
+            item("user", "[github tools are now available; continue the user's request]", "2026-11-18T07:01:00Z"),
+            item("user", "[Now: Wed 2026-11-18 16:12 (Asia/Seoul)]\n\n고마워", "2026-11-22T19:00:00Z")]  # after the log began
+    (tmp_path / "s").mkdir()
+    (tmp_path / "s" / "rollout-1.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows))
+    store.log_message("user", "지난번 CCTV 뭐였지")  # the log begins now
+
+    assert import_codex_sessions(store, tmp_path / "s", ws) == 1
+    old = store.unsummarized_conversations()
+    assert [(m["role"], m["text"]) for m in store.messages(old[0])] == [
+        ("user", "실외 CCTV 추천해줘\n[files: files/inbox/a.jpg]"), ("friday", "Tapo C320WS가 제일 나아.")]
