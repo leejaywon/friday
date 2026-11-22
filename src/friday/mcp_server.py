@@ -308,52 +308,126 @@ def cancel_task(task_id: int) -> str:
 
 
 @server.tool()
-def remember(fact: str) -> str:
-    """Save a lasting fact about the user (preferences, people, routines) for future conversations.
-    Start it with a few topic words so it's easy to find later, e.g. "coffee: americano, no sugar" or
-    "mom's birthday: March 5".
+def memory(action: str, fact: str = "", memory_id: int = 0) -> str:
+    """Lasting facts about the user, kept across conversations: preferences, people, routines,
+    what they own or use. What was merely said or looked up stays in the conversation log, which
+    recall searches; save only what should shape later conversations.
 
-    Call recall first: if a memory on the same subject exists, use update_memory instead so old
-    and new facts don't contradict each other. Never use this for passwords, keys, card or ID numbers.
-    """
-    if looks_secret(fact):
+    action: 'add' (fact), 'update' (memory_id and the new fact: it changed, or you were corrected),
+        'delete' (memory_id).
+    fact: one fact, starting with a few topic words so it's easy to find, e.g. "coffee: americano,
+        no sugar" or "mom's birthday: March 5". Before adding, check recall for one on the same
+        subject and update that instead, so old and new facts don't contradict each other.
+    Never passwords, keys, card or ID numbers."""
+    action = action.strip().lower()
+    if action in ("add", "update") and looks_secret(fact):
         return REFUSAL
-    mid, created = store.remember(fact)
-    return f"Saved memory #{mid}." if created else f"Already saved as #{mid}."
+    if action == "add":
+        if not fact.strip():
+            return "Give the fact to add."
+        mid, created = store.remember(fact)
+        return f"Saved memory #{mid}." if created else f"Already saved as #{mid}."
+    if action == "update":
+        return "Updated." if fact.strip() and store.update_memory(memory_id, fact) else "No memory with that id."
+    if action == "delete":
+        return "Deleted." if store.forget(memory_id) else "No memory with that id."
+    return "Unknown action: use add, update or delete."
+
+
+RECALL_HITS = 5  # messages per search; the best one comes with the messages around it
+RECALL_SNIPPET = 300
+RECALL_MESSAGE = 800  # characters of one message when reading a conversation
+RECALL_BUDGET = 4000  # characters of one recall result, about 1k tokens
+
+
+def _at(iso: str) -> str:
+    return f"{tu.from_iso(iso).astimezone(ZoneInfo(_tz())):%m/%d %H:%M}"
+
+
+def _snippet(text: str, terms: list[str], size: int = RECALL_SNIPPET) -> str:
+    """The part of text around the first query word it contains."""
+    text = " ".join(text.split())
+    low = text.lower()
+    pos = min((low.find(t) for t in terms if t in low), default=0)
+    start = max(0, pos - size // 3)
+    part = text[start:start + size]
+    return ("…" if start else "") + part + ("…" if start + size < len(text) else "")
+
+
+def _message_line(m, size: int) -> str:
+    return f"[msg {m['id']} · {_at(m['at'])}] {m['role']}: {short(m['text'], size)}"
 
 
 @server.tool()
-def update_memory(memory_id: int, fact: str) -> str:
-    """Replace a saved memory's text, e.g. when the user moved, changed jobs or corrected you."""
-    if looks_secret(fact):
-        return REFUSAL
-    return "Updated." if store.update_memory(memory_id, fact) else "No memory with that id."
+def recall(query: str = "", conversation: int = 0, after: int = 0, before: int = 0,
+           since: str = "", until: str = "") -> str:
+    """What you know and what was said before: saved memories and past conversations with the user
+    (their titles, summaries and messages, including the links and findings you gave). Call it
+    whenever the user refers to something earlier ("the CCTVs we looked at", "what did I say
+    about…") or a request may depend on what you know about them, before asking them.
 
-
-@server.tool()
-def recall(query: str = "") -> str:
-    """Saved memories. With up to 50 saved, all of them (newest first); otherwise up to 20 best
-    keyword matches for query, or the 20 newest when it's empty or nothing matches (then try
-    other words too, e.g. mom / mother)."""
-    total = store.memory_count()
-    if not total:
-        return "No memories saved yet."
-    head = ""
-    if total <= 50:
-        rows = store.memories("", 50)
-    else:
-        rows = store.memories(query) if query.strip() else []
-        if not rows:
-            head = f"No match for '{query}'; the newest memories:\n" if query.strip() else ""
-            rows = store.memories("")
-    body = head + "\n".join(f"#{r['id']} {r['text']}" for r in rows)
-    return body + (f"\n({len(rows)} of {total} memories shown)" if total > len(rows) else "")
-
-
-@server.tool()
-def forget(memory_id: int) -> str:
-    """Delete a saved memory by id."""
-    return "Forgotten." if store.forget(memory_id) else "No memory with that id."
+    query: key words, nouns without particles ("CCTV", "엄마 생일"). Nothing found: try other words,
+        a shorter form, or the English/Korean name.
+    since / until: ISO dates or date-times to narrow the search ("2026-11-01").
+    conversation: read that conversation's messages, from its start, after a message id (after)
+        or the ones just before one (before).
+    No arguments: the latest conversations."""
+    tz = _tz()
+    if conversation:
+        conv = store.conversation(conversation)
+        if not conv:
+            return f"No conversation #{conversation}."
+        rows = store.messages(conversation, after=after, before=before, limit=40)
+        head = f"Conversation #{conversation} ({_at(conv['started_at'])}{', ' + conv['title'] if conv['title'] else ''}):"
+        lines, size = [head], len(head)
+        for m in rows:
+            line = _message_line(m, RECALL_MESSAGE)
+            if size + len(line) > RECALL_BUDGET:
+                lines.append(f"(more: recall(conversation={conversation}, after={m['id'] - 1}))")
+                break
+            lines.append(line)
+            size += len(line)
+        else:
+            if len(rows) == 40:
+                lines.append(f"(more: recall(conversation={conversation}, after={rows[-1]['id']}))")
+        return "\n".join(lines) if rows else head + " no messages there."
+    if not query.strip():
+        convs = store.recent_conversations(10)
+        out = [f"{store.memory_count()} saved memories (recall with a query finds them)."]
+        out += [f"conversation #{c['id']} · {_at(c['started_at'])} · {c['title']}: {short(c['summary'] or '', 150)}"
+                for c in convs]
+        return "\n".join(out) if convs else out[0] + " No earlier conversations yet."
+    since_iso = tu.to_utc_iso(tu.parse_when(since, tz)) if since else ""
+    until_iso = tu.to_utc_iso(tu.parse_when(until, tz)) if until else ""
+    terms = search_terms(query)
+    out: list[str] = []
+    mems = store.memories(query, 5)
+    if mems:
+        out.append("Memories:")
+        out += [f"#{m['id']} {short(m['text'], 200)}" for m in mems]
+    convs = [c for c in store.search_conversations(query, 3)
+             if (not since_iso or c["started_at"] >= since_iso) and (not until_iso or c["started_at"] < until_iso)]
+    if convs:
+        out.append("Conversations:")
+        out += [f"#{c['id']} · {_at(c['started_at'])} · {c['title']}: {short(c['summary'] or '', 300)}" for c in convs]
+    hits = store.search_messages(query, since_iso, until_iso, RECALL_HITS)
+    if hits:
+        out.append("Messages (best match first):")
+        top = hits[0]
+        around = store.messages(top["conversation_id"], before=top["id"], limit=2) + [top] + \
+            store.messages(top["conversation_id"], after=top["id"], limit=2)
+        out.append(f"conversation #{top['conversation_id']}:")
+        out += ["  " + _message_line(m, 400) if m["id"] != top["id"]
+                else f"  [msg {m['id']} · {_at(m['at'])}] {m['role']}: {_snippet(m['text'], terms, 600)}"
+                for m in around]
+        out += [f"conversation #{m['conversation_id']} [msg {m['id']} · {_at(m['at'])}] {m['role']}: "
+                f"{_snippet(m['text'], terms)}" for m in hits[1:]]
+        out.append("Read more with recall(conversation=…, after=… or before=…).")
+    if not out:
+        return (f"Nothing matches '{query}' in {store.memory_count()} memories or the conversation log. "
+                "Try other words, a shorter form or the other language's name.")
+    text = "\n".join(out)
+    return text if len(text) <= RECALL_BUDGET else text[:RECALL_BUDGET - 1] + "…"
 
 
 @server.tool()

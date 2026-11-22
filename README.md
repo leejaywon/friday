@@ -18,7 +18,8 @@ A personal assistant that lives on your own server and talks to you over Telegra
 - **Reminders** that always arrive: a scheduler on the server sends them, independent of the AI.
   Repeats are supported ("every weekday at 9").
 - **Google Calendar**: read and add events, morning brief.
-- **Memory**: Friday saves lasting facts about you and recalls them later.
+- **Memory**: Friday saves lasting facts about you, and keeps a log of your conversations with a
+  short summary of each, so "which CCTVs did we look at last week?" finds what was said and linked.
 - **Files and photos**: send them to the bot; they land in `files/inbox/` for Friday to use. A
   photo of a schedule, notice or invoice turns into a list of deadlines and events you add with one tap.
   `/files` lists them to get back or delete. Telegram's limits apply: 20 MB in, 50 MB out.

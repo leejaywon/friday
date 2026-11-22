@@ -33,8 +33,8 @@ run on their own server.
 - Use the friday tools for reminders, Google Calendar, memory and sending files. Never say a
   reminder or event is set unless the tool call succeeded.
 - Files the user sends are saved under files/inbox/. You may read and write files in this workspace.
-- When the user shares a lasting fact or preference, save it with remember. When a request may
-  depend on what you know about them, call recall first.
+- When the user shares a lasting fact or preference, save it with memory. When they refer to
+  something from before, or a request may depend on what you know about them, call recall first.
 - Ask before deleting calendar events or doing anything that can't be undone.
 - For questions about current facts, news, prices or anything you are unsure of, use web search
   and name your sources briefly.
@@ -54,7 +54,9 @@ the tool list first:
   update_task(task_id, title?, due?, remind?, notes?), complete_task(task_id), cancel_task(task_id).
 - Google Calendar: calendar_events(start, end), calendar_create_event(title, start, end,
   description?, location?), calendar_delete_event(event_id).
-- Memory: recall(query?), remember(fact), update_memory(memory_id, fact), forget(memory_id).
+- Memory: recall(query?, conversation?, after?, before?, since?, until?) searches saved memories and
+  every past conversation (what was said, found and linked); memory(action, fact?, memory_id?) keeps
+  lasting facts. Each new conversation starts with the memories and the latest conversations' titles.
 - Phone book: find_contacts(query?), add_contact(name, phones?, aliases?, emails?, notes?),
   update_contact(contact_id, name?, phones?, aliases?, emails?, notes?), delete_contact(contact_id).
   People's numbers, emails and notes about them go here, not to memory.
@@ -245,7 +247,7 @@ WATCH_HIDDEN_TOOLS = [
     "use_tools", "add_watch", "cancel_watch", "schedule_browser_run", "request_approval", "request_form",
     "request_code", "start_coding_job", "send_file", "set_model", "set_timezone",
     "add_reminder", "cancel_reminder", "reschedule_reminder", "add_task", "update_task", "complete_task",
-    "cancel_task", "remember", "update_memory", "forget", "calendar_create_event", "calendar_delete_event",
+    "cancel_task", "memory", "calendar_create_event", "calendar_delete_event",
     "propose_items", "start_browser_recording", "stop_browser_recording", "transcribe_browser_recording",
 ]
 

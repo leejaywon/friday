@@ -117,7 +117,7 @@ def test_chat_request_returns_at_once_and_the_answer_continues_the_thread(cfg, t
     monkeypatch.setattr(tools, "store", f.store)
     f.store.set("thread_id", "thread-1")
     notes = []
-    monkeypatch.setattr(f, "_turn", lambda chat, note, lane=None: notes.append(note) or asyncio.sleep(0))
+    monkeypatch.setattr(f, "_turn", lambda chat, note, lane=None, from_user=True: notes.append(note) or asyncio.sleep(0))
     chat = SimpleNamespace(headers={"X-Friday-Chat": "1"})  # what the agent sends for a chat turn
     fields = json.dumps([{"name": "api_key", "label": "API key", "type": "password"},
                          {"name": "account", "label": "Account", "type": "text"}])

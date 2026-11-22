@@ -26,15 +26,23 @@ def test_series_starting_now_is_refused_and_fired_reminder_rearmed(tools, store)
     assert store.reminder(r.id).status == "active"
 
 
-def test_recall_returns_all_or_newest(tools, store):
-    for i in range(40):
-        store.remember(f"메모 {i}")
-    out = tools.recall("커피")  # few memories: all of them, whatever the query
-    assert out.count("\n") == 39 and out.startswith("#40 메모 39")
-    for i in range(40, 60):
-        store.remember(f"메모 {i}")
-    out = tools.recall("커피")  # many, no match: the newest 20
-    assert out.startswith("No match for '커피'") and "#60 메모 59" in out and "(20 of 60 memories shown)" in out
+def test_recall_finds_an_earlier_conversation(tools, store):
+    store.log_message("user", "집에 달 CCTV 추천해줘")
+    store.log_message("friday", "Tapo C200과 샤오미 C300을 비교했어. https://example.com/c200")
+    store.log_message("user", "고마워")
+    cid = store.close_conversation()
+    store.set_conversation_summary(cid, "집 CCTV 비교", "Tapo C200 vs Xiaomi C300\nKeywords: Tapo C200, 샤오미")
+    store.log_message("user", "오늘 날씨 어때")  # the next conversation
+    assert tools.memory("add", "집: 서울 마포") == "Saved memory #1."
+
+    out = tools.recall("cctv 제품")  # a two-syllable Korean word and another case still match
+    assert f"#{cid} · " in out and "집 CCTV 비교" in out
+    assert "Tapo C200과 샤오미 C300" in out and "https://example.com/c200" in out  # the best message, in full
+    assert "고마워" in out  # with what was said around it
+    assert "날씨" not in out
+    assert "집: 서울 마포" not in out  # memories only when they match
+    assert "Tapo C200과" in tools.recall(conversation=cid)
+    assert tools.recall("냉장고").startswith("Nothing matches")
 
 
 def test_markdown_becomes_plain_text():

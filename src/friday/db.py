@@ -156,6 +156,23 @@ CREATE TABLE IF NOT EXISTS contacts (       -- the user's phone book (contacts.p
     created_at  TEXT NOT NULL,
     updated_at  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS conversations (  -- chats with Friday, one per thread from fresh start to reset
+    id         INTEGER PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT,                        -- set when it closes (6 h idle, /new)
+    title      TEXT,                        -- a small model's title and summary, written once it closes
+    summary    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS messages (       -- what was said in them, for recall
+    id              INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL,
+    role            TEXT NOT NULL,          -- user | friday
+    text            TEXT NOT NULL,
+    at              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, id);
 """
 
 JOB_FIELDS = (
@@ -516,6 +533,87 @@ class Store:
 
     def forget(self, mid: int) -> bool:
         return self.conn.execute("DELETE FROM memories WHERE id = ?", (mid,)).rowcount > 0
+
+    # --- conversations (episodic memory: what was said, searched by recall) ---
+
+    def conversation_id(self) -> int:
+        """The open conversation, started now if there is none."""
+        cid = self.get("conversation_id")
+        if cid:
+            return int(cid)
+        cur = self.conn.execute("INSERT INTO conversations(started_at) VALUES(?)", (self._now(),))
+        self.set("conversation_id", str(cur.lastrowid))
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def close_conversation(self) -> int | None:
+        """End the open conversation; returns its id when it has messages (it is then summarized),
+        and drops it when it has none."""
+        cid = self.get("conversation_id")
+        if not cid:
+            return None
+        self.delete("conversation_id")
+        if not self.conn.execute("SELECT 1 FROM messages WHERE conversation_id = ?", (int(cid),)).fetchone():
+            self.conn.execute("DELETE FROM conversations WHERE id = ?", (int(cid),))
+            return None
+        self.conn.execute("UPDATE conversations SET ended_at = ? WHERE id = ?", (self._now(), int(cid)))
+        return int(cid)
+
+    def log_message(self, role: str, text: str) -> None:
+        if text.strip():
+            self.conn.execute("INSERT INTO messages(conversation_id, role, text, at) VALUES(?, ?, ?, ?)",
+                              (self.conversation_id(), role, text.strip(), self._now()))
+
+    def unsummarized_conversations(self) -> list[int]:
+        return [r["id"] for r in self.conn.execute(
+            "SELECT id FROM conversations WHERE ended_at IS NOT NULL AND title IS NULL ORDER BY id")]
+
+    def set_conversation_summary(self, cid: int, title: str, summary: str) -> None:
+        self.conn.execute("UPDATE conversations SET title = ?, summary = ? WHERE id = ?", (title, summary, cid))
+
+    def conversation(self, cid: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM conversations WHERE id = ?", (cid,)).fetchone()
+
+    def recent_conversations(self, limit: int = 5) -> list[sqlite3.Row]:
+        """Closed and summarized conversations, newest first."""
+        return self.conn.execute("SELECT * FROM conversations WHERE title IS NOT NULL ORDER BY id DESC LIMIT ?",
+                                 (limit,)).fetchall()
+
+    def messages(self, cid: int, after: int = 0, before: int = 0, limit: int = 50) -> list[sqlite3.Row]:
+        """A conversation's messages in order: from its start, after an id, or the last ones before an id."""
+        if before:
+            rows = self.conn.execute("SELECT * FROM messages WHERE conversation_id = ? AND id < ? ORDER BY id DESC "
+                                     "LIMIT ?", (cid, before, limit)).fetchall()
+            return rows[::-1]
+        return self.conn.execute("SELECT * FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?",
+                                 (cid, after, limit)).fetchall()
+
+    def search_messages(self, query: str, since: str = "", until: str = "", limit: int = 5) -> list[sqlite3.Row]:
+        """Messages matching the most of the query's words, newest first among equals. A plain scan:
+        it finds two-syllable Korean words and words inside others, and is quick at one person's scale."""
+        terms = search_terms(query)
+        if not terms:
+            return []
+        score = " + ".join("(instr(lower(text), ?) > 0)" for _ in terms)
+        where, args = [f"({score}) > 0"], [*terms]
+        if since:
+            where.append("at >= ?")
+            args.append(since)
+        if until:
+            where.append("at < ?")
+            args.append(until)
+        return self.conn.execute(
+            f"SELECT *, ({score}) AS score FROM messages WHERE {' AND '.join(where)} ORDER BY score DESC, id DESC LIMIT ?",
+            (*terms, *args, limit)).fetchall()
+
+    def search_conversations(self, query: str, limit: int = 5) -> list[sqlite3.Row]:
+        """Summarized conversations whose title or summary matches the query's words."""
+        terms = search_terms(query)
+        if not terms:
+            return []
+        score = " + ".join("(instr(lower(title || ' ' || summary), ?) > 0)" for _ in terms)
+        return self.conn.execute(
+            f"SELECT *, ({score}) AS score FROM conversations WHERE title IS NOT NULL AND ({score}) > 0 "
+            "ORDER BY score DESC, id DESC LIMIT ?", (*terms, *terms, limit)).fetchall()
 
     # --- contacts ------------------------------------------------------------
 
