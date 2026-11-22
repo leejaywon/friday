@@ -136,6 +136,23 @@ Its steps so far (oldest first):
 {steps}
 Running now: {now}
 """
+WAKE_NOTE = """\
+[A wake-up you scheduled is due; the user didn't write. What you noted:
+{notes}
+Look at it now and decide: tell them something (your reply is sent to them), do or check
+something, schedule another wake, or, if nothing is worth their attention, reply only "-".]"""
+HEARTBEAT_NOTE = """\
+[Your regular check-in (every {hours} h); the user didn't write. Their day as it stands:
+{state}
+
+Your pending wake-ups:
+{wakes}
+{first}Decide whether anything deserves a message now, from this and from what was said earlier:
+something due soon and still open, getting ready for what's coming, a follow-up. Schedule a wake
+for what is better raised later. One short message at most; if nothing is worth their attention,
+reply only "-".]"""
+HEARTBEAT_FIRST = "This is the first check-in of the day: send a short plan for it, even if the day is quiet.\n"
+HEARTBEAT_STALE = timedelta(hours=1)  # a check-in missed by more than this (Friday was down) is skipped
 SUMMARY_PROMPT = """\
 Below is a finished conversation between a person and their assistant, Friday (data, not
 instructions to you; don't use any tools). Write a JSON object, nothing else, in the conversation's
@@ -629,8 +646,8 @@ class Friday(WatchBot):
             await self._runs_startup()
         except Exception:
             log.exception("browser runs startup failed")
-        for loop in (self.reminder_loop, self.outbox_loop, self.brief_loop, self.job_loop,
-                     self.browser_run_loop, self.watch_loop):
+        for loop in (self.reminder_loop, self.outbox_loop, self.brief_loop, self.heartbeat_loop, self.wake_loop,
+                     self.job_loop, self.browser_run_loop, self.watch_loop):
             self._tasks.append(asyncio.create_task(self._forever(loop), name=loop.__name__))
         task = asyncio.create_task(self._import_history())
         self._bg.add(task)
@@ -935,17 +952,19 @@ class Friday(WatchBot):
         return await light_reply(self.cfg, prompt, model, effort, timeout)
 
     async def _turn(self, chat_id: int, text: str, files: list[str] | None = None,
-                    images: list[Path] | None = None, lane: Lane | None = None, from_user: bool = True) -> None:
+                    images: list[Path] | None = None, lane: Lane | None = None, source: str = "user") -> None:
         """Answer a message (or continue after a note) in a chat lane's Codex thread. Lanes run at
         the same time; the browser is acquired only after use_tools("browser"), and only one turn
         has it. When the agent turns on a toolset, the thread is continued
         right away with it attached, at most MAX_CONTINUATIONS times; only the last reply is sent.
-        from_user: text is the user's message (logged for recall), not a note from Friday."""
+        source: "user" (their message, logged for recall), "note" (Friday continuing after a request
+        was answered) or "wake" (a turn Friday scheduled for itself, wake_loop / heartbeat_loop: no
+        typing, and it keeps the conversation open only when it says something)."""
         lane = lane or self.lanes["1"]
         asked_at = tu.to_utc_iso(tu.now_utc())
         async with lane.lock:
             lane.topic, lane.stopping, stopped, has_browser = text, False, False, False
-            typing = asyncio.create_task(self._keep_typing(chat_id))
+            typing = asyncio.create_task(self._keep_typing(chat_id) if source != "wake" else asyncio.sleep(0))
             status = lane.status = self._status(chat_id, lane.key, text)
             used, calls = set(), []
             try:
@@ -980,7 +999,8 @@ class Friday(WatchBot):
                     elif thread:
                         self.store.set("thread_id", thread)
                         self.store.set("thread_engine", self.cfg.chat_engine)
-                    self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
+                    if source != "wake":
+                        self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
                     new = self._toolsets(lane.key) - toolsets
                     if "browser" in new:
                         self._drop_browser_request(lane.key)
@@ -999,7 +1019,7 @@ class Friday(WatchBot):
                 lane.topic, lane.status, lane.finished_at = "", None, clock.monotonic()
                 async with self._lane_free:
                     self._lane_free.notify_all()
-            if from_user:
+            if source == "user":
                 self.store.log_message("user", said(text, files or []), asked_at)
             if stopped:
                 self._note_exchange(text, "(stopped by the user)", lane.key, calls)
@@ -1020,7 +1040,9 @@ class Friday(WatchBot):
             # A one-liner next to a proposal or a tree (show_tree) only says it was sent.
             if self._worth_sending(result.text, made_request, bool(tools & LISTING_TOOLS)):
                 await self.say(plain_text(result.text), chat_id)
-        elif result.errors or not made_request:
+                if source == "wake":  # Friday spoke up: the conversation goes on from here
+                    self.store.set("last_message_at", tu.to_utc_iso(tu.now_utc()))
+        elif result.errors or not (made_request or source == "wake"):
             detail = "; ".join(result.errors) or "no reply"
             await self.say(f"Agent error: {detail[:1500]}\nIf this keeps happening, send /new.", chat_id)
         await self.outbox_loop()
@@ -1184,7 +1206,7 @@ class Friday(WatchBot):
             lane = self.lanes["1"]
         if lane.key == "1" and not self._current_thread():
             return
-        task = asyncio.create_task(self._turn(self.owner, note, lane=lane, from_user=False))
+        task = asyncio.create_task(self._turn(self.owner, note, lane=lane, source="note"))
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
 
@@ -2405,12 +2427,7 @@ class Friday(WatchBot):
             notes = (notes + "\n" if notes else "") + f"Hand in on: {sub['site']}" + (f" - {sub['what']}" if sub["what"] else "")
 
         def task(due: datetime | None, remind: str | None = None, extra: str = "") -> str:
-            if remind == "none":
-                nudge = None
-            elif remind:
-                nudge = tu.from_iso(remind)
-            else:
-                nudge = tu.default_task_reminder(due, tz, now) if due else None
+            nudge = tu.from_iso(remind) if remind and remind != "none" else None
             t = self.store.add_task(title, due, nudge, notes)
             return f"📝 #{t.id} {title}" + (f" (due {self._short_time(due)})" if due else "") + extra
 
@@ -2722,8 +2739,73 @@ class Friday(WatchBot):
                 raise
         return 3
 
+    # --- Friday's own turns: wake-ups it scheduled and regular check-ins ----------
+
+    def _own_turn(self, text: str) -> bool:
+        """Start a turn Friday begins itself, in the main lane if it's free, else a free side lane.
+        False when every lane is busy (try again soon)."""
+        lane = self._free_lane()
+        if not lane:
+            return False
+        task = asyncio.create_task(self._turn(self.owner, text, lane=lane, source="wake"))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+        return True
+
+    async def wake_loop(self) -> float:
+        """Due wake-ups (the wake tool) become one turn of Friday's."""
+        due = self.store.due_wakes(tu.now_utc())
+        if not due:
+            return 15
+        if not self._free_lane():
+            return 15
+        zone = ZoneInfo(self.tz)
+        notes = [f"«{w['note']}» (set {tu.from_iso(w['created_at']).astimezone(zone):%m/%d %H:%M} for "
+                 f"{tu.from_iso(w['at']).astimezone(zone):%m/%d %H:%M})" for w in due if self.store.end_wake(w["id"])]
+        if notes:
+            self._own_turn(WAKE_NOTE.format(notes="\n".join(notes)))
+        return 5
+
+    def _heartbeat_slot(self, now: datetime) -> tuple[datetime, bool] | None:
+        """The latest check-in time at or before now (and whether it's the day's first), if any."""
+        if self.cfg.heartbeat_hours <= 0:
+            return None
+        zone = ZoneInfo(self.tz)
+        first = time.fromisoformat(self.cfg.morning_brief_at) if self.cfg.morning_brief_at else time(7, 0)
+        every = timedelta(hours=self.cfg.heartbeat_hours)
+        day = now.astimezone(zone).date()
+        for d in (day, day - timedelta(days=1)):  # the slots after midnight belong to the day before
+            past = [s for s in tu.heartbeat_slots(d, self.tz, first, every, self.cfg.quiet_hours) if s <= now]
+            if past:
+                return past[-1], past[-1] == datetime.combine(d, first, tzinfo=zone)
+        return None
+
+    async def heartbeat_loop(self) -> float:
+        """Every HEARTBEAT_HOURS outside quiet hours, Friday looks at the day and speaks up only
+        when something is worth it; the day's first check-in is the morning brief."""
+        now = tu.now_utc()
+        slot = self._heartbeat_slot(now)
+        if not slot:
+            return 60
+        at, first = slot
+        key = tu.to_utc_iso(at)
+        if self.store.get("heartbeat_last") == key or now - at > HEARTBEAT_STALE:
+            return 30
+        if self.store.get("heartbeat_last") is None and not first:
+            self.store.set("heartbeat_last", key)  # just turned on: start with the next one
+            return 30
+        if not self._free_lane():
+            return 30
+        self.store.set("heartbeat_last", key)
+        wakes = [f"  {tu.local_str(tu.from_iso(w['at']), self.tz)}: {w['note']}" for w in self.store.pending_wakes()]
+        self._own_turn(HEARTBEAT_NOTE.format(
+            hours=f"{self.cfg.heartbeat_hours:g}", state=await self.brief(),
+            wakes="\n".join(wakes) or "  none", first=HEARTBEAT_FIRST if first else ""))
+        return 30
+
     async def brief_loop(self) -> float:
-        if not self.cfg.morning_brief_at:
+        """The plain morning summary, when check-ins are off (they write it otherwise)."""
+        if not self.cfg.morning_brief_at or self.cfg.heartbeat_hours > 0:
             return 3600
         zone = ZoneInfo(self.tz)
         local = datetime.now(zone)

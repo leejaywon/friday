@@ -157,6 +157,14 @@ CREATE TABLE IF NOT EXISTS contacts (       -- the user's phone book (contacts.p
     updated_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS wakes (          -- turns Friday scheduled for itself (wake tool, bot.wake_loop)
+    id         INTEGER PRIMARY KEY,
+    at         TEXT NOT NULL,
+    note       TEXT NOT NULL,               -- what to look at then, in its own words
+    status     TEXT NOT NULL DEFAULT 'pending', -- pending | done | cancelled
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS conversations (  -- chats with Friday, one per thread from fresh start to reset
     id         INTEGER PRIMARY KEY,
     started_at TEXT NOT NULL,
@@ -533,6 +541,25 @@ class Store:
 
     def forget(self, mid: int) -> bool:
         return self.conn.execute("DELETE FROM memories WHERE id = ?", (mid,)).rowcount > 0
+
+    # --- wakes (Friday's own turns at a time it chose) -----------------------
+
+    def add_wake(self, at: datetime, note: str) -> int:
+        cur = self.conn.execute("INSERT INTO wakes(at, note, created_at) VALUES(?, ?, ?)",
+                                (tu.to_utc_iso(at), note.strip(), self._now()))
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def pending_wakes(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM wakes WHERE status = 'pending' ORDER BY at").fetchall()
+
+    def due_wakes(self, now: datetime) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM wakes WHERE status = 'pending' AND at <= ? ORDER BY at",
+                                 (tu.to_utc_iso(now),)).fetchall()
+
+    def end_wake(self, wid: int, status: str = "done") -> bool:
+        """Mark a pending wake done or cancelled; False if it wasn't pending (another took it)."""
+        cur = self.conn.execute("UPDATE wakes SET status = ? WHERE id = ? AND status = 'pending'", (status, wid))
+        return cur.rowcount == 1
 
     # --- conversations (episodic memory: what was said, searched by recall) ---
 

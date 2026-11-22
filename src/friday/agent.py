@@ -52,6 +52,9 @@ the tool list first:
   cancel_reminder(reminder_id).
 - To-dos: add_task(title, due?, remind?, notes?), list_tasks(include_done?),
   update_task(task_id, title?, due?, remind?, notes?), complete_task(task_id), cancel_task(task_id).
+- Your own follow-ups: wake(when, note) runs a turn of yours later with the note, cancel_wake(wake_id).
+  You decide when something deserves another look (a deadline, an event to get ready for, a promise
+  to follow up on) and how often; you also check in on your own every few hours.
 - Google Calendar: calendar_events(start, end), calendar_create_event(title, start, end,
   description?, location?), calendar_delete_event(event_id).
 - Memory: recall(query?, conversation?, after?, before?, since?, until?) searches saved memories and
@@ -247,7 +250,7 @@ WATCH_HIDDEN_TOOLS = [
     "use_tools", "add_watch", "cancel_watch", "schedule_browser_run", "request_approval", "request_form",
     "request_code", "start_coding_job", "send_file", "set_model", "set_timezone",
     "add_reminder", "cancel_reminder", "reschedule_reminder", "add_task", "update_task", "complete_task",
-    "cancel_task", "memory", "calendar_create_event", "calendar_delete_event",
+    "cancel_task", "memory", "wake", "cancel_wake", "calendar_create_event", "calendar_delete_event",
     "propose_items", "start_browser_recording", "stop_browser_recording", "transcribe_browser_recording",
 ]
 

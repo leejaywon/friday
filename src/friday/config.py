@@ -32,6 +32,8 @@ class Config:
     github_token_set: bool
     github_readonly: bool
     morning_brief_at: str  # "HH:MM" in the user's timezone, or "" to turn it off
+    heartbeat_hours: float  # Friday's own check-ins: every this many hours from morning_brief_at; 0 = off
+    quiet_hours: str  # "HH:MM-HH:MM": no check-ins or wakes then (the user's own reminders still go out)
     # The agent behind chat, browser runs and watch checks: codex (a ChatGPT plan) or claude (a
     # Claude plan, through Claude Code). Env: CHAT_ENGINE, CLAUDE_MODEL (claude's default model)
     chat_engine: str = "codex"
@@ -202,6 +204,8 @@ def load_config() -> Config:
         github_token_set=bool(os.environ.get("GITHUB_TOKEN", "").strip()),
         github_readonly=os.environ.get("GITHUB_READONLY", "true").strip().lower() not in ("0", "false", "no"),
         morning_brief_at=os.environ.get("MORNING_BRIEF_AT", "08:00").strip(),
+        heartbeat_hours=float(_setting("HEARTBEAT_HOURS", "3.5")),
+        quiet_hours=os.environ.get("QUIET_HOURS", "02:00-07:00").strip(),
         code_dir=Path(os.environ.get("CODE_DIR") or Path.home() / "code").expanduser(),
         code_engine=(os.environ.get("CODE_ENGINE", "claude").strip().lower() or "claude"),
         claude_bin=os.environ.get("CLAUDE_BIN", "claude"),

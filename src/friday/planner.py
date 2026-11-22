@@ -119,9 +119,7 @@ def tomorrow(t: Task, tz: str, now: datetime) -> datetime:
 
 
 def move_to_tomorrow(store: Store, t: Task, tz: str, now: datetime) -> Task | None:
-    due = tomorrow(t, tz, now)
-    remind = tu.default_task_reminder(due, tz, now)
-    return store.update_task(t.id, due=due, remind=remind, clear_remind=remind is None)
+    return store.update_task(t.id, due=tomorrow(t, tz, now), clear_remind=True)
 
 
 # --- the Mini App planner -----------------------------------------------------------------
@@ -189,8 +187,7 @@ def apply(store: Store, values: dict, snap: Snapshot, tz: str, now: datetime,
                 pass
         if title is None and due is None:
             continue
-        remind = tu.default_task_reminder(due, tz, now) if due else None
-        t = store.update_task(e["id"], title=title, due=due, remind=remind, clear_remind=bool(due) and remind is None)
+        t = store.update_task(e["id"], title=title, due=due, clear_remind=bool(due))
         if t:
             done.append(f"✏️ {t.title}" + (f" → {when(t.due_at, tz, now)}" if due and t.due_at else ""))
     for n in (values.get("new") or [])[:20]:
@@ -203,7 +200,7 @@ def apply(store: Store, values: dict, snap: Snapshot, tz: str, now: datetime,
                 due = tu.parse_when(n["d"], tz)
             except ValueError:
                 pass
-        t = store.add_task(title, due, tu.default_task_reminder(due, tz, now) if due else None)
+        t = store.add_task(title, due, None)
         done.append(f"➕ {t.title}" + (f" · {when(due, tz, now)}" if due else ""))
     for rid in _ids(values, "remdel", snap.reminders):
         r = next((x for x in store.active_reminders() if x.id == rid), None)

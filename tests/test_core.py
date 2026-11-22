@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -69,6 +69,13 @@ def test_invalid_rules_are_rejected(store):
             store.add_reminder("x", local("2026-11-17T09:00"), SEOUL, rule)
 
 
+def test_heartbeat_slots_skip_quiet_hours():
+    slots = tu.heartbeat_slots(date(2026, 11, 23), SEOUL, time(8, 0), timedelta(hours=3.5), "02:00-07:00")
+    assert [f"{s:%H:%M}" for s in slots] == ["08:00", "11:30", "15:00", "18:30", "22:00", "01:30"]
+    assert tu.quiet_end(local("2026-11-23T23:30"), SEOUL, "23:00-07:00") == local("2026-11-24T07:00")
+    assert tu.quiet_end(local("2026-11-23T12:00"), SEOUL, "02:00-07:00") is None
+
+
 # --- tasks and memories ----------------------------------------------------------
 
 def test_task_lifecycle(store):
@@ -84,15 +91,6 @@ def test_task_lifecycle(store):
     assert store.tasks_now_due(local("2026-11-19T15:00"))[0].id == t.id
     assert store.complete_task(t.id) and not store.complete_task(t.id)
     assert store.open_tasks() == [] and store.recent_done_tasks()[0].title == "보고서 마무리"
-
-
-def test_default_task_reminder():
-    now = local("2026-11-17T20:00")
-    # Deadline tomorrow afternoon -> 09:00 that morning; tomorrow 10:00 -> one hour before.
-    assert tu.default_task_reminder(local("2026-11-18T15:00"), SEOUL, now) == local("2026-11-18T09:00")
-    assert tu.default_task_reminder(local("2026-11-18T10:00"), SEOUL, now) == local("2026-11-18T09:00")
-    # Deadline in 30 minutes -> nothing (would be in the past).
-    assert tu.default_task_reminder(now + timedelta(minutes=30), SEOUL, now) is None
 
 
 def test_memory_dedupe_update_and_search(store):

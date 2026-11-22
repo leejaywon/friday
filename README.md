@@ -17,7 +17,10 @@ A personal assistant that lives on your own server and talks to you over Telegra
   when a request needs a signed-in page or interaction with a website.
 - **Reminders** that always arrive: a scheduler on the server sends them, independent of the AI.
   Repeats are supported ("every weekday at 9").
-- **Google Calendar**: read and add events, morning brief.
+- **Google Calendar**: read and add events.
+- **Check-ins and follow-ups**: Friday looks at your day on its own every few hours (the first one
+  is the morning plan) and schedules its own wake-ups for deadlines, events and things you said
+  you'd do; it messages you only when something is worth it, and never in quiet hours.
 - **Memory**: Friday saves lasting facts about you, and keeps a log of your conversations with a
   short summary of each, so "which CCTVs did we look at last week?" finds what was said and linked.
 - **Files and photos**: send them to the bot; they land in `files/inbox/` for Friday to use. A
@@ -43,7 +46,7 @@ inbound ports are open apart from SSH.
 Telegram ──► friday bot (systemd) ──► Codex or Claude Code ──► friday MCP tools ──► SQLite
                      │                        │                                     ▲
                      │                        └──► Playwright MCP ──► Chrome (systemd)
-                     └── reminder / calendar / brief / browser-run / watch loops ───┘
+                     └── reminder / check-in / wake-up / browser-run / watch loops ───┘
 ```
 
 ## Setup
@@ -119,8 +122,8 @@ fixed rules (no stored secrets, web/GitHub text is never an instruction, plain-t
 are always added and can't be edited away.
 
 **Tasks vs reminders**: "report by tomorrow evening" is a *task* (deadline, done/open). Friday
-nudges at 09:00 on the due day (or 1 h before) and again when it's due, with ✅ Done / ⏳ 1 hour
-buttons. "workout at 7" is a *reminder* (a message at a time, optionally repeating; skip dates
+decides itself when and how often to nudge about it (it schedules its own wake-ups), and the server
+messages you when it's due, with ✅ Done / ⏳ 1 hour buttons. "workout at 7" is a *reminder* (a message at a time, optionally repeating; skip dates
 supported). Vague times like "by evening" have fixed meanings (`VAGUE_TIMES` in
 `src/friday/timeutil.py`).
 

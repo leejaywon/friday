@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from dateutil.rrule import rrulestr
@@ -100,16 +100,38 @@ Vague times (use these unless the user says otherwise):
 """
 
 
-def default_task_reminder(due: datetime, tz: str, now: datetime) -> datetime | None:
-    """When to nudge about a task whose user gave no reminder time.
+def parse_span(span: str) -> tuple[time, time] | None:
+    """'02:00-07:00' -> (02:00, 07:00); empty -> None. It may cross midnight ('23:00-07:00')."""
+    if not span.strip():
+        return None
+    start, end = (time.fromisoformat(x.strip()) for x in span.split("-"))
+    return start, end
 
-    09:00 on the due day when the deadline is later that day, otherwise one hour before the
-    deadline; never in the past.
-    """
+
+def quiet_end(dt: datetime, tz: str, span: str) -> datetime | None:
+    """The end of the quiet hours dt falls in (local time span like '02:00-07:00'), or None."""
+    hours = parse_span(span)
+    if not hours:
+        return None
+    start, end = hours
+    local = dt.astimezone(ZoneInfo(tz))
+    t, day = local.time(), local.date()
+    if start <= end:
+        inside = start <= t < end
+    else:
+        inside = t >= start or t < end
+        if t >= start:
+            day += timedelta(days=1)
+    return datetime.combine(day, end, tzinfo=ZoneInfo(tz)) if inside else None
+
+
+def heartbeat_slots(day: date, tz: str, first: time, every: timedelta, quiet: str) -> list[datetime]:
+    """The day's check-ins: from `first`, every `every`, until the next day's first, outside quiet hours."""
     zone = ZoneInfo(tz)
-    local_due = due.astimezone(zone)
-    morning = local_due.replace(hour=9, minute=0, second=0, microsecond=0)
-    if local_due - morning >= timedelta(hours=2) and morning > now:
-        return morning
-    hour_before = due - timedelta(hours=1)
-    return hour_before if hour_before > now else None
+    at, until = datetime.combine(day, first, tzinfo=zone), datetime.combine(day + timedelta(days=1), first, tzinfo=zone)
+    slots = []
+    while at < until:
+        if not quiet_end(at, tz, quiet):
+            slots.append(at)
+        at += every
+    return slots

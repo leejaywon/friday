@@ -46,6 +46,21 @@ def test_recall_finds_an_earlier_conversation(tools, store):
     assert tools.recall("냉장고").startswith("Nothing matches")
 
 
+def test_wakes_wait_out_quiet_hours_and_run_as_friday_turns(cfg, tools):
+    tomorrow = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(days=1)).date()
+    out = tools.wake(f"{tomorrow}T03:30", "인턴 지원 마감 확인")
+    assert "07:00" in out and "quiet hours" in out
+
+    bot = Friday(replace(cfg, allowed_user_ids=(1,)))
+    bot.store.add_wake(tu.now_utc() - timedelta(minutes=1), "인턴 지원 마감 23:59, 아직이면 알려주기")
+    turns = []
+    bot._turn = lambda chat, text, lane=None, source="user": turns.append((text, source)) or asyncio.sleep(0)
+    asyncio.run(bot.wake_loop())
+    assert len(turns) == 1 and turns[0][1] == "wake" and "인턴 지원 마감 23:59" in turns[0][0]
+    assert not bot.store.due_wakes(tu.now_utc())  # taken once
+    bot.store.close()
+
+
 def test_markdown_becomes_plain_text():
     assert plain_text("**영업시간**: 07:00~22:00 [네이버 지도](https://map.naver.com/p/x) "
                       "[https://a.kr](https://a.kr)") == "영업시간: 07:00~22:00 네이버 지도 https://map.naver.com/p/x https://a.kr"

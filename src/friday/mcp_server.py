@@ -190,13 +190,54 @@ def add_reminder(text: str, when: str, repeat: str = "", skip_dates: str = "") -
 
 @server.tool()
 def list_reminders() -> str:
-    """All upcoming reminders with their ids and next alerts."""
+    """All upcoming reminders with their ids and next alerts, and the wake-ups you scheduled."""
     tz = _tz()
     lines = []
     for r in store.active_reminders():
         nxt = f"  next: {'; '.join(r.preview(tz))}" if r.rrule else ""
         lines.append(r.describe(tz) + nxt)
-    return "\n".join(lines) or "No upcoming reminders."
+    wakes = [f"wake #{w['id']} {tu.local_str(tu.from_iso(w['at']), tz)}: {w['note']}" for w in store.pending_wakes()]
+    return "\n".join(lines or ["No upcoming reminders."]) + ("\nYour wake-ups:\n" + "\n".join(wakes) if wakes else "")
+
+
+MAX_WAKES = 50  # pending at once: a loop of wakes scheduling wakes stops here
+
+
+@server.tool()
+def wake(when: str, note: str) -> str:
+    """Schedule a turn of your own: at `when` (ISO 8601 local) you are woken with `note` and decide
+    then what to do: message the user, check or do something, schedule another wake, or nothing.
+
+    Use it whenever something deserves a look later rather than now: a nudge before a deadline
+    (and again if it's still open), getting ready for an event (leave time, what to bring, the
+    link), a follow-up on what the user said they'd do, a retry of something that failed. Choose
+    the time and how often by what's at stake. For a plain message the user asked for at a fixed
+    time, use add_reminder: it goes out even if you can't run.
+
+    note: what to look at and why, complete on its own (the conversation may have moved on),
+        e.g. "Naver internship application due 23:59 today; check list_tasks, nudge if still open".
+    Quiet hours (no wakes then) move it to their end."""
+    if looks_secret(note):
+        return REFUSAL
+    if not note.strip():
+        return "Give a note: what to look at then and why."
+    if len(store.pending_wakes()) >= MAX_WAKES:
+        return f"Not scheduled: {MAX_WAKES} wake-ups are already pending (list_reminders; cancel_wake some)."
+    tz = _tz()
+    at = tu.parse_when(when, tz)
+    if at < tu.now_utc() - timedelta(minutes=1):
+        return f"Not scheduled: {tu.local_str(at, tz)} is in the past."
+    moved = ""
+    if end := tu.quiet_end(at, tz, cfg.quiet_hours):
+        at, moved = end, f" (moved out of quiet hours {cfg.quiet_hours})"
+    wid = store.add_wake(at, note)
+    return f"Wake #{wid} at {tu.local_str(at, tz)}{moved}."
+
+
+@server.tool()
+def cancel_wake(wake_id: int) -> str:
+    """Cancel a wake-up you scheduled (list_reminders shows them)."""
+    return "Cancelled." if store.end_wake(wake_id, "cancelled") else "No pending wake-up with that id."
 
 
 @server.tool()
@@ -248,22 +289,17 @@ def add_task(title: str, due: str = "", remind: str = "", notes: str = "") -> st
     title: short description, e.g. 'finish the report'.
     due: ISO 8601 deadline, e.g. '2026-11-18T15:00'. Empty if there is no deadline.
         Use the vague-time defaults from your instructions for words like "by evening" or "today".
-    remind: ISO 8601 time for a heads-up before the deadline. Leave empty for the default
-        (09:00 on the due day, or 1 hour before); 'none' for no heads-up.
+    remind: ISO 8601 time for a heads-up, only when the user asked for one at a time. Otherwise
+        leave it empty and decide yourself when a nudge would help: schedule it with wake.
     notes: optional details.
 
-    Friday also messages the user when the deadline arrives if the task is still open.
+    Friday messages the user when the deadline arrives if the task is still open.
     """
     if looks_secret(f"{title} {notes}"):
         return REFUSAL
-    tz, now = _tz(), tu.now_utc()
+    tz = _tz()
     due_dt = tu.parse_when(due, tz) if due else None
-    if remind.strip().lower() == "none":
-        remind_dt = None
-    elif remind:
-        remind_dt = tu.parse_when(remind, tz)
-    else:
-        remind_dt = tu.default_task_reminder(due_dt, tz, now) if due_dt else None
+    remind_dt = tu.parse_when(remind, tz) if remind and remind.strip().lower() != "none" else None
     t = store.add_task(title, due_dt, remind_dt, notes)
     return f"Added task {t.describe(tz)}"
 
