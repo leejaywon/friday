@@ -35,6 +35,9 @@ A personal assistant that lives on your own server and talks to you over Telegra
   stay on the server until you request a file or transcription.
 - **Watches**: "tell me when that website posts a new notice": Friday checks on a schedule and
   messages you only when something new matches.
+- **Delegated work**: Friday answers everyday things itself and hands heavy work (a website with a
+  login, playing or recording something, files, comparing many sources) to a background worker with
+  its own folder and progress ledger. It tells you the result when the worker is done.
 - **Coding jobs**: ask for a change to a project on the server; Claude Code or Codex does it in a
   sandbox. GitHub repos get a pull request you merge or close from Telegram; local projects are
   changed in place, with an Undo button.
