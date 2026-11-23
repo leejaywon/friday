@@ -67,8 +67,11 @@ def step_label(item: dict) -> str:
         return f"{SERVER_NAMES.get(server, server)}: {tool}" + (f" «{what[:50]}»" if what else "")
     if kind == "commandExecution":
         return "running a command"
-    if kind == "webSearch":
-        return "searching the web"
+    if kind == "webSearch" or (str(kind).lower() == "extension" and item.get("kind") == "web.search"):
+        action = item.get("action") if isinstance(item.get("action"), dict) else {}
+        query = item.get("query") or action.get("query") or " / ".join(action.get("queries") or [])
+        query = " ".join(str(query).split())
+        return "searching the web" + (f" «{query[:50]}»" if query else "")
     if kind == "dynamicToolCall":
         return str(item.get("tool") or "a tool").replace("_", " ")
     return str(kind or "")

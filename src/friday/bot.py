@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import time as clock
 from dataclasses import dataclass, field, replace
+from collections import Counter
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -89,6 +90,21 @@ WATCH_SHOT, WATCH_ADVISE, WATCH_STOP, WATCH_END = 10.0, 20.0, 30.0, 50.0
 WAITS = ("sleep", "wait", "friday:", "browser: evaluate", "browser: wait for")
 # Steps that only look: succeeding at them isn't progress.
 LOOKS = ("snapshot", "screenshot", "tabs", "console", "«status»", "network")
+# Pacing (TurnStatus._pace), for work that succeeds step by step without converging. Set from 228
+# real turns: steps per turn are 1 at the median, 13 at p95, 34 at p99 (the worst, 144, was a loop
+# of snapshot and press_key). Steps that wait on purpose don't count.
+CHECK_EVERY, WRAP_UP_STEPS, END_STEPS = 15, 45, 65
+WRAP_UP_TIME = 0.75  # of the turn's time limit, from its first step
+REPEAT_AFTER = 5  # the same action on the same target
+CHECK_NOTE = ("[Friday] {n} steps so far on this request. Take stock before the next one: what you have "
+              "established, what is still missing, and whether another step is likely to get it. If you can "
+              "answer, answer now. If the last steps brought nothing new, change approach or stop and say "
+              "what you tried.")
+REPEAT_NOTE = ("[Friday] You have now done «{what}» {n} times in this request. If it isn't bringing anything "
+               "new, do something different, or stop and say why.")
+WRAP_UP_NOTE = ("[Friday] This request has taken {n} steps over {t}. Finish now: reply with what you have, what "
+                "you couldn't confirm and what you tried. If more work is really needed, say what's done and "
+                "what's left and ask whether to continue. Don't start anything new.")
 STOP_NUDGE = ("[Friday] 30 seconds without progress. Stop trying now: reply to the user with what you "
               "tried, the concrete reason it doesn't work (what you saw), and what they could do. "
               "Don't start anything new.")
@@ -324,8 +340,12 @@ class TurnStatus:
     def __init__(self, send, edit, delete, alert=None, summarize=None, note_after: float = PROGRESS_AFTER,
                  status_after: float = STATUS_AFTER, every: float = STATUS_EVERY, stuck_after: float = STUCK_AFTER,
                  summary_every: float = SUMMARY_EVERY, tick: float = 1.0, nudge=None, advise=None, give_up=None,
-                 shoot=None):
+                 shoot=None, time_limit: float = 0):
         self.send, self.edit, self.delete, self.alert = send, edit, delete, alert
+        # Pacing (_pace): steps that count, from when, how often each action on a target came.
+        self.time_limit, self.work, self.first_step = time_limit, 0, None
+        self.repeats: Counter[str] = Counter()
+        self.wrapped, self.ended = False, False
         # The watchdog (_watch): nudge(text, images) adds a note to the running turn, advise(facts)
         # -> a small model's advice, give_up(facts) stops the turn and explains, shoot() -> a
         # screenshot of the page (a Path) or None.
@@ -366,6 +386,7 @@ class TurnStatus:
             self.steps[item_id] = (label, now)
             self.last = label
             self.history.append(label)
+            self._pace(label, now)
             return
         done = self.steps.pop(item_id, None)
         what = done[0] if done else "a step"
@@ -377,6 +398,31 @@ class TurnStatus:
         elif done and not what.startswith(WAITS) and not any(x in what for x in LOOKS):
             self.trouble_since, self.stage = None, 0  # it got somewhere
 
+    def _pace(self, label: str, now: float) -> None:
+        """Work that goes on without converging: take stock, then finish, then Friday ends it. The
+        limits are notes to the agent first, so a long task that is getting somewhere can say so."""
+        if not self.nudge or label.startswith(WAITS):
+            return
+        self.first_step = self.first_step or now
+        self.work += 1
+        if "«" in label and not any(x in label for x in LOOKS):
+            self.repeats[label] += 1
+            if self.repeats[label] == REPEAT_AFTER:
+                what = label.replace("«", "").replace("»", "")
+                self._spawn(self.nudge(REPEAT_NOTE.format(what=what, n=REPEAT_AFTER), []))
+        if self.work >= END_STEPS and self.give_up and not self.ended:
+            self.ended = True
+            self._spawn(self.give_up(self._facts()))
+        elif self.work >= WRAP_UP_STEPS:
+            self._wrap_up(now)
+        elif self.work % CHECK_EVERY == 0:
+            self._spawn(self.nudge(CHECK_NOTE.format(n=self.work), []))
+
+    def _wrap_up(self, now: float) -> None:
+        if not self.wrapped:
+            self.wrapped = True
+            self._spawn(self.nudge(WRAP_UP_NOTE.format(n=self.work, t=_clock(now - self.first_step)), []))
+
     def _hanging(self, now: float) -> float | None:
         """When the oldest step still running started, if it isn't one that waits on purpose."""
         starts = [t for label, t in self.steps.values() if not label.startswith(WAITS)]
@@ -387,8 +433,10 @@ class TurnStatus:
 
     async def _watch(self, now: float) -> None:
         """Steps fail or hang with nothing succeeding after: see, rethink, stop, explain (WATCH_*)."""
-        if not self.nudge:
+        if not self.nudge or self.ended:
             return
+        if self.time_limit and self.first_step and now - self.first_step >= WRAP_UP_TIME * self.time_limit:
+            self._wrap_up(now)
         hung = self._hanging(now)
         since = min(x for x in (self.trouble_since, hung) if x is not None) if (self.trouble_since or hung) else None
         if since is None:
@@ -1141,7 +1189,7 @@ class Friday(WatchBot):
                           alert=lambda text: bot().send_message(chat_id, text, reply_markup=stop_button(lane)),
                           summarize=summarize if light else None,
                           nudge=nudge if self.codex else None, advise=advise if light else None,
-                          give_up=give_up, shoot=shoot)
+                          give_up=give_up, shoot=shoot, time_limit=self.cfg.codex_timeout_seconds)
 
     async def _progress_update(self, request: str, progress: dict) -> str:
         """One line on where a long turn is, from a small model with no tools (PROGRESS_PROMPT)."""

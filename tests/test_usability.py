@@ -360,3 +360,32 @@ def test_chats_from_before_the_log_are_imported_as_conversations(tmp_path, store
         ("user", "리올링크는?"), ("friday", "RLC-810WA도 괜찮아.")]
     assert [m["text"] for m in store.messages(second)] == ["오늘 일정 알려줘"]
     assert len(store.all_messages()) == 6  # the log's own message stays; nothing twice
+
+
+def test_work_that_does_not_converge_is_paced_then_ended():
+    from friday.bot import END_STEPS, REPEAT_AFTER, WRAP_UP_STEPS, TurnStatus
+
+    async def go():
+        notes, ended = [], []
+
+        async def nudge(text, images):
+            notes.append(text)
+
+        async def give_up(facts):
+            ended.append(facts)
+
+        idle = lambda *a: asyncio.sleep(0)
+        st = TurnStatus(idle, idle, idle, nudge=nudge, give_up=give_up, tick=60)
+        for i in range(END_STEPS + 5):  # every step succeeds: the failure watchdog sees nothing wrong
+            label = "browser: press key «PageDown»" if i % 2 else "browser: snapshot"
+            st.on_step(str(i), label)
+            st.on_step(str(i), "")
+        await asyncio.sleep(0)
+        await st.finish()
+        repeats = [n for n in notes if f"{REPEAT_AFTER} times" in n and "press key PageDown" in n]
+        assert len(repeats) == 1
+        assert sum("Take stock" in n for n in notes) == (WRAP_UP_STEPS - 1) // 15
+        assert sum("Finish now" in n for n in notes) == 1
+        assert len(ended) == 1
+
+    asyncio.run(go())
