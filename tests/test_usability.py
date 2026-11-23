@@ -422,6 +422,19 @@ def test_a_worker_cant_end_early_or_claim_more_than_it_checked(cfg, store):
         ended = gate.result()
         assert (ended.status, ended.reason) == ("partial", "B의 제출 여부")
 
+        # A follow-up is checked against what it asked for, not the job's first goal.
+        seen = []
+        async def met(prompt):
+            seen.append(prompt)
+            return '{"verdict": "met", "missing": ""}'
+        store.update_job(jid, followup="PDF만 다시 읽어줘", asked="PDF만 다시 봐줘")
+        gate = dg.FinishGate(store, store.job(jid), met)
+        dg.save_finish(store, jid, dg.Finish("done"))
+        assert await gate.next("보고") == "" and gate.result().status == "done"
+        assert "PDF만 다시 읽어줘" in seen[0] and "두 곳 확인" not in seen[0]
+        assert "What to do now: PDF만 다시 읽어줘" in dg.worker_prompt(store, cfg, store.job(jid), "now")
+        store.update_job(jid, followup=None, asked="두 곳 다 확인해줘")
+
         # A check that fails blocks nothing.
         async def broken(prompt):
             return ""

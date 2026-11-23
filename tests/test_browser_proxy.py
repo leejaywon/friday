@@ -33,6 +33,16 @@ def test_a_huge_page_is_cut_with_the_full_text_saved():
     assert bp.bounded(small, lambda text: 1 / 0) is small
 
 
+def test_a_screenshot_reaches_the_agent_as_a_file_it_can_open():
+    result = {"content": [{"type": "text", "text": "failed"}, {"type": "image", "data": "aGk=", "mimeType": "image/png"}],
+              "isError": True}
+    out = bp.images_to_files(result, lambda part: "/tmp/shot.png" if part["data"] == "aGk=" else "")
+    assert [c["type"] for c in out["content"]] == ["text", "text"] and out["isError"]
+    assert "/tmp/shot.png" in out["content"][1]["text"] and "view_image" in out["content"][1]["text"]
+    plain = {"content": [{"type": "text", "text": "ok"}]}
+    assert bp.images_to_files(plain, lambda part: 1 / 0) is plain
+
+
 def test_a_click_on_a_moving_player_becomes_a_mouse_click_and_is_checked():
     relay = bp.Relay("http://127.0.0.1:1/mcp")
     moving = {"x": 640, "y": 360, "w": 1280, "h": 720, "vw": 1280, "vh": 900, "hidden": False,

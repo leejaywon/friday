@@ -32,6 +32,7 @@ out and screenshots take seconds, and can keep a video from loading at all.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import itertools
 import json
@@ -216,6 +217,23 @@ def with_line(result: dict, line: str) -> dict:
     return {**result, "content": [{"type": "text", "text": line}, *(result.get("content") or [])]}
 
 
+def images_to_files(result: dict, save) -> dict:
+    """Screenshots as files the agent can open. Codex hands a tool result to the model as text, so an
+    attached image would arrive as base64 it can't see. save(image part) -> the file's path, or ""."""
+    content = result.get("content") or []
+    if not any(c.get("type") == "image" for c in content):
+        return result
+    out = []
+    for c in content:
+        if c.get("type") != "image":
+            out.append(c)
+            continue
+        path = save(c)
+        out.append({"type": "text", "text": f"[Screenshot saved: {path}. To see it, open that file with view_image.]"
+                    if path else "[Friday couldn't save this screenshot.]"})
+    return {**result, "content": out}
+
+
 def bounded(result: dict, save, limit: int = OUTPUT_LIMIT) -> dict:
     """A result that fits the limit: the start and end of its longest text, cut at line breaks, and
     where the whole of it was saved. save(text) -> the file's path, or "" if it couldn't be saved."""
@@ -393,19 +411,30 @@ class Relay:
             self._store = Store(load_config().db_path)
         return self._store
 
-    def save_output(self, text: str) -> str:
-        """A long result in full: in the job's temporary folder, or with the browser's other files."""
-        try:
-            from .config import load_config
+    def _output_path(self, suffix: str):
+        """Where a long result or a screenshot goes: the job's temporary folder, or the browser's files."""
+        from .config import load_config
 
-            cfg = load_config()
-            job = re.fullmatch(r"job:(\d+)", self.owner)
-            folder = cfg.workspace / "jobs" / job[1] if job else cfg.files_dir / "browser"
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / f"page-{uuid.uuid4().hex[:8]}.txt"
+        cfg = load_config()
+        job = re.fullmatch(r"job:(\d+)", self.owner)
+        folder = cfg.workspace / "jobs" / job[1] if job else cfg.files_dir / "browser"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / f"page-{uuid.uuid4().hex[:8]}{suffix}"
+
+    def save_output(self, text: str) -> str:
+        try:
+            path = self._output_path(".txt")
             path.write_text(text, encoding="utf-8")
             return str(path)
         except OSError:
+            return ""
+
+    def save_image(self, part: dict) -> str:
+        try:
+            path = self._output_path(".png" if "png" in str(part.get("mimeType")) else ".jpg")
+            path.write_bytes(base64.b64decode(part.get("data") or "", validate=True))
+            return str(path)
+        except (OSError, ValueError):
             return ""
 
     async def write(self, msg: dict) -> None:
@@ -421,7 +450,8 @@ class Relay:
         method = msg.get("method")
         try:
             if method == "tools/call":
-                out = {"jsonrpc": "2.0", "id": msg["id"], "result": bounded(await self.tool(msg), self.save_output)}
+                result = images_to_files(await self.tool(msg), self.save_image)
+                out = {"jsonrpc": "2.0", "id": msg["id"], "result": bounded(result, self.save_output)}
             else:
                 out = await self.up.send(msg, self.passthrough)
                 if method == "initialize" and out and "result" in out:

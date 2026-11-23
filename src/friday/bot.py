@@ -1840,7 +1840,7 @@ class Friday(WatchBot):
         elif status in ("queued", "running"):
             await msg.reply_text(f"«{name}» is still {status}. Reply again when it's done, or stop it (/jobs has its number).")
         elif status in ("review", *dg.ENDED):
-            self.store.update_job(jid, followup=msg.text, status="queued")
+            self.store.update_job(jid, followup=msg.text, asked=short(msg.text or "", 1500), status="queued")
             sent = await msg.reply_text(f"↩️ «{name}»: follow-up queued")
             self.store.link_job_message(sent.message_id, jid)
             self.store.set(f"job_queued_msg:{jid}", str(sent.message_id))

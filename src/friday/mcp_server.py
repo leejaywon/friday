@@ -654,8 +654,7 @@ def delegate(goal: str, why: str = "", context: str = "", project: str = "", rel
             return f"Passed to job #{continue_job}, which is still {job['status']}."
         if job["status"] not in ("review", *dg.ENDED, "cancelled"):
             return f"Job #{continue_job} is {job['status']} and can't be continued: start a new one."
-        store.update_job(continue_job, followup=goal, status="queued", **({"browser": 1} if browser else {}),
-                         **({"asked": asked} if asked else {}))
+        store.update_job(continue_job, followup=goal, status="queued", asked=asked, **({"browser": 1} if browser else {}))
         return f"Job #{continue_job} goes on with this. Tell the owner in one short line and end your turn."
     project = project.strip()
     if project and not REPO_ARG.match(project):
