@@ -2096,7 +2096,7 @@ class Friday(WatchBot):
     async def _run_worker(self, job, on_step: Callable[[str], None]) -> Outcome:
         """A delegated job without a project (delegate.py): an agent in its own folder and thread,
         with the browser attached when it asks. It can run for as long as jobs may, as long as it
-        keeps getting somewhere (WorkerPace)."""
+        isn't going in circles (WorkerPace)."""
         jid, key = job["id"], f"job{job['id']}"
         workdir = dg.work_dir(self.cfg, jid)
         prompt = dg.worker_prompt(self.store, self.cfg, job, dg.now_str(self.tz))
@@ -2117,7 +2117,8 @@ class Friday(WatchBot):
             if self.codex:
                 self.codex.stop_turn(key)
 
-        pace = dg.WorkerPace(self.store, jid, nudge, stop, spawn)
+        pace = dg.WorkerPace(self.store, jid, job["task"], nudge, stop, spawn,
+                             self._light if self.cfg.progress_model.lower() != "off" else None)
 
         def step(item_id: str, label: str, failed: str = "") -> None:
             if label:
@@ -2130,7 +2131,8 @@ class Friday(WatchBot):
                       toolsets=toolsets, tz=self.tz, job_id=jid, workdir=workdir)
             if job["engine"] == "codex" and same_engine and self.codex:
                 try:
-                    return await self.codex.run(text, thread, [], on_step=step, key=key, timeout=limit, **kw)
+                    return await self.codex.run(text, thread, [], on_note=pace.on_note, on_step=step, key=key,
+                                                timeout=limit, **kw)
                 except CodexServerError as e:
                     log.warning("codex app-server failed on job %s, retrying with codex exec: %s", jid, e)
                     if e.partial:
@@ -2154,7 +2156,7 @@ class Friday(WatchBot):
                     await self.doctor.ensure("lock")  # a stuck Chrome is restarted before the worker starts on it
                 prompt = "[The browser tools are now attached; go on with the job.]"
             if pace.ended:
-                result = await turn("[Friday stopped this job: it stopped making progress. Without using any tools, "
+                result = await turn("[Friday stopped this job: it kept going in circles. Without using any tools, "
                                     "report what you have, what's missing and what you tried.]", thread,
                                     {"browser"} if has_browser else set())
         finally:
@@ -2163,7 +2165,7 @@ class Friday(WatchBot):
             self.store.delete(mcp_http.toolsets_key(key))
         text = result.text.strip()
         if pace.ended:
-            return Outcome("failed", text or "It stopped making progress and gave no report.")
+            return Outcome("failed", text or "It kept going in circles and gave no report.")
         if not text.strip(" .-") or (result.errors and not text):
             raise JobError("; ".join(result.errors) or "the worker gave no report")
         return Outcome("done", text)

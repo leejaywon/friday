@@ -421,33 +421,36 @@ def test_a_delegated_job_only_reaches_its_tools_and_its_report_goes_to_the_main_
     bot.store.close()
 
 
-def test_a_worker_is_ended_for_making_no_progress_not_for_its_step_count(store):
+def test_a_worker_ends_on_a_review_saying_stuck_twice_never_on_a_count(store):
     from friday import delegate as dg
 
-    jid = store.add_delegated_job("긴 작업", "codex")
-    item = store.add_job_item(jid, "항목")
-    notes, stopped = [], []
+    async def go(answers):
+        jid = store.add_delegated_job("긴 목록 정리", "codex")
+        notes, stopped, answers = [], [], iter(answers)
 
-    async def nudge(text):
-        notes.append(text)
+        async def nudge(text):
+            notes.append(text)
 
-    async def stop():
-        stopped.append(True)
+        async def stop():
+            stopped.append(True)
 
-    async def go():
-        pace = dg.WorkerPace(store, jid, nudge, stop, asyncio.ensure_future)
-        for i in range(200):  # long, but the ledger keeps moving
-            pace.on_step(f"browser: click «item {i}»")
-            if i % 20 == 0:
-                store.update_job_item(jid, item, "doing", f"step {i}")
-        await asyncio.sleep(0)
-        assert not stopped
-        for i in range(dg.STALL_END):
-            pace.on_step(f"browser: click «other {i}»")
-        await asyncio.sleep(0)
-        assert stopped and any("without the ledger moving" in n for n in notes)
+        async def judge(prompt):
+            return next(answers)
 
-    asyncio.run(go())
+        pace = dg.WorkerPace(store, jid, "긴 목록 정리", nudge, stop, asyncio.ensure_future, judge)
+        for i in range(dg.REVIEW_EVERY * 2 + 2):  # the same key over and over, two reviews
+            pace.on_step("browser: press key «PageDown»")
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        return notes, stopped
+
+    going = '{"verdict": "progress", "why": "new items each page"}'
+    circles = '{"verdict": "stuck", "why": "the same key finds nothing"}'
+    notes, stopped = asyncio.run(go([going, going]))
+    assert not stopped and sum("circles" in n for n in notes) == 0  # long and repetitive, but getting somewhere
+    assert not asyncio.run(go(["not json", "still not json"]))[1]  # an unclear review counts for nothing
+    notes, stopped = asyncio.run(go([circles, circles]))
+    assert stopped and any("the same key finds nothing" in n for n in notes)
 
 
 def test_a_job_interrupted_during_an_approved_step_stops_and_asks(cfg):
