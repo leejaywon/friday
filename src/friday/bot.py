@@ -2038,7 +2038,8 @@ class Friday(WatchBot):
         work = job["kind"] == "work"
         head = self._job_label(job)
         what = f"follow-up: {short(job['followup'], 200)}" if job["followup"] else short(job["task"], 200)
-        started = f"🛠 Started: {what}" if work else f"🛠 {job['repo']} ({job['engine']}) started: {what}"
+        # A work job's brief is the main agent's wording, for the worker; the owner gets its one-line reply.
+        started = "🛠 Working on it" if work else f"🛠 {job['repo']} ({job['engine']}) started: {what}"
         queued = self.store.get(f"job_queued_msg:{jid}")  # the /code or follow-up message: edit it
         self.store.delete(f"job_queued_msg:{jid}")
         stop = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"job:stop:{jid}")]])

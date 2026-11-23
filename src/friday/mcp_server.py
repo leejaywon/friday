@@ -1109,9 +1109,13 @@ or (replying instead of using the form) marks that field not needed; the result 
     fill_login_field any field. Waits up to 5 minutes. Returns 'Submitted: {json}' plus notes,
     'Cancelled' or 'Timed out'.
 
-    title: what the form is for, in the user's language, e.g. 'example.com login'.
+    Everything the form shows is in English, whatever language the chat is in; real values (an
+    option's name on a site) stay as they are.
+
+    title: what the form is for, e.g. 'example.com login'.
     fields: JSON list (at most 12) of {"name", "label", "type", "required" (default true;
-        checkbox false), "placeholder", "help", "options" (select/choice: strings or
+        checkbox false), "placeholder" (only a format example the label doesn't already give),
+        "help", "options" (select/choice: strings or
         {"value", "label"}), "default", "sensitive"}. type: text, password, code, number, email,
         url, textarea, select, choice, checkbox, date, time.
     description: a sentence on why you ask and how it will be used; shown to the user.
@@ -1149,7 +1153,7 @@ async def request_code(reason: str, label: str = "Code", ctx: Context | None = N
     They type it into a form (or reply with it); the code is returned to you and not stored anywhere. Waits up to
     5 minutes. Returns 'Code: <code>', 'Cancelled' or 'Timed out'.
 
-    reason: a few words in the user's language, e.g. 'SMS code for example.com'.
+    reason: a few words in English (the form is in English), e.g. 'SMS code for example.com'.
     label: the field's label, e.g. 'Code' or 'OTP'.
     """
     status, values = await _run_form(code_spec(reason, label), "code", ctx=ctx, tool="request_code")

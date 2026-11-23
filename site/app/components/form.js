@@ -15,10 +15,10 @@ FridayApp.register("form", function (spec, app) {
   const form = el("form", { className: "group", noValidate: true, autocomplete: "on" });
   const controls = []; // {f, box, input, get(), focus(), initial}
 
-  function placeholderFor(f) {
+  const FORMAT_HINTS = { email: "name@example.com", url: "https://" };
+  function placeholderFor(f) { // only what the label doesn't already say
     if (f.placeholder) return f.placeholder;
-    const l = f.label || f.name; // "Member ID" -> "member ID", "OTP" stays
-    return (f.type === "select" ? "Choose " : "Enter ") + (/^[A-Z][a-z]/.test(l) ? l[0].toLowerCase() + l.slice(1) : l);
+    return f.type === "select" ? "Choose one" : FORMAT_HINTS[f.type] || "";
   }
   function clearError(box) {
     box.classList.remove("bad");
