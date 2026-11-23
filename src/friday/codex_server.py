@@ -46,6 +46,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 NOT_TOOLS = {"userMessage", "agentMessage", "reasoning", "plan", "hookPrompt", "contextCompaction"}
 STOP = {"method": "friday/stop"}  # put in a running turn's queue by stop_turn (the [Stop] button)
 SERVER_NAMES = {"playwright": "browser"}
+EFFECT = re.compile(r"\[effect: (changed|unchanged|unknown)\]")
 
 
 def step_label(item: dict) -> str:
@@ -86,6 +87,16 @@ def item_error(item: dict) -> str:
     if isinstance(result, dict) and result.get("isError"):
         return " ".join(str(c.get("text", "")) for c in result.get("content") or []
                         if isinstance(c, dict))[:500] or "failed"
+    return ""
+
+
+def item_effect(item: dict) -> str:
+    """What a finished browser action did, from the line browser_proxy puts in its result."""
+    result = item.get("result")
+    if isinstance(result, dict):
+        for c in result.get("content") or []:
+            if isinstance(c, dict) and (m := EFFECT.match(str(c.get("text", "")))):
+                return m[1]
     return ""
 
 
@@ -375,6 +386,7 @@ class CodexServer:
         job_id: int | None = None,
         workdir: Path | None = None,
         timeout: float = 0,
+        on_effect: Callable[[str, str], None] | None = None,
     ) -> AgentResult:
         """One turn, like agent.run_codex. Turns on different threads run at the same time.
         on_note gets the agent's progress lines ("checking X") as they come; on_step(item id,
@@ -393,7 +405,7 @@ class CodexServer:
                 raise
         try:
             return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note,
-                                    on_step, key, timeout)
+                                    on_step, key, timeout, on_effect)
         except CodexServerError:
             async with self._lock:
                 await self._recover(tid)
@@ -443,7 +455,7 @@ class CodexServer:
     async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str,
                     on_note: Callable[[str], None] | None = None,
                     on_step: Callable[[str, str], None] | None = None, key: str = "",
-                    timeout: float = 0) -> AgentResult:
+                    timeout: float = 0, on_effect: Callable[[str, str], None] | None = None) -> AgentResult:
         limit = timeout or self.cfg.codex_timeout_seconds
         q: asyncio.Queue = asyncio.Queue()
         self._turns[tid] = q
@@ -489,6 +501,8 @@ class CodexServer:
                     if on_step:
                         failed = item_error(item)
                         on_step(str(item.get("id")), "", failed) if failed else on_step(str(item.get("id")), "")
+                    if on_effect and (effect := item_effect(item)):
+                        on_effect(str(item.get("id")), effect)
                     if item.get("type") == "mcpToolCall":
                         servers.add(item.get("server") or "")
                         if item.get("server") == "friday":

@@ -11,6 +11,13 @@ better than the agent would on its own.
   verdict within a few seconds: playing, or why not (stuck loading, unsupported format, blocked).
 - browser_evaluate (page JavaScript) runs only after the owner approves the exact script on
   Telegram, since a script could read what fill_login typed. The other blocked tools stay hidden.
+- Every action's result says what it did: [effect: changed | unchanged | unknown], from the URL,
+  tabs, dialogs, visible text, controls and media, ignoring a move of keyboard focus. Where the page
+  can't tell (a canvas, a frame it can't read) the screen is compared, and an animated one is
+  unknown. Only hashes are compared; what's typed is never kept.
+- A control can be on screen and not in the page's structure (a canvas, an image button). When a
+  lookup finds nothing, or the page has such regions, the result carries a screenshot and says to
+  click by position. Where to click stays the agent's choice.
 
 Every forwarded call gets CALL_TIMEOUT seconds: past that the agent hears so and moves on.
 
@@ -25,6 +32,7 @@ out and screenshots take seconds, and can keep a video from loading at all.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import os
@@ -47,6 +55,23 @@ APPROVAL_TIMEOUT = 300
 TAB_TIMEOUT = 20.0  # finding or opening the task's tab
 LEASE_TOUCH = 60  # seconds between notes that the task still uses its tabs
 CLICKS = {"browser_click", "browser_hover"}
+# Tools that act on the page: their results say whether anything changed.
+ACTIONS = {f"browser_{t}" for t in (
+    "click", "hover", "check", "uncheck", "drag", "drop", "type", "press_key", "press_sequentially", "keydown", "keyup",
+    "fill_form", "select_option", "file_upload", "navigate", "navigate_back", "navigate_forward",
+    "reload", "mouse_click_xy", "mouse_move_xy", "mouse_down", "mouse_up", "mouse_drag_xy", "mouse_wheel")}
+LOOKUPS = {"browser_find", "browser_snapshot"}
+STATE_SECONDS = 2.5  # reading the page's state around an action; longer means "unknown"
+MAX_FRAMES = 12
+SCREEN_SETTLE = 0.35  # a screen that still differs after this is animating
+EFFECT_LINES = {
+    "changed": "[effect: changed]",
+    "unchanged": "[effect: unchanged] The page is the same after this action. Find out why before repeating it.",
+    "unknown": "[effect: unknown] Friday can't tell whether this changed anything: look at the page.",
+    "focus": "[effect: unchanged] Only the keyboard focus moved.",
+}
+SEE_IT = ("Friday: {why} If what you need is visible in this screenshot, click it with browser_mouse_click_xy at its "
+          "position, then check the result.")
 # A click may open a popup, which Chrome puts in front: the agent's tab goes back there.
 FRONT_AFTER = {"browser_navigate", "browser_navigate_back", "browser_tabs", "browser_click"}
 PROTOCOL = "2025-06-18"
@@ -93,6 +118,30 @@ PROBE = """(e) => {
           framed: window !== window.top};
 }"""
 SCROLL = "(e) => { e.scrollIntoView({block: 'center', inline: 'center'}); return true; }"
+# What an action can change in a frame, as hashes computed in the page, so that what's typed in a
+# field never leaves it. A password field counts by length only. opaque: regions the page's text
+# and structure can't describe.
+PAGE_STATE = """() => {
+  const h = (s) => { let x = 0x811c9dc5; for (let i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); } return x >>> 0; };
+  const a = (e, n) => e.getAttribute(n) || '';
+  const value = (e) => e.value == null ? '' : e.type === 'password' ? 'len' + String(e.value).length : h(String(e.value));
+  const controls = [...document.querySelectorAll('input,select,textarea,button,details,dialog,[role],[aria-expanded],[contenteditable]')]
+    .slice(0, 4000).map((e) => [e.tagName, e.type || '', e.disabled ? 1 : 0, e.checked ? 1 : 0, e.open ? 1 : 0, e.selectedIndex ?? '',
+      value(e), a(e, 'aria-expanded'), a(e, 'aria-checked'), a(e, 'aria-selected'), a(e, 'aria-pressed'), e.hidden ? 1 : 0].join(':')).join('|');
+  const media = [...document.querySelectorAll('video,audio')].map((m) => [m.currentSrc, m.paused, m.ended].join(':')).join('|');
+  const scrolled = [...document.querySelectorAll('div,section,main,ul,ol,table,tbody,aside,nav,article')].slice(0, 5000)
+    .filter((e) => e.scrollTop || e.scrollLeft).map((e) => e.scrollTop + ',' + e.scrollLeft).join('|');
+  const area = innerWidth * innerHeight, shown = (e, part) => {
+    const r = e.getBoundingClientRect();
+    return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && r.width * r.height >= area * part;
+  };
+  const bare = (e) => { const c = e.closest('a,button,[role=button],[onclick]');
+    return !!c && !a(e, 'alt') && !a(c, 'aria-label') && !(c.innerText || '').trim(); };
+  const opaque = [...document.querySelectorAll('canvas,iframe,embed,object')].some((e) => shown(e, 0.1))
+    || [...document.querySelectorAll('img,input[type=image]')].slice(0, 500).some((e) => shown(e, 0.1) || (bare(e) && shown(e, 0.001)));
+  return {page: h([location.href, document.body ? document.body.innerText : '', controls, media].join('|')),
+          scroll: scrollX + ',' + scrollY + ';' + scrolled, opaque};
+}"""
 
 MEDIA_STATE = """() => [...document.querySelectorAll('video, audio')].map((m, i) => {
   const r = m.getBoundingClientRect();
@@ -138,6 +187,32 @@ def click_plan(probe: dict | None, error: str) -> tuple[str, str]:
     if probe.get("covered") or "intercepts pointer events" in error:
         return "escape", f"something covers it ({probe.get('by') or 'an overlay'})"
     return "xy", "the element keeps moving or changing (an animation, a loading player)"
+
+
+def action_effect(before: dict | None, after: dict | None, again: str | None = None, focus_only: bool = False) -> str:
+    """changed | unchanged | unknown | focus (EFFECT_LINES), from the page's state around an action.
+    again: the screen a moment after `after`, when the screen had to decide. focus_only: the key
+    only moves focus, so what that scrolls into view doesn't count."""
+    if not before or not after:
+        return "unknown"
+    if before["url"] != after["url"] or before["tabs"] != after["tabs"] or before["dom"] != after["dom"]:
+        return "changed"
+    if focus_only:
+        return "focus"
+    if before["scroll"] != after["scroll"]:
+        return "changed"
+    if not before["opaque"] and not before["blind"] and not after["blind"]:
+        return "unchanged"
+    if not before.get("shot") or not after.get("shot"):
+        return "unknown"
+    if before["shot"] == after["shot"]:
+        return "unchanged"
+    return "changed" if again == after["shot"] else "unknown"  # still moving: an animation or a video
+
+
+def with_line(result: dict, line: str) -> dict:
+    """The result with a line of Friday's first."""
+    return {**result, "content": [{"type": "text", "text": line}, *(result.get("content") or [])]}
 
 
 def media_verdict(before: dict, after: dict, play_said: str) -> tuple[bool, str]:
@@ -284,6 +359,8 @@ class Relay:
         self.known: set[str] = set()  # tabs seen so far: any other is new
         self.touched = 0.0
         self._store = None
+        self.seen_pages: set[str] = set()  # pages whose screenshot a lookup already carried
+        self.shown_state: tuple | None = None
 
     @property
     def store(self):
@@ -331,6 +408,15 @@ class Relay:
             return await self.media(str(args.get("action") or "status"), args.get("seconds"))
         if name == "browser_evaluate":
             return await self.evaluate(args)
+        if name in ACTIONS:
+            before = await self.page_state()
+            result = await self.forward(msg, name, args)
+            return await self.with_effect(name, args, result, before)
+        result = await self.forward(msg, name, args)
+        return await self.with_view(name, result) if name in LOOKUPS else result
+
+    async def forward(self, msg: dict, name: str, args: dict) -> dict:
+        params = msg.get("params") or {}
         timeout = 120.0 if name == "browser_wait_for" else CALL_TIMEOUT
         fwd = {**msg, "params": {**params, "arguments": args}}
         try:
@@ -362,6 +448,78 @@ class Relay:
                 return page
         except Exception:
             return None
+
+    # --- what an action did, and what the text can't show -------------------------------------
+
+    async def page_state(self, shot: bool | None = None) -> dict | None:
+        """The current tab's state (hashes), or None when it can't be read in time. shot: with a hash
+        of the screen; by default when the page has regions its structure can't describe."""
+        page = self.tab if self.tab is not None and not self.tab.is_closed() else None
+        if page is None:
+            return None
+        try:
+            async with asyncio.timeout(STATE_SECONDS):
+                frames, blind = [], len(page.frames) > MAX_FRAMES
+                for frame in page.frames[:MAX_FRAMES]:
+                    try:
+                        frames.append(await frame.evaluate(PAGE_STATE))
+                    except TimeoutError:
+                        raise
+                    except Exception:  # a frame going away, or one that can't be read
+                        blind = True
+                if not frames:
+                    return None
+                state = {"url": page.url, "tabs": sorted(await self.chrome.targets()), "blind": blind,
+                         "dom": tuple(x["page"] for x in frames), "scroll": tuple(x["scroll"] for x in frames),
+                         "opaque": any(x["opaque"] for x in frames), "shot": None}
+                if state["opaque"] or blind if shot is None else shot:
+                    state["shot"] = await self.screen_hash(page)
+                return state
+        except Exception:  # includes a dialog holding the page
+            return None
+
+    async def screen_hash(self, page) -> str:
+        return hashlib.sha256((await self.chrome.shot(page))["data"].encode()).hexdigest()
+
+    async def with_effect(self, name: str, args: dict, result: dict, before: dict | None) -> dict:
+        text = _text(result)
+        if "### Modal state" in text or "Downloading file" in text or "Downloaded file" in text:
+            return with_line(result, EFFECT_LINES["changed"])  # a dialog holds the page: it can't be read
+        after = await self.page_state(bool(before and before["shot"]))
+        again = None
+        if before and after and before["shot"] and after["shot"] and before["shot"] != after["shot"]:
+            await asyncio.sleep(SCREEN_SETTLE)
+            page = self.tab if self.tab is not None and not self.tab.is_closed() else None
+            with suppress(Exception):
+                async with asyncio.timeout(STATE_SECONDS):
+                    again = await self.screen_hash(page) if page is not None else None
+        focus = name == "browser_press_key" and str(args.get("key") or "").lower() in ("tab", "shift+tab")
+        return with_line(result, EFFECT_LINES[action_effect(before, after, again, focus)])
+
+    async def with_view(self, name: str, result: dict) -> dict:
+        """A lookup that found nothing, or a page with regions its text can't describe, comes with
+        the screen, once for each state of the page (and for those regions, once for each URL)."""
+        if result.get("isError"):
+            return result
+        empty = name == "browser_find" and "No matches found" in _text(result)
+        state = await self.page_state(False)
+        regions = bool(state and state["opaque"])
+        if not empty and not (regions and state["url"] not in self.seen_pages):
+            return result
+        key = (state["url"], state["dom"]) if state else None
+        why = ("It isn't in the page's text or controls." if empty else
+               "This page has regions its text can't describe (a canvas, images or frames).")
+        if key is not None and key == self.shown_state:  # the agent has this screen already
+            return {**result, "content": [*(result.get("content") or []), {"type": "text", "text": SEE_IT.format(
+                why=why).replace("this screenshot", "the last screenshot")}]}
+        images = await self.screenshot()
+        if not images:
+            return result
+        self.shown_state = key
+        if state:
+            self.seen_pages.add(state["url"])
+        return {**result, "content": [*(result.get("content") or []),
+                                      {"type": "text", "text": SEE_IT.format(why=why)}, *images]}
 
     # --- the task's own tab -----------------------------------------------------------------
 
@@ -496,6 +654,29 @@ class Relay:
         except ValueError:
             return None
 
+    async def frame_offset(self, page, args: dict) -> tuple[float, float] | None:
+        """Where the frame holding this element starts on the page. The session marks the element's
+        frame and Friday's connection looks for the mark, since refs only mean something there."""
+        mark = uuid.uuid4().hex
+        r = await self.up.call("browser_evaluate", {"function": f"(e) => {{ window.__fridayFrame = '{mark}'; return true; }}",
+                                                    "element": args.get("element", ""), "target": args["target"]},
+                               self.passthrough, timeout=8)
+        if r.get("isError") or page is None:
+            return None
+        for frame in page.frames:
+            try:
+                if not await frame.evaluate("m => { const me = window.__fridayFrame === m; "
+                                            "if (me) delete window.__fridayFrame; return me; }", mark):
+                    continue
+                element = await frame.frame_element()
+                box = await element.bounding_box()
+                inset = await element.evaluate("e => { const s = getComputedStyle(e); return "
+                                               "[e.clientLeft + parseFloat(s.paddingLeft), e.clientTop + parseFloat(s.paddingTop)]; }")
+                return (box["x"] + inset[0], box["y"] + inset[1]) if box else None
+            except Exception:
+                continue
+        return None
+
     async def fix_click(self, name: str, args: dict, failed: dict) -> dict:
         error = _text(failed)
         page = await self.front()
@@ -516,7 +697,11 @@ class Relay:
             probe = await self.probe(args)
             remedy, done = ("xy", "pressed Escape, ") if probe and not probe.get("covered") else ("none", "pressed Escape (still covered), ")
         if remedy == "xy" and probe and probe.get("framed"):
-            remedy, why = "none", why + "; it is inside a frame, so its position on the page is unknown"
+            offset = await self.frame_offset(page, args)
+            if offset:
+                probe = {**probe, "x": probe["x"] + offset[0], "y": probe["y"] + offset[1]}
+            else:
+                remedy, why = "none", why + "; it is inside a frame whose position on the page couldn't be found"
         if remedy != "xy" or not probe:
             note = f"Friday: the {name.removeprefix('browser_')} failed: {why}. {done}Nothing else was tried."
             return _result(f"{error.strip()[:600]}\n\n{note} The screenshot shows the page now.", True,

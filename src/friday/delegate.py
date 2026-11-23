@@ -86,7 +86,8 @@ Ledger:
 What the worker said lately:
 {notes}
 
-Its latest steps (oldest first):
+Its latest steps (oldest first). [changed] means the page visibly changed after that action,
+[unchanged] that it didn't, and [unknown] tells you nothing:
 {steps}
 """
 
@@ -219,6 +220,13 @@ class WorkerPace:
 
     def on_note(self, text: str) -> None:
         self.notes.append(" ".join(text.split())[:300])
+
+    def on_effect(self, label: str, effect: str) -> None:
+        """What the browser saw that step do, for the review."""
+        for i in range(len(self.steps) - 1, -1, -1):
+            if self.steps[i] == label:
+                self.steps[i] = f"{label} [{effect}]"
+                return
 
     def on_step(self, label: str) -> None:
         if self.ended or not label:

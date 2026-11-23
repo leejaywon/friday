@@ -2126,10 +2126,17 @@ class Friday(WatchBot):
         pace = dg.WorkerPace(self.store, jid, job["task"], nudge, stop, spawn,
                              self._light if self.cfg.progress_model.lower() != "off" else None)
 
+        running: dict[str, str] = {}
+
         def step(item_id: str, label: str, failed: str = "") -> None:
             if label:
+                running[item_id] = label
                 on_step(label)
                 pace.on_step(label)
+
+        def effect(item_id: str, what: str) -> None:
+            if label := running.pop(item_id, ""):
+                pace.on_effect(label, what)
 
         async def turn(text: str, thread: str | None, toolsets: set[str]) -> AgentResult:
             kw = dict(model=(self.store.get("model") or "") if same_engine else "",
@@ -2138,7 +2145,7 @@ class Friday(WatchBot):
             if job["engine"] == "codex" and same_engine and self.codex:
                 try:
                     return await self.codex.run(text, thread, [], on_note=pace.on_note, on_step=step, key=key,
-                                                timeout=limit, **kw)
+                                                timeout=limit, on_effect=effect, **kw)
                 except CodexServerError as e:
                     log.warning("codex app-server failed on job %s, retrying with codex exec: %s", jid, e)
                     if e.partial:

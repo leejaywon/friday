@@ -55,3 +55,19 @@ def test_cleanup_keeps_what_is_still_in_use():
     close, over = care.plan_cleanup(held, live, {"video"}, {"chat:2"}, idle, now)
     assert close == {"idle", "popup", "finished", "restored"}
     assert over == [care.LEASE + "chat:3"]  # the run's lease stays until its video has stopped
+
+
+def test_an_action_reports_what_it_did():
+    from friday.browser_proxy import action_effect as effect
+
+    page = {"url": "u", "tabs": ["a"], "dom": (1,), "scroll": ("0,0;",), "opaque": False, "blind": False, "shot": None}
+    assert effect(page, dict(page)) == "unchanged"
+    assert effect(page, {**page, "dom": (2,)}) == "changed" and effect(page, {**page, "tabs": ["a", "b"]}) == "changed"
+    assert effect(page, {**page, "scroll": ("0,900;",)}) == "changed"  # PageDown through a long list
+    assert effect(page, {**page, "scroll": ("0,900;",)}, focus_only=True) == "focus"  # Tab scrolled to the focus
+    assert effect(None, page) == "unknown"
+
+    canvas = {**page, "opaque": True, "shot": "s1"}
+    assert effect(canvas, dict(canvas)) == "unchanged"
+    assert effect(canvas, {**canvas, "shot": "s2"}, again="s2") == "changed"  # it changed and settled
+    assert effect(canvas, {**canvas, "shot": "s2"}, again="s3") == "unknown"  # still animating
