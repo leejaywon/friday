@@ -2791,9 +2791,6 @@ class Friday(WatchBot):
         key = tu.to_utc_iso(at)
         if self.store.get("heartbeat_last") == key or now - at > HEARTBEAT_STALE:
             return 30
-        if self.store.get("heartbeat_last") is None and not first:
-            self.store.set("heartbeat_last", key)  # just turned on: start with the next one
-            return 30
         if not self._free_lane():
             return 30
         self.store.set("heartbeat_last", key)
