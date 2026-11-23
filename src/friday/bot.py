@@ -1839,7 +1839,8 @@ class Friday(WatchBot):
             self.store.link_job_message(sent.message_id, jid)
             self.store.set(f"job_queued_msg:{jid}", str(sent.message_id))
         else:
-            await msg.reply_text(f"Job #{jid} is {status}. For a new job: /code {job['repo']} <task>")
+            await msg.reply_text(f"Job #{jid} is {status}. For a new one, just ask me."
+                                 if job["kind"] == "work" else f"Job #{jid} is {status}. For a new job: /code {job['repo']} <task>")
 
     async def on_job_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -1974,13 +1975,18 @@ class Friday(WatchBot):
             tries = int(self.store.get(f"job_resumes:{jid}") or 0)
             if tries >= MAX_RESUMES:
                 self.store.update_job(jid, status="failed", error="Friday restarted while this job was running.")
-                await self._job_send(jid, f"⚠️ Friday restarted, so job #{jid} ({job['repo']}) stopped.\n"
+                await self._job_send(jid, f"⚠️ Friday restarted, so job #{jid} ({self._job_label(job)}) stopped.\n"
                                           "To try again, reply to this message with instructions.")
                 continue
             self.store.set(f"job_resumes:{jid}", str(tries + 1))
             self.store.update_job(jid, status="queued", followup=RESUME_NOTE if job["session_id"] else None)
-            await self._job_send(jid, f"🔁 Friday restarted while job #{jid} ({job['repo']}) was running; "
+            await self._job_send(jid, f"🔁 Friday restarted while job #{jid} ({self._job_label(job)}) was running; "
                                       "it starts again where it was.")
+
+    @staticmethod
+    def _job_label(job) -> str:
+        """What a job is, in a message: its repo, or what it's doing when it has none."""
+        return short(job["task"], 40) if job["kind"] == "work" else job["repo"]
 
     async def _job_send(self, jid: int, text: str, markup: InlineKeyboardMarkup | None = None) -> int | None:
         """Message the owner about a job and remember the message ids, so a reply to any of them
