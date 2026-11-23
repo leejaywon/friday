@@ -405,6 +405,11 @@ def test_a_delegated_job_only_reaches_its_tools_and_its_report_goes_to_the_main_
     first = store.job_items(1)[0]["id"]
     assert "1/2 done" in tools.ledger("update", item_id=first, status="done", evidence="진도 100%", ctx=ctx)
 
+    # A worker says how the job ended; a job that doesn't say isn't recorded as a success.
+    assert "reason" in tools.finish_job("blocked", ctx=ctx) and dg.take_outcome(store, 1) == ("unconfirmed", "")
+    tools.finish_job("blocked", "사람 확인이 필요함", ctx=ctx)
+    assert dg.take_outcome(store, 1) == ("blocked", "사람 확인이 필요함")
+
     # A later job sees an earlier one only when it's named, and as data.
     store.update_job(1, status="done", result="9주 1강 완료")
     tools.delegate("10주 2강 이어서", related="#1")

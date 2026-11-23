@@ -459,9 +459,10 @@ async def run_agent(cfg: Config, engine: str, workdir: Path, prompt: str, rules:
 
 @dataclass
 class Outcome:
-    status: str              # review | done | failed
+    status: str              # review | done | failed; a work job also partial | blocked | unconfirmed
     message: str
     undo: bool = False      # a local project has job commits the Undo button can revert
+    reason: str = ""        # a work job that didn't fully succeed: why, in the worker's words
 
 
 @dataclass

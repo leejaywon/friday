@@ -652,7 +652,7 @@ def delegate(goal: str, why: str = "", context: str = "", project: str = "", rel
         if job["status"] in ("queued", "running"):
             store.queue("job_steer", text=goal, path=str(continue_job))
             return f"Passed to job #{continue_job}, which is still {job['status']}."
-        if job["status"] not in ("review", "done", "failed", "cancelled"):
+        if job["status"] not in ("review", *dg.ENDED, "cancelled"):
             return f"Job #{continue_job} is {job['status']} and can't be continued: start a new one."
         store.update_job(continue_job, followup=goal, status="queued", **({"browser": 1} if browser else {}),
                          **({"asked": asked} if asked else {}))
@@ -700,18 +700,42 @@ def ledger(action: str = "read", title: str = "", item_id: int = 0, status: str 
 
 
 @server.tool()
+def finish_job(outcome: str, reason: str = "", ctx: Context | None = None) -> str:
+    """Say how your job ended, right before your final report.
+
+    outcome: done (the goal is met and you saw it at the source), partial (only some of it is),
+        blocked (it needs the owner or something outside your control), failed (you tried and it
+        didn't work).
+    reason: unless done, one short sentence on what's missing or what stopped you.
+    """
+    jid = _job_id(ctx)
+    if not jid:
+        return "finish_job belongs to a delegated job."
+    outcome, reason = outcome.strip().lower(), " ".join(reason.split())
+    if outcome not in dg.OUTCOMES:
+        return f"outcome must be one of {', '.join(dg.OUTCOMES)}."
+    if outcome != "done" and not reason:
+        return f"Give a reason for '{outcome}'."
+    if looks_secret(reason):
+        return REFUSAL
+    store.set(dg.outcome_key(jid), outcome + ("" if outcome == "done" else "\n" + short(reason, 300)))
+    return "Recorded. Now write your final report."
+
+
+@server.tool()
 def list_coding_jobs() -> str:
     """The 10 most recent coding jobs: id, status, repo, engine, task and pull request link.
 
     Statuses: queued, running, review (pull request open), done (finished; local projects are
-    committed in place), merged, closed, undone, failed, cancelled.
+    committed in place), partial, blocked, unconfirmed (a worker didn't say how it ended), merged,
+    closed, undone, failed, cancelled.
     """
     lines = []
     for j in store.recent_jobs():
         line = f"#{j['id']} [{j['status']}] {j['repo']} ({j['engine']}): {short(j['task'])}"
         if j["pr_url"]:
             line += f" {j['pr_url']}"
-        if j["status"] == "failed" and j["error"]:
+        if j["status"] in ("failed", "partial", "blocked") and j["error"]:
             line += f" - {short(j['error'], 120)}"
         lines.append(line)
     return "\n".join(lines) or "No coding jobs yet."
@@ -1181,7 +1205,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
         url = None if job and job["kind"] == "project" else await browser.screenshot(shot)
     except Exception:
         url = None
-    text = (f"✋ Job #{job['id']}: " if job else "✋ ") + summary + (f"\n{url}" if url else "")
+    text = "✋ " + summary + (f"\n{url}" if url else "")
     if _in_chat(ctx):
         aid = store.add_approval("action", text)
         _follow_up("approval", aid, "request_approval", ctx)

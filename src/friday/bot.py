@@ -1839,7 +1839,7 @@ class Friday(WatchBot):
             await msg.reply_text(f"↪️ Passed to «{name}».")
         elif status in ("queued", "running"):
             await msg.reply_text(f"«{name}» is still {status}. Reply again when it's done, or stop it (/jobs has its number).")
-        elif status in ("review", "done", "failed"):
+        elif status in ("review", *dg.ENDED):
             self.store.update_job(jid, followup=msg.text, status="queued")
             sent = await msg.reply_text(f"↩️ «{name}»: follow-up queued")
             self.store.link_job_message(sent.message_id, jid)
@@ -2057,11 +2057,13 @@ class Friday(WatchBot):
         self._job_execs[jid] = asyncio.create_task(
             self._run_worker(job, steps.append) if work else self.runner.execute(job, on_step=steps.append))
         status = asyncio.create_task(self._job_status(mid, started, stop, steps, t0))
+        outcome, ended = None, ""
         try:
             outcome = await self._job_execs[jid]
         except asyncio.CancelledError:
             if asyncio.current_task().cancelling():  # Friday is stopping, not /stop: next start reports it
                 raise
+            ended = "⏹ Stopped" if work else ""
             await self._stopped_job(jid, head)
             return
         except JobError as e:
@@ -2074,8 +2076,9 @@ class Friday(WatchBot):
             status.cancel()
             if mid:  # the final word comes as a new message; this one keeps how long it took
                 took = max(1, round((clock.monotonic() - t0) / 60))
+                last = ended or (dg.CARD.get(outcome.status, started) if work and outcome else started)
                 await self._quiet(self.app.bot.edit_message_text(  # type: ignore[union-attr]
-                    f"{started}\n\n⏱ {took} min", chat_id=self.owner, message_id=mid))
+                    f"{last}\n\n⏱ {took} min", chat_id=self.owner, message_id=mid))
 
         self.store.delete(dg.risky_key(jid))
         if work:
@@ -2117,6 +2120,7 @@ class Friday(WatchBot):
         workdir = dg.work_dir(self.cfg, jid)
         prompt = dg.worker_prompt(self.store, self.cfg, job, dg.now_str(self.tz))
         self.store.update_job(jid, workdir=str(workdir), followup=None)
+        self.store.delete(dg.outcome_key(jid))  # a follow-up says again how it ended
         same_engine = job["engine"] == self.cfg.chat_engine
         limit = self.cfg.code_job_timeout_seconds
 
@@ -2197,11 +2201,12 @@ class Friday(WatchBot):
                 self.browser_lock.release()
             self.store.delete(mcp_http.toolsets_key(key))
         text = result.text.strip()
+        declared, reason = dg.take_outcome(self.store, jid)
         if pace.ended:
             return Outcome("failed", text or "It kept going in circles and gave no report.")
         if not text.strip(" .-") or (result.errors and not text):
             raise JobError("; ".join(result.errors) or "the worker gave no report")
-        return Outcome("done", text)
+        return Outcome(declared, text, reason=reason)
 
     async def _worker_done(self, jid: int, outcome: Outcome) -> None:
         """A worker's report goes to the main agent, which tells the owner."""
@@ -2210,7 +2215,7 @@ class Friday(WatchBot):
             failed = outcome.status == "failed"
             report = dg.keep_report(Path(job["workdir"]) if job["workdir"] else self.cfg.workspace, outcome.message)
             self.store.update_job(jid, status=outcome.status, result=outcome.message,
-                                  error=short(outcome.message, 500) if failed else None)
+                                  error=outcome.reason or (short(outcome.message, 500) if failed else None))
             self.store.log_message("worker", f"Job #{jid}: {short(job['task'], 200)}\n{report}")
             note = dg.finished_note(self.store, job, outcome.status, report)
             task = asyncio.create_task(self._turn(self.owner, note, lane=self.lanes["1"], source="note"))

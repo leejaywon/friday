@@ -332,7 +332,7 @@ def codex_overrides(
         o["mcp_servers.friday.command"] = sys.executable
         o["mcp_servers.friday.args"] = ["-m", "friday.mcp_server"]
         o["mcp_servers.friday.env"] = env
-    hidden = ([] if browser_on else FRIDAY_BROWSER_TOOLS) + (["use_tools", "delegate"] if run_id else []) + ["ledger"]
+    hidden = ([] if browser_on else FRIDAY_BROWSER_TOOLS) + (["use_tools", "delegate"] if run_id else []) + ["ledger", "finish_job"]
     if watch_id:
         hidden = list(dict.fromkeys(hidden + WATCH_HIDDEN_TOOLS))
     if job_id:
