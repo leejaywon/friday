@@ -610,16 +610,18 @@ def delete_contact(contact_id: int) -> str:
 
 @server.tool()
 def delegate(goal: str, why: str = "", context: str = "", project: str = "", related: str = "",
-             continue_job: int = 0, engine: str = "", browser: bool = False) -> str:
+             continue_job: int = 0, engine: str = "", browser: bool = False,
+             ctx: Context | None = None) -> str:
     """Hand heavy work to a worker agent that runs in the background and reports back to you.
 
     Delegate what needs the browser or a login, playing or recording something, downloading or
     working on files, comparing many sources, or changing code. Answer yourself what a quick look
     settles: a fact, a rate, the weather, one or two web searches.
 
-    goal: the outcome the owner wants, complete: the worker can't see this chat.
+    goal: the outcome the owner wants. The worker gets their message with this but not the rest of
+        this chat, so spell out what it refers to.
     why: what it's for, so the worker can judge what matters and what to keep.
-    context: what you know that it needs (names, sites, dates, preferences). No secrets.
+    context: what you've seen or been told that it needs (names, sites, dates, preferences). No secrets.
     project: a code project: a folder name in ~/code or 'owner/name' on GitHub (list_projects). Only
         when the user's own message asks for a code change; a new name creates a new local project.
         GitHub repos get a pull request; local projects are committed in place with an Undo button.
@@ -641,6 +643,8 @@ def delegate(goal: str, why: str = "", context: str = "", project: str = "", rel
     engine = engine.strip().lower()
     if engine and engine not in ("claude", "codex"):
         return f"Not delegated: engine must be 'claude' or 'codex', not '{engine}'."
+    asked = (store.get(dg.asked_key(_lane(ctx))) or "") if _in_chat(ctx) else ""
+    asked = "" if looks_secret(asked) else asked[:1500]
     if continue_job:
         job = store.job(continue_job)
         if not job:
@@ -650,13 +654,14 @@ def delegate(goal: str, why: str = "", context: str = "", project: str = "", rel
             return f"Passed to job #{continue_job}, which is still {job['status']}."
         if job["status"] not in ("review", "done", "failed", "cancelled"):
             return f"Job #{continue_job} is {job['status']} and can't be continued: start a new one."
-        store.update_job(continue_job, followup=goal, status="queued", **({"browser": 1} if browser else {}))
+        store.update_job(continue_job, followup=goal, status="queued", **({"browser": 1} if browser else {}),
+                         **({"asked": asked} if asked else {}))
         return f"Job #{continue_job} goes on with this. Tell the owner in one short line and end your turn."
     project = project.strip()
     if project and not REPO_ARG.match(project):
         return f"Not delegated: '{project}' isn't a project name. Use a folder name in ~/code or owner/name."
     engine = engine or (cfg.code_engine if project else cfg.chat_engine)
-    jid = store.add_delegated_job(goal, engine, project, why, context, dg.parse_refs(related), browser)
+    jid = store.add_delegated_job(goal, engine, project, why, context, dg.parse_refs(related), browser, asked)
     return (f"Delegated as job #{jid} ({engine}). Tell the owner in one short line what you handed off (not its "
             "number) and end your turn; you're continued with the result.")
 

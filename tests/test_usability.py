@@ -412,6 +412,14 @@ def test_a_delegated_job_only_reaches_its_tools_and_its_report_goes_to_the_main_
     tools.delegate("다른 일")
     assert "9주 1강 완료" not in dg.worker_prompt(store, cfg, store.job(3), "now")
 
+    # The worker gets the owner's words apart from the main agent's reading of them, only from their turn.
+    store.set(dg.asked_key("1"), "수강 현황 봐줘")
+    tools.delegate("수강 현황 확인", ctx=SimpleNamespace(headers={tools.mcp_http.CHAT_HEADER: "1"}))
+    prompt = dg.worker_prompt(store, cfg, store.job(4), "now")
+    assert prompt.index("The owner's message:\n수강 현황 봐줘") < prompt.index("Main agent's brief:")
+    tools.delegate("다른 클라이언트의 일")
+    assert not store.job(5)["asked"]
+
     bot = Friday(replace(cfg, allowed_user_ids=(1,)))
     bot.store.add_delegated_job("자료 정리", "codex")
     notes = []

@@ -972,6 +972,8 @@ class Friday(WatchBot):
             # A follow-up to a request in progress: into that turn, which answers both.
             if await self.codex.steer(lane.key, self._steer_text(text, files), images):
                 self.store.log_message("user", said(text, files))
+                asked = dg.asked_key(lane.key)
+                self.store.set(asked, f"{self.store.get(asked) or ''}\n{said(text, files)}".strip())
                 lane.topic += f" / {short(' '.join(text.split()) or '(files)', 200)}"
                 await self._quiet(self.say(f"↪️ Added to what I'm working on: «{short(lane.topic, 80)}»", chat_id))
                 return
@@ -1017,6 +1019,7 @@ class Friday(WatchBot):
         asked_at = tu.to_utc_iso(tu.now_utc())
         async with lane.lock:
             lane.topic, lane.stopping, stopped, has_browser = text, False, False, False
+            self.store.set(dg.asked_key(lane.key), said(text, files or []) if source == "user" else "")
             typing = asyncio.create_task(self._keep_typing(chat_id) if source != "wake" else asyncio.sleep(0))
             status = lane.status = self._status(chat_id, lane.key, text)
             used, calls = set(), []
@@ -1065,6 +1068,7 @@ class Friday(WatchBot):
                     prompt = f"[{' and '.join(sorted(new))} tools are now available; continue the user's request]"
             finally:
                 lane.task = None
+                self.store.delete(dg.asked_key(lane.key))
                 if has_browser:
                     self.browser_lock.release()
                 typing.cancel()
