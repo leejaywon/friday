@@ -233,9 +233,9 @@ class Lane:
     finished_at: float = 0.0
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 FILES_ONLY = (
-    "(The user sent only the files above, with no message. Look at them. If it's clear what they "
-    "want done, do it. Otherwise say in a sentence or two what you see and what you think matters, "
-    "and ask what they'd like you to do with them.)"
+    "(The user sent only the files above, with no message. If what they want is clear from the names "
+    "and the conversation, delegate it. Otherwise delegate reading them with the goal of saying what "
+    "they are and what matters, and then ask what they'd like done.)"
 )
 # Files answered on their own when at least one is an image (photo, screenshot).
 IMAGES_ONLY = (
