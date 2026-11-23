@@ -2178,11 +2178,11 @@ class Friday(WatchBot):
             if not self.doctor.fresh() and mcp_http.listening(browser.CDP_PORT):
                 await self.doctor.ensure("lock")  # a stuck Chrome is restarted before the worker starts on it
 
-        try:
-            if job["browser"] and self.cfg.browser_enabled:
-                await attach_browser()
+        async def work(text: str) -> AgentResult:
+            """A turn of the worker, with the browser attached if it asks for it."""
+            nonlocal thread
             for _ in range(MAX_CONTINUATIONS + 1):
-                result = await turn(prompt, thread, {"browser"} if has_browser else set())
+                result = await turn(text, thread, {"browser"} if has_browser else set())
                 thread = result.thread_id or thread
                 if thread:
                     self.store.update_job(jid, session_id=thread)
@@ -2191,7 +2191,21 @@ class Friday(WatchBot):
                 self._drop_browser_request(key)
                 self.store.update_job(jid, browser=1)  # a follow-up goes on with its page
                 await attach_browser()
-                prompt = "[The browser tools are now attached; go on with the job.]"
+                text = "[The browser tools are now attached; go on with the job.]"
+            return result
+
+        gate = dg.FinishGate(self.store, job, self._light if self.cfg.progress_model.lower() != "off" else None)
+        report = ""
+        try:
+            if job["browser"] and self.cfg.browser_enabled:
+                await attach_browser()
+            result = await work(prompt)
+            while not pace.ended and not result.errors:  # it stopped: is the job really over?
+                report = result.text.strip() if result.text.strip(" .-") else report
+                note = await gate.next(report)
+                if not note:
+                    break
+                result = await work(note)
             if pace.ended:
                 result = await turn("[Friday stopped this job: it kept going in circles. Without using any tools, "
                                     "report what you have, what's missing and what you tried.]", thread,
@@ -2200,13 +2214,14 @@ class Friday(WatchBot):
             if has_browser:
                 self.browser_lock.release()
             self.store.delete(mcp_http.toolsets_key(key))
-        text = result.text.strip()
-        declared, reason = dg.take_outcome(self.store, jid)
+        text = result.text.strip() if result.text.strip(" .-") else report
+        finish = gate.result()
+        files = tuple(finish.files)
         if pace.ended:
-            return Outcome("failed", text or "It kept going in circles and gave no report.")
+            return Outcome("failed", text or "It kept going in circles and gave no report.", caveats=finish.caveats, files=files)
         if not text.strip(" .-") or (result.errors and not text):
             raise JobError("; ".join(result.errors) or "the worker gave no report")
-        return Outcome(declared, text, reason=reason)
+        return Outcome(finish.status, text, reason=finish.reason, caveats=finish.caveats, files=files)
 
     async def _worker_done(self, jid: int, outcome: Outcome) -> None:
         """A worker's report goes to the main agent, which tells the owner."""
@@ -2214,11 +2229,21 @@ class Friday(WatchBot):
             job = self.store.job(jid)
             failed = outcome.status == "failed"
             report = dg.keep_report(Path(job["workdir"]) if job["workdir"] else self.cfg.workspace, outcome.message)
-            self.store.update_job(jid, status=outcome.status, result=outcome.message,
+            caveats = f"\n\nCaveats:\n{outcome.caveats}" if outcome.caveats else ""
+            self.store.update_job(jid, status=outcome.status, result=outcome.message + caveats,
                                   error=outcome.reason or (short(outcome.message, 500) if failed else None))
-            self.store.log_message("worker", f"Job #{jid}: {short(job['task'], 200)}\n{report}")
-            note = dg.finished_note(self.store, job, outcome.status, report)
-            task = asyncio.create_task(self._turn(self.owner, note, lane=self.lanes["1"], source="note"))
+            self.store.log_message("worker", f"Job #{jid}: {short(job['task'], 200)}\n{report}{caveats}")
+            note = dg.finished_note(self.store, job, outcome.status, report, outcome.reason, outcome.caveats, outcome.files)
+            reply = self._turn(self.owner, note, lane=self.lanes["1"], source="note")
+
+            async def tell() -> None:  # the reply first, then the files it talks about
+                try:
+                    await reply
+                finally:
+                    for path in outcome.files:
+                        self.store.queue("file", path=str(self.cfg.workspace / path))
+
+            task = asyncio.create_task(tell())
             self._bg.add(task)
             task.add_done_callback(self._bg.discard)
         except Exception:

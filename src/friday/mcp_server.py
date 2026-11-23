@@ -700,26 +700,38 @@ def ledger(action: str = "read", title: str = "", item_id: int = 0, status: str 
 
 
 @server.tool()
-def finish_job(outcome: str, reason: str = "", ctx: Context | None = None) -> str:
+def finish_job(outcome: str, reason: str = "", caveats: str = "", files: list[str] | None = None,
+               ctx: Context | None = None) -> str:
     """Say how your job ended, right before your final report.
 
-    outcome: done (the goal is met and you saw it at the source), partial (only some of it is),
-        blocked (it needs the owner or something outside your control), failed (you tried and it
-        didn't work).
+    outcome: done (everything asked for is met and you saw it at the source), partial (only some of
+        it is), blocked (it needs the owner or something outside your control), failed (you tried
+        and it didn't work).
     reason: unless done, one short sentence on what's missing or what stopped you.
+    caveats: what a reader could get wrong without it, one per line: something not available yet,
+        conditional or unconfirmed.
+    files: the files the owner should get (at most 10). Friday checks they exist, keeps them in the
+        files folder, sends them to the owner and returns their real paths.
     """
     jid = _job_id(ctx)
     if not jid:
         return "finish_job belongs to a delegated job."
-    outcome, reason = outcome.strip().lower(), " ".join(reason.split())
+    outcome, reason, caveats = outcome.strip().lower(), " ".join(reason.split()), caveats.strip()
     if outcome not in dg.OUTCOMES:
         return f"outcome must be one of {', '.join(dg.OUTCOMES)}."
     if outcome != "done" and not reason:
         return f"Give a reason for '{outcome}'."
-    if looks_secret(reason):
+    if looks_secret(f"{reason} {caveats}"):
         return REFUSAL
-    store.set(dg.outcome_key(jid), outcome + ("" if outcome == "done" else "\n" + short(reason, 300)))
-    return "Recorded. Now write your final report."
+    if len(files or []) > 10:
+        return "At most 10 files: put more in one archive or folder summary."
+    kept, missing = dg.keep_files(cfg, jid, files or [])
+    if missing:
+        return "Not recorded. These files don't exist: " + ", ".join(missing) + ". Fix the paths and call finish_job again."
+    before = dg.read_finish(store, jid).files
+    all_files = list(dict.fromkeys(before + kept))
+    dg.save_finish(store, jid, dg.Finish(outcome, "" if outcome == "done" else short(reason, 300), caveats[:1000], all_files))
+    return "Recorded. " + (f"Files kept at: {', '.join(all_files)}. " if all_files else "") + "Now write your final report."
 
 
 @server.tool()

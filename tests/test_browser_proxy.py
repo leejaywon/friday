@@ -19,6 +19,20 @@ class FakeUpstream:
         return {"content": [{"type": "text", "text": "clicked"}]}
 
 
+def test_a_huge_page_is_cut_with_the_full_text_saved():
+    page = "\n".join(f"- row {i}" for i in range(9000))
+    result = {"content": [{"type": "text", "text": "[effect: changed]"}, {"type": "text", "text": page},
+                          {"type": "image", "data": "x"}]}
+    saved = []
+    out = bp.bounded(result, lambda text: saved.append(text) or "/tmp/page.txt", limit=20_000)
+    text = out["content"][1]["text"]
+    assert sum(len(c.get("text", "")) for c in out["content"]) <= 20_000 and page in saved[0]
+    assert "- row 0\n" in text and "- row 8999" in text and "/tmp/page.txt" in text
+    assert out["content"][0]["text"] == "[effect: changed]" and out["content"][2]["type"] == "image"
+    small = {"content": [{"type": "text", "text": "short"}]}
+    assert bp.bounded(small, lambda text: 1 / 0) is small
+
+
 def test_a_click_on_a_moving_player_becomes_a_mouse_click_and_is_checked():
     relay = bp.Relay("http://127.0.0.1:1/mcp")
     moving = {"x": 640, "y": 360, "w": 1280, "h": 720, "vw": 1280, "vh": 900, "hidden": False,

@@ -390,6 +390,58 @@ def test_long_work_gets_notes_but_is_never_stopped_by_step_count():
     asyncio.run(go())
 
 
+def test_a_worker_cant_end_early_or_claim_more_than_it_checked(cfg, store):
+    from friday import delegate as dg
+
+    async def go():
+        jid = store.add_delegated_job("두 곳 확인", "codex", asked="두 곳 다 확인해줘")
+        store.add_job_item(jid, "A")
+        store.add_job_item(jid, "B")
+        a, b = (i["id"] for i in store.job_items(jid))
+
+        # Items open with nothing blocking: it goes on while the ledger moves, and no longer.
+        gate = dg.FinishGate(store, store.job(jid))
+        dg.save_finish(store, jid, dg.Finish("partial", "일부만 봄"))
+        assert "2 ledger item(s) are open" in await gate.next("보고")
+        store.update_job_item(jid, a, "done", "화면에서 확인")
+        dg.save_finish(store, jid, dg.Finish("partial", "일부만 봄"))
+        assert "1 ledger item(s) are open" in await gate.next("보고")
+        assert await gate.next("보고") == ""
+        assert gate.result().status == "partial"
+
+        # "done" against what was asked: a shortfall goes back once, then it's partial.
+        store.update_job_item(jid, b, "done", "화면에서 확인")
+        answers = ['{"verdict": "missing", "missing": "B의 제출 여부"}'] * 2
+        async def judge(prompt):
+            return answers.pop(0)
+        gate = dg.FinishGate(store, store.job(jid), judge)
+        dg.save_finish(store, jid, dg.Finish("done"))
+        assert "B의 제출 여부" in await gate.next("보고")
+        dg.save_finish(store, jid, dg.Finish("done"))
+        assert await gate.next("보고") == ""
+        ended = gate.result()
+        assert (ended.status, ended.reason) == ("partial", "B의 제출 여부")
+
+        # A check that fails blocks nothing.
+        async def broken(prompt):
+            return ""
+        gate = dg.FinishGate(store, store.job(jid), broken)
+        dg.save_finish(store, jid, dg.Finish("done"))
+        assert await gate.next("보고") == "" and gate.result().status == "done"
+
+        # A file named where it belongs but written in the temporary folder is kept, under its real path.
+        written = dg.work_dir(cfg, jid) / "files" / "topic" / "a.txt"
+        written.parent.mkdir(parents=True)
+        written.write_text("x")
+        assert dg.keep_files(cfg, jid, ["nope.txt"]) == ([], ["nope.txt"])
+        kept, _ = dg.keep_files(cfg, jid, [str(cfg.files_dir / "topic" / "a.txt")])
+        assert kept == ["files/topic/a.txt"] and (cfg.workspace / kept[0]).is_file() and not written.exists()
+        (dg.work_dir(cfg, jid) / "link.txt").symlink_to(cfg.db_path)
+        assert dg.keep_files(cfg, jid, ["link.txt"])[1] == ["link.txt"]
+
+    asyncio.run(go())
+
+
 def test_a_delegated_job_only_reaches_its_tools_and_its_report_goes_to_the_main_agent(cfg, tools, store):
     from friday import delegate as dg
     from friday.jobs import Outcome
@@ -406,9 +458,10 @@ def test_a_delegated_job_only_reaches_its_tools_and_its_report_goes_to_the_main_
     assert "1/2 done" in tools.ledger("update", item_id=first, status="done", evidence="진도 100%", ctx=ctx)
 
     # A worker says how the job ended; a job that doesn't say isn't recorded as a success.
-    assert "reason" in tools.finish_job("blocked", ctx=ctx) and dg.take_outcome(store, 1) == ("unconfirmed", "")
-    tools.finish_job("blocked", "사람 확인이 필요함", ctx=ctx)
-    assert dg.take_outcome(store, 1) == ("blocked", "사람 확인이 필요함")
+    assert "reason" in tools.finish_job("blocked", ctx=ctx) and dg.read_finish(store, 1).status == "unconfirmed"
+    tools.finish_job("blocked", "사람 확인이 필요함", "결제 전 단계까지만 봄", ctx=ctx)
+    ended = dg.FinishGate(store, store.job(1)).result()
+    assert (ended.status, ended.reason, ended.caveats) == ("blocked", "사람 확인이 필요함", "결제 전 단계까지만 봄")
 
     # A later job sees an earlier one only when it's named, and as data.
     store.update_job(1, status="done", result="9주 1강 완료")
@@ -484,14 +537,20 @@ def test_a_job_interrupted_during_an_approved_step_stops_and_asks(cfg):
 
 def test_a_job_that_needs_the_browser_has_it_from_its_first_turn(cfg, monkeypatch):
     from friday import bot as botmod
+    from friday import delegate as dg
 
     bot = Friday(replace(cfg, allowed_user_ids=(1,), codex_server=False, browser_enabled=True))
     turns = []
 
     async def turn(cfg, text, thread=None, images=(), **kw):
         turns.append(set(kw["toolsets"]))
+        dg.save_finish(bot.store, kw["job_id"], dg.Finish("done"))
         return botmod.AgentResult("report", "t1")
 
+    async def met(prompt, timeout=45):
+        return '{"verdict": "met", "missing": ""}'
+
+    bot._light = met
     monkeypatch.setattr(botmod, "run_turn", turn)
     monkeypatch.setattr(botmod.mcp_http, "listening", lambda port: False)
     needs, plain = (bot.store.add_delegated_job("일", "codex", browser=b) for b in (True, False))

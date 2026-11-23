@@ -49,6 +49,7 @@ import httpx
 from . import browser_care as care
 from .browser import BLOCKED_TOOLS, CDP_URL
 
+OUTPUT_LIMIT = 20_000  # characters of one tool result that reach the agent; the full text goes to a file
 CALL_TIMEOUT = 30.0  # a forwarded browser step that takes longer is reported as failed
 PLAY_VERDICT = 5.0  # seconds to decide whether playback really started
 APPROVAL_TIMEOUT = 300
@@ -215,6 +216,27 @@ def with_line(result: dict, line: str) -> dict:
     return {**result, "content": [{"type": "text", "text": line}, *(result.get("content") or [])]}
 
 
+def bounded(result: dict, save, limit: int = OUTPUT_LIMIT) -> dict:
+    """A result that fits the limit: the start and end of its longest text, cut at line breaks, and
+    where the whole of it was saved. save(text) -> the file's path, or "" if it couldn't be saved."""
+    content = result.get("content") or []
+    texts = [c for c in content if c.get("type") == "text"]
+    total = sum(len(c.get("text", "")) for c in texts)
+    if total <= limit:
+        return result
+    path = save("\n".join(c.get("text", "") for c in texts))
+    where = f"The full output is in {path}. " if path else ""
+    note = (f"\n… [Friday cut this output: {total} characters. {where}To see a part, use browser_find, "
+            "browser_snapshot with a target ref" + (", or read that file" if path else "") + ".]\n")
+    longest = max(texts, key=lambda c: len(c.get("text", "")))
+    room = max(limit - (total - len(longest["text"])) - len(note), 2000)
+    text = longest["text"]
+    head, tail = text[:room * 3 // 4], text[-(room // 4):]
+    head = head[:head.rfind("\n")] if "\n" in head else head
+    tail = tail[tail.find("\n") + 1:] if "\n" in tail else tail
+    return {**result, "content": [{**c, "text": head + note + tail} if c is longest else c for c in content]}
+
+
 def media_verdict(before: dict, after: dict, play_said: str) -> tuple[bool, str]:
     """Whether play worked, from the element's state before and PLAY_VERDICT seconds after."""
     if after.get("t", 0) - before.get("t", 0) > 0.5 and not after.get("paused"):
@@ -371,6 +393,21 @@ class Relay:
             self._store = Store(load_config().db_path)
         return self._store
 
+    def save_output(self, text: str) -> str:
+        """A long result in full: in the job's temporary folder, or with the browser's other files."""
+        try:
+            from .config import load_config
+
+            cfg = load_config()
+            job = re.fullmatch(r"job:(\d+)", self.owner)
+            folder = cfg.workspace / "jobs" / job[1] if job else cfg.files_dir / "browser"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"page-{uuid.uuid4().hex[:8]}.txt"
+            path.write_text(text, encoding="utf-8")
+            return str(path)
+        except OSError:
+            return ""
+
     async def write(self, msg: dict) -> None:
         async with self.out_lock:
             sys.stdout.write(json.dumps(msg) + "\n")
@@ -384,7 +421,7 @@ class Relay:
         method = msg.get("method")
         try:
             if method == "tools/call":
-                out = {"jsonrpc": "2.0", "id": msg["id"], "result": await self.tool(msg)}
+                out = {"jsonrpc": "2.0", "id": msg["id"], "result": bounded(await self.tool(msg), self.save_output)}
             else:
                 out = await self.up.send(msg, self.passthrough)
                 if method == "initialize" and out and "result" in out:

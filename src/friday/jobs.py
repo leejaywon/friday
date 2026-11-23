@@ -463,6 +463,8 @@ class Outcome:
     message: str
     undo: bool = False      # a local project has job commits the Undo button can revert
     reason: str = ""        # a work job that didn't fully succeed: why, in the worker's words
+    caveats: str = ""       # a work job: conditions and unconfirmed points the reply has to carry
+    files: tuple[str, ...] = ()  # a work job: result files kept in the workspace, to send to the owner
 
 
 @dataclass
