@@ -7,17 +7,19 @@ better than the agent would on its own.
   click at its position when it keeps moving (a video player, an animation), scrolling it into
   view, Escape for an overlay. Then it checks whether the page changed, and when an action failed
   or changed nothing the result carries a screenshot, so the agent sees what happened.
-- browser_media: the state of the page's video and audio (all frames), and play/pause/seek with a
-  verdict within a few seconds: playing, or why not (stuck loading, unsupported format, blocked).
+- browser_media reads the page's video and audio (all frames): position, rate, and whether it's
+  really advancing. It only reads: a player is operated through its own controls like any page.
 - browser_evaluate (page JavaScript) runs only after the owner approves the exact script on
   Telegram, since a script could read what fill_login typed. The other blocked tools stay hidden.
 - Every action's result says what it did: [effect: changed | unchanged | unknown], from the URL,
   tabs, dialogs, visible text, controls and media, ignoring a move of keyboard focus. Where the page
   can't tell (a canvas, a frame it can't read) the screen is compared, and an animated one is
   unknown. Only hashes are compared; what's typed is never kept.
-- A control can be on screen and not in the page's structure (a canvas, an image button). When a
-  lookup finds nothing, or the page has such regions, the result carries a screenshot and says to
-  click by position. Where to click stays the agent's choice.
+- It also lists the controls the action made appear or go away on that page (a menu, a control bar
+  under the pointer, a dialog), with refs. Nothing is hovered or opened on the agent's behalf.
+- A control can be on screen and not in the page's structure (a canvas, an image button, a built-in
+  player). When a lookup finds nothing, the page has such regions, or an action changed nothing, the
+  result carries a screenshot to open. Where to hover or click stays the agent's choice.
 
 Every forwarded call gets CALL_TIMEOUT seconds: past that the agent hears so and moves on.
 
@@ -42,8 +44,9 @@ import signal
 import sys
 import time
 import uuid
+from collections import Counter
 from contextlib import suppress
-from typing import Any
+from math import isfinite
 
 import httpx
 
@@ -52,7 +55,8 @@ from .browser import BLOCKED_TOOLS, CDP_URL
 
 OUTPUT_LIMIT = 20_000  # characters of one tool result that reach the agent; the full text goes to a file
 CALL_TIMEOUT = 30.0  # a forwarded browser step that takes longer is reported as failed
-PLAY_VERDICT = 5.0  # seconds to decide whether playback really started
+MEDIA_SAMPLE = 0.6  # seconds between two readings of a player, to tell whether it's really advancing
+CHANGE_SHOWN = 14  # controls listed as having appeared after an action; the rest are counted
 APPROVAL_TIMEOUT = 300
 TAB_TIMEOUT = 20.0  # finding or opening the task's tab
 LEASE_TOUCH = 60  # seconds between notes that the task still uses its tabs
@@ -72,8 +76,15 @@ EFFECT_LINES = {
     "unknown": "[effect: unknown] Friday can't tell whether this changed anything: look at the page.",
     "focus": "[effect: unchanged] Only the keyboard focus moved.",
 }
-SEE_IT = ("Friday: {why} If what you need is visible in this screenshot, click it with browser_mouse_click_xy at its "
-          "position, then check the result.")
+SEE_IT = ("Friday: {why} If what you need is visible in this screenshot, act on it by position (browser_mouse_click_xy, "
+          "or browser_mouse_move_xy to hover), then check the result.")
+SNAPSHOT_FILE = re.compile(r"\[Snapshot\]\((\S+?\.yml)\)")
+PAGE_URL = re.compile(r"^- Page URL: (\S+)", re.M)
+# A line of Playwright's page structure: role, "name", [attributes], and any text after the colon.
+TREE_LINE = re.compile(r"""^\s*- '?(\w+)(?: "((?:[^"\\]|\\.)*)")?((?: \[[^\]]*\])*):?[ ]?(.*)$""", re.M)
+CONTROL_ROLES = {"button", "link", "menu", "menuitem", "menuitemradio", "menuitemcheckbox", "dialog", "alertdialog", "alert",
+                 "slider", "tab", "textbox", "searchbox", "combobox", "listbox", "option", "checkbox", "radio", "switch",
+                 "spinbutton"}
 # A click may open a popup, which Chrome puts in front: the agent's tab goes back there.
 FRONT_AFTER = {"browser_navigate", "browser_navigate_back", "browser_tabs", "browser_click"}
 PROTOCOL = "2025-06-18"
@@ -82,15 +93,10 @@ TAB_LINE = re.compile(r"^- (\d+):( \(current\))? \[.*\]\((\S*)\)(?: \[[^\]\n]*\]
 MEDIA_TOOL = {
     "name": "browser_media",
     "description": (
-        "The current tab's <video>/<audio> (inside frames too): position, duration, paused, "
-        "loading, errors. action 'play' starts the main one and answers within ~5 seconds "
-        "whether it is really playing, or why not (stuck loading: the site isn't sending the "
-        "video; unsupported format; blocked). Also 'pause' and 'seek' (seconds). Use it "
-        "instead of clicking a player's buttons and waiting to see."),
-    "inputSchema": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["status", "play", "pause", "seek"]},
-        "seconds": {"type": "number", "description": "for seek: the position"}},
-        "required": ["action"]},
+        "Read the current tab's <video>/<audio> (inside frames too): position, duration, playback "
+        "rate, muted, loading, errors, and whether it's really advancing. It only reads: operate a "
+        "player through its own controls, then use this to check what happened."),
+    "inputSchema": {"type": "object", "properties": {}},
 }
 EVALUATE_TOOL = {
     "name": "browser_evaluate",
@@ -139,7 +145,8 @@ PAGE_STATE = """() => {
   };
   const bare = (e) => { const c = e.closest('a,button,[role=button],[onclick]');
     return !!c && !a(e, 'alt') && !a(c, 'aria-label') && !(c.innerText || '').trim(); };
-  const opaque = [...document.querySelectorAll('canvas,iframe,embed,object')].some((e) => shown(e, 0.1))
+  const opaque = [...document.querySelectorAll('canvas,iframe,embed,object,video[controls]')].some((e) => shown(e, 0.1))
+    || [...document.querySelectorAll('audio[controls]')].some((e) => shown(e, 0.001))
     || [...document.querySelectorAll('img,input[type=image]')].slice(0, 500).some((e) => shown(e, 0.1) || (bare(e) && shown(e, 0.001)));
   return {page: h([location.href, document.body ? document.body.innerText : '', controls, media].join('|')),
           scroll: scrollX + ',' + scrollY + ';' + scrolled, opaque};
@@ -147,22 +154,12 @@ PAGE_STATE = """() => {
 
 MEDIA_STATE = """() => [...document.querySelectorAll('video, audio')].map((m, i) => {
   const r = m.getBoundingClientRect();
-  return {i, tag: m.tagName.toLowerCase(), t: m.currentTime, d: m.duration, paused: m.paused,
-          ended: m.ended, muted: m.muted, ready: m.readyState, net: m.networkState,
+  return {i, tag: m.tagName.toLowerCase(), t: m.currentTime, d: m.duration, rate: m.playbackRate, paused: m.paused,
+          ended: m.ended, muted: m.muted, ready: m.readyState,
           error: m.error ? [m.error.code, m.error.message || ''] : null,
           buffered: m.buffered.length ? m.buffered.end(m.buffered.length - 1) : 0,
-          area: r.width * r.height, src: (m.currentSrc || '').slice(0, 80)};
+          area: r.width * r.height};
 })"""
-MEDIA_DO = """async ([i, action, seconds]) => {
-  const m = document.querySelectorAll('video, audio')[i];
-  if (!m) return 'gone';
-  try {
-    if (action === 'play') await m.play();
-    else if (action === 'pause') m.pause();
-    else if (action === 'seek') m.currentTime = seconds;
-    return 'ok';
-  } catch (e) { return e.name + ': ' + e.message; }
-}"""
 MEDIA_ERRORS = {1: "playback was aborted", 2: "a network error stopped the download",
                 3: "the file couldn't be decoded", 4: "this format isn't supported here"}
 
@@ -255,25 +252,53 @@ def bounded(result: dict, save, limit: int = OUTPUT_LIMIT) -> dict:
     return {**result, "content": [{**c, "text": head + note + tail} if c is longest else c for c in content]}
 
 
-def media_verdict(before: dict, after: dict, play_said: str) -> tuple[bool, str]:
-    """Whether play worked, from the element's state before and PLAY_VERDICT seconds after."""
-    if after.get("t", 0) - before.get("t", 0) > 0.5 and not after.get("paused"):
-        return True, f"playing: {after['t']:.0f}s of {after.get('d') or 0:.0f}s"
+def media_note(before: dict, after: dict) -> str:
+    """What a player is doing, from two readings MEDIA_SAMPLE seconds apart."""
     if after.get("error"):
         code, msg = after["error"]
-        return False, f"media error {code}: {MEDIA_ERRORS.get(code, '')} {msg}".strip()
-    if play_said.startswith("NotAllowedError"):
-        return False, "the browser blocked playback without a click on the page"
-    if play_said not in ("ok", ""):
-        return False, f"play() failed: {play_said}"
+        return f"media error {code}: {MEDIA_ERRORS.get(code, '')} {msg}".strip()
+    if after.get("ended"):
+        return "ended"
     if after.get("paused"):
-        return False, "the page paused it again (an ad, a consent dialog or a login wall?)"
+        return "paused"
+    if after.get("t", 0) > before.get("t", 0):
+        return "playing"
     if after.get("ready", 0) < 3:
-        got = after.get("buffered", 0)
-        return False, (f"stuck loading at {after.get('t', 0):.0f}s: no video data is arriving "
-                       f"(buffered {got:.0f}s). The site isn't sending it to this browser; "
-                       "waiting longer won't help")
-    return False, "it didn't move although it isn't paused"
+        return f"not advancing: waiting for data (buffered to {after.get('buffered', 0):.0f}s)"
+    return "not advancing although it isn't paused"
+
+
+def _controls(tree: str) -> list[tuple[str, str]]:
+    """The controls in a page structure, as (what identifies it, how to show it). Numbers don't count
+    towards identity, so a running clock or counter in a label isn't a new control."""
+    out = []
+    for role, name, attrs, text in TREE_LINE.findall(tree):
+        ref = re.search(r"\[ref=([\w-]+)\]", attrs)
+        label = (name or text).strip().strip("'\"")[:50]
+        if ref and (role in CONTROL_ROLES or ("[cursor=pointer]" in attrs and label)):
+            out.append((f"{role} {re.sub(r'[0-9]+', '#', label)}", f'{role} "{label}" [ref={ref[1]}]' if label else f"{role} [ref={ref[1]}]"))
+    return out
+
+
+def structure_change(before: str, after: str, shown: int = CHANGE_SHOWN) -> str:
+    """What an action made appear and go away among a page's controls, with refs to act on."""
+    def extra(items, other):
+        left, out = Counter(k for k, _ in other), []
+        for key, label in items:
+            if left[key] > 0:
+                left[key] -= 1
+            else:
+                out.append(label)
+        return out
+
+    old, new = _controls(before), _controls(after)
+    came, gone = extra(new, old), [x.split(" [ref=")[0] for x in extra(old, new)]
+    lines = []
+    if came:
+        lines.append("[appeared: " + "; ".join(came[:shown]) + (f"; and {len(came) - shown} more" if len(came) > shown else "") + "]")
+    if gone:
+        lines.append("[went away: " + "; ".join(gone[:6]) + (f"; and {len(gone) - 6} more" if len(gone) > 6 else "") + "]")
+    return "\n".join(lines)
 
 
 class Upstream:
@@ -401,6 +426,7 @@ class Relay:
         self._store = None
         self.seen_pages: set[str] = set()  # pages whose screenshot a lookup already carried
         self.shown_state: tuple | None = None
+        self.tree: tuple[str, str] | None = None  # (url, page structure) after the last action or full snapshot
 
     @property
     def store(self):
@@ -472,14 +498,17 @@ class Relay:
         if problem := await self.use_tab():
             return _result(problem, True)
         if name == "browser_media":
-            return await self.media(str(args.get("action") or "status"), args.get("seconds"))
+            return await self.media()
         if name == "browser_evaluate":
             return await self.evaluate(args)
         if name in ACTIONS:
             before = await self.page_state()
             result = await self.forward(msg, name, args)
-            return await self.with_effect(name, args, result, before)
+            return await self.with_change(await self.with_effect(name, args, result, before))
         result = await self.forward(msg, name, args)
+        if name == "browser_snapshot" and not result.get("isError") and not args.get("target") and not args.get("depth"):
+            text = _text(result)
+            self.tree = ((m[1] if (m := PAGE_URL.search(text)) else ""), text)
         return await self.with_view(name, result) if name in LOOKUPS else result
 
     async def forward(self, msg: dict, name: str, args: dict) -> dict:
@@ -561,7 +590,44 @@ class Relay:
                 async with asyncio.timeout(STATE_SECONDS):
                     again = await self.screen_hash(page) if page is not None else None
         focus = name == "browser_press_key" and str(args.get("key") or "").lower() in ("tab", "shift+tab")
-        return with_line(result, EFFECT_LINES[action_effect(before, after, again, focus)])
+        effect = action_effect(before, after, again, focus)
+        out = with_line(result, EFFECT_LINES[effect])
+        if effect == "unchanged" and not result.get("isError"):
+            return await self.with_screen(out, "This action changed nothing on the page.", after)
+        return out
+
+    def read_tree(self, text: str) -> str | None:
+        """The page structure Playwright saved after an action (its result links to the file)."""
+        link = SNAPSHOT_FILE.search(text)
+        if not link:
+            return None
+        try:
+            from .config import load_config
+
+            root = load_config().workspace.resolve()
+            path = (root / link[1]).resolve()
+            return path.read_text(encoding="utf-8", errors="replace") if path.is_relative_to(root) else None
+        except OSError:
+            return None
+
+    async def with_change(self, result: dict) -> dict:
+        """An action's result, plus what it made appear or go away on the same page: a menu that
+        opened, a control bar that showed up under the pointer, a dialog. The agent decides what
+        to do with it. A new page has no comparison: the agent reads it."""
+        if result.get("isError"):
+            return result
+        tree = self.read_tree(_text(result))
+        if tree is None:  # mouse moves and scrolls don't save one
+            snap = await self.up.call("browser_snapshot", {}, self.passthrough, timeout=5)
+            if snap.get("isError"):
+                return result
+            tree = _text(snap)
+        url = m[1] if (m := PAGE_URL.search(_text(result)) or PAGE_URL.search(tree)) else ""
+        previous, self.tree = self.tree, (url, tree)
+        if not previous or previous[0] != url:
+            return result
+        change = structure_change(previous[1], tree)
+        return {**result, "content": [*(result.get("content") or []), {"type": "text", "text": change}]} if change else result
 
     async def with_view(self, name: str, result: dict) -> dict:
         """A lookup that found nothing, or a page with regions its text can't describe, comes with
@@ -573,9 +639,13 @@ class Relay:
         regions = bool(state and state["opaque"])
         if not empty and not (regions and state["url"] not in self.seen_pages):
             return result
-        key = (state["url"], state["dom"]) if state else None
         why = ("It isn't in the page's text or controls." if empty else
-               "This page has regions its text can't describe (a canvas, images or frames).")
+               "This page has regions its text can't describe (a canvas, images, frames or a built-in player).")
+        return await self.with_screen(result, why, state)
+
+    async def with_screen(self, result: dict, why: str, state: dict | None) -> dict:
+        """The result with the screen, unless the agent already has this state of the page."""
+        key = (state["url"], state["dom"]) if state else None
         if key is not None and key == self.shown_state:  # the agent has this screen already
             return {**result, "content": [*(result.get("content") or []), {"type": "text", "text": SEE_IT.format(
                 why=why).replace("this screenshot", "the last screenshot")}]}
@@ -799,7 +869,9 @@ class Relay:
     async def current_url(self) -> str:
         return next((url for _, current, url in await self.listed() if current), "")
 
-    async def media(self, action: str, seconds: Any = None) -> dict:
+    async def media(self) -> dict:
+        """What the page's players are doing. Read twice, since only a moving position shows that
+        one really plays. It changes nothing: players are operated through their own controls."""
         page = await self.front()  # a background tab may not load its video at all
         if page is None:
             return _result("Couldn't find the current tab in the browser.", True)
@@ -812,24 +884,18 @@ class Relay:
                 continue
         if not found:
             return _result("There is no <video> or <audio> on this page yet (the player may start "
-                           "after a click, or draw on a canvas).", action != "status")
-        frame, m = max(found, key=lambda fm: (fm[1]["area"], fm[1]["d"] or 0))
-        if action == "status":
-            return _result(json.dumps([mm for _, mm in found], ensure_ascii=False))
-        said = await frame.evaluate(MEDIA_DO, [m["i"], action, float(seconds or 0)])
-        if action != "play":
-            state = (await frame.evaluate(MEDIA_STATE))[m["i"]]
-            return _result(f"{action}: {said}; now at {state['t']:.0f}s, paused={state['paused']}",
-                           said != "ok")
-        # Answer as soon as it moves; a stall takes the whole PLAY_VERDICT to call.
-        deadline = time.monotonic() + PLAY_VERDICT
-        while True:
-            await asyncio.sleep(0.5)
-            after = (await frame.evaluate(MEDIA_STATE))[m["i"]]
-            ok, verdict = media_verdict(m, after, said)
-            if ok or time.monotonic() >= deadline:
-                break
-        return _result(("▶️ " if ok else "⛔ ") + verdict, not ok)
+                           "after a click, or draw on a canvas).")
+        await asyncio.sleep(MEDIA_SAMPLE)
+        out = []
+        for frame, m in sorted(found, key=lambda fm: fm[1]["area"], reverse=True):
+            try:
+                after = (await frame.evaluate(MEDIA_STATE))[m["i"]]
+            except Exception:  # the frame went away, or the player was replaced
+                continue
+            out.append({"tag": after["tag"], "state": media_note(m, after), "position": round(after["t"], 1),
+                        "duration": round(after["d"], 1) if isfinite(after["d"] or 0) and after["d"] else None,
+                        "rate": after["rate"], "muted": after["muted"], "buffered_to": round(after["buffered"], 1)})
+        return _result(json.dumps(out, ensure_ascii=False))
 
     # --- page JavaScript, with the owner's approval --------------------------------------
 

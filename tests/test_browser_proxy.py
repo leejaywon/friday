@@ -65,10 +65,29 @@ def test_a_click_on_a_moving_player_becomes_a_mouse_click_and_is_checked():
     assert bp.click_plan(None, "waiting for locator('aria-ref=e9')")[0] == "refresh"
 
 
-def test_media_verdict_says_why_playback_didnt_start():
-    start = {"t": 0, "paused": True, "ready": 0, "buffered": 0}
-    assert bp.media_verdict(start, {"t": 4.8, "paused": False, "d": 392}, "ok")[0]
-    stuck = bp.media_verdict(start, {"t": 0, "paused": False, "ready": 0, "buffered": 0}, "ok")
-    assert not stuck[0] and "no video data is arriving" in stuck[1]
-    assert "isn't supported" in bp.media_verdict(start, {"t": 0, "paused": True, "error": [4, ""]}, "ok")[1]
-    assert "blocked" in bp.media_verdict(start, {"t": 0, "paused": True}, "NotAllowedError: play()")[1]
+def test_media_status_reads_what_a_player_is_really_doing():
+    start = {"t": 3, "paused": False, "ready": 4, "buffered": 9}
+    assert bp.media_note(start, {**start, "t": 3.9}) == "playing"
+    assert bp.media_note(start, {**start, "paused": True}) == "paused"
+    assert "waiting for data" in bp.media_note(start, {**start, "ready": 1})
+    assert "isn't supported" in bp.media_note(start, {**start, "error": [4, ""]})
+    assert bp.MEDIA_TOOL["inputSchema"]["properties"] == {}  # it reads; it has nothing to operate
+
+
+def test_an_action_lists_the_controls_it_made_appear_on_any_page():
+    before = """- generic [ref=e1]:
+  - button "Play" [ref=e2] [cursor=pointer]
+  - button "0:05 of 2:00" [ref=e3]
+  - link "Home" [ref=e4] [cursor=pointer]"""
+    after = """- generic [ref=e1]:
+  - button "Pause" [ref=e2] [cursor=pointer]
+  - button "0:09 of 2:00" [ref=e3]
+  - menu [ref=e7]:
+    - menuitemradio "1.5x" [ref=e8]
+    - generic [ref=e9] [cursor=pointer]: 1x
+  - link "Home" [ref=e4] [cursor=pointer]"""
+    change = bp.structure_change(before, after)
+    assert 'button "Pause" [ref=e2]' in change and 'menuitemradio "1.5x" [ref=e8]' in change and 'generic "1x" [ref=e9]' in change
+    assert "went away: button \"Play\"" in change
+    assert "0:09" not in change and "Home" not in change  # a running clock isn't a new control
+    assert bp.structure_change(before, before) == ""

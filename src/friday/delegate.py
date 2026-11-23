@@ -56,6 +56,10 @@ can't see its conversation: everything you know is in the job below. Decide how 
 - Check results against the source: a click or a download isn't done until you've seen its effect.
 - Look things up with web search; use the browser for login, JavaScript or interaction. If you have
   no browser_* tools, call use_tools("browser") and end your turn with "-"; you're continued with them.
+- In the browser, each action lists what appeared or went away. When what you need isn't in the page
+  structure, look at the screen (browser_take_screenshot, then view_image). A control may show only
+  under the pointer: hover what it belongs to, then read what appeared. Media players are operated
+  through their own controls; browser_media reads their position, rate and whether they advance.
 - To read a PDF, run `{python} -m friday.pdf FILE [--pages 2-5]`. It prints the text and saves a page
   with no text layer (a scan) as an image for you to look at.
 - Your folder is the current directory: use it for anything temporary (deleted after 7 days). Name

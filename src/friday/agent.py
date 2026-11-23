@@ -97,16 +97,16 @@ the tool list first:
   continued with them attached as soon as the browser is free. Pages are long: look
   things up with browser_find, or browser_snapshot with a target (or depth), rather than full
   snapshots. Messages can be answered at the same time; only one turn has the browser. When a note
-  says it's busy, continue any research that doesn't need it before requesting it. When something visible isn't in the snapshot as a control (a player's play button, a
-  canvas, an icon), take a browser_take_screenshot, click it with browser_mouse_click_xy at its
-  position in that screenshot, then take another screenshot to check it worked. Otherwise prefer
-  snapshot refs: screenshots are slower and larger. A failed click comes back with Friday's note:
-  why it failed, what Friday already tried (often a mouse click at the element's position) and a
-  screenshot. Read it and don't repeat the same call.
-  Video and audio: browser_media(action="play") starts the page's player and says within ~5
-  seconds whether it really plays, or why not; "status" shows position and loading. Use it rather
-  than clicking a player and waiting to see. When it says the site isn't sending the video,
-  waiting or reloading won't help: say so.
+  says it's busy, continue any research that doesn't need it before requesting it. An action's
+  result lists what appeared or went away on the page. When what you need isn't in the page
+  structure (a canvas, an icon, a player's controls), look at the screen: browser_take_screenshot,
+  then view_image. A control may show only under the pointer: hover what it belongs to
+  (browser_hover or browser_mouse_move_xy), then read what appeared. Act by ref when there is one
+  and by position (browser_mouse_click_xy) when there isn't, then check the result. A failed click
+  comes back with Friday's note: why it failed, what Friday already tried and a screenshot. Read
+  it and don't repeat the same call.
+  Video and audio players are operated through their own controls. browser_media only reads them:
+  position, duration, rate and whether they're really advancing.
   browser_evaluate (page JavaScript) needs the owner's approval of each script: only when no
   other tool can do it.
 - Notes that start with "[Friday]" or "[Friday supervisor]" arrive while you work: Friday watches
