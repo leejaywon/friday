@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from collections import Counter
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -42,6 +43,7 @@ from telegram.ext import (
 from . import browser, browser_audio, gcal, mcp_config, mcp_http, miniapp, planner
 from . import browser_care as care
 from . import timeutil as tu
+from . import delegate as dg
 from . import workspace as wsfiles
 from .agent import AgentResult, engine_status, instructions, light_reply, run_turn
 from .codex_server import CodexServer, CodexServerError
@@ -615,6 +617,7 @@ class Friday(WatchBot):
         self.own_repo: str | None = None  # Friday's own GitHub owner/name, for the Deploy button
         self._jobs: dict[int, asyncio.Task] = {}  # job id -> the task running and reporting it
         self._job_execs: dict[int, asyncio.Task] = {}  # job id -> the agent/git part, which /stop cancels
+        self._next_sweep = 0.0  # when old work folders are next cleaned up (delegate.sweep)
         self._job_busy: set[int] = set()  # jobs with a button action in flight (double taps)
         self._file_timer: asyncio.Task | None = None  # answers files sent without a message
         self._downloads = 0  # incoming files still downloading
@@ -744,6 +747,9 @@ class Friday(WatchBot):
         if others:
             head.append("[Also in progress in parallel, as other turns of yours: " + "; ".join(f"«{t}»" for t in others)
                         + ". Don't start that work again here; if asked about it, say it's still running.]")
+        if running := [self.store.job(j) for j in self._running_jobs()]:
+            head.append("[Delegated jobs running: " + "; ".join(f"#{j['id']} «{short(j['task'], 80)}»" for j in running if j)
+                        + ". To add to one, delegate(goal, continue_job=id).]")
         if self.cfg.browser_enabled and not browser_attached:
             head.append('[Browser tools are not attached to this turn. Use built-in web search for public '
                         'research. If you need a signed-in page or UI interaction, call use_tools("browser") '
@@ -1822,7 +1828,10 @@ class Friday(WatchBot):
 
     async def _job_followup(self, msg, job) -> None:
         jid, status = job["id"], job["status"]
-        if status in ("queued", "running"):
+        if status == "running" and job["kind"] == "work" and self.codex \
+                and await self.codex.steer(f"job{jid}", f"[The owner adds: {msg.text}]"):
+            await msg.reply_text(f"↪️ Passed to job #{jid}.")
+        elif status in ("queued", "running"):
             await msg.reply_text(f"Job #{jid} is still {status}. Reply again when it's done, or /stop {jid}")
         elif status in ("review", "done", "failed"):
             self.store.update_job(jid, followup=msg.text, status="queued")
@@ -1993,6 +2002,9 @@ class Friday(WatchBot):
         # Polled, because the MCP server (another process) can queue jobs too.
         for jid in [j for j, t in self._jobs.items() if t.done()]:
             del self._jobs[jid]
+        if clock.monotonic() >= self._next_sweep:
+            self._next_sweep = clock.monotonic() + 3600
+            await asyncio.to_thread(dg.sweep, self.store, tu.now_utc())
         while len(self._jobs) < self.cfg.coding_jobs and (job := self.store.next_queued_job()):
             self.store.update_job(job["id"], status="running", error=None)
             self._jobs[job["id"]] = asyncio.create_task(self._run_job(self.store.job(job["id"])),
@@ -2002,7 +2014,8 @@ class Friday(WatchBot):
     async def _run_job(self, job) -> None:
         """Run one job and report it. Never raises (except when Friday shuts down), so the loop goes on."""
         jid = job["id"]
-        head = f"#{jid} {job['repo']} ({job['engine']})"
+        work = job["kind"] == "work"
+        head = f"#{jid} ({job['engine']})" if work else f"#{jid} {job['repo']} ({job['engine']})"
         what = f"follow-up: {short(job['followup'], 200)}" if job["followup"] else short(job["task"], 200)
         started = f"🛠 Job {head} started: {what}"
         queued = self.store.get(f"job_queued_msg:{jid}")  # the /code or follow-up message: edit it
@@ -2019,7 +2032,8 @@ class Friday(WatchBot):
             mid = await self._job_send(jid, started, stop)
         steps: list[str] = []
         t0 = clock.monotonic()
-        self._job_execs[jid] = asyncio.create_task(self.runner.execute(job, on_step=steps.append))
+        self._job_execs[jid] = asyncio.create_task(
+            self._run_worker(job, steps.append) if work else self.runner.execute(job, on_step=steps.append))
         status = asyncio.create_task(self._job_status(mid, started, stop, steps, t0))
         try:
             outcome = await self._job_execs[jid]
@@ -2041,6 +2055,9 @@ class Friday(WatchBot):
                 await self._quiet(self.app.bot.edit_message_text(  # type: ignore[union-attr]
                     f"{started}\n\n⏱ {took} min", chat_id=self.owner, message_id=mid))
 
+        if work:
+            await self._worker_done(jid, outcome)
+            return
         try:
             failed = outcome.status == "failed"
             self.store.update_job(jid, status=outcome.status, error=outcome.message if failed else None)
@@ -2067,6 +2084,107 @@ class Friday(WatchBot):
                                  + self._laptop_hint(self.store.job(jid)), buttons)
         except Exception:
             log.exception("reporting job %s failed", jid)
+
+    async def _run_worker(self, job, on_step: Callable[[str], None]) -> Outcome:
+        """A delegated job without a project (delegate.py): an agent in its own folder and thread,
+        with the browser attached when it asks. It can run for as long as jobs may, as long as it
+        keeps getting somewhere (WorkerPace)."""
+        jid, key = job["id"], f"job{job['id']}"
+        workdir = dg.work_dir(self.cfg, jid)
+        prompt = dg.worker_prompt(self.store, self.cfg, job, dg.now_str(self.tz))
+        self.store.update_job(jid, workdir=str(workdir), followup=None)
+        same_engine = job["engine"] == self.cfg.chat_engine
+        limit = self.cfg.code_job_timeout_seconds
+
+        def spawn(coro) -> None:
+            task = asyncio.create_task(self._quiet(coro))
+            self._bg.add(task)
+            task.add_done_callback(self._bg.discard)
+
+        async def nudge(text: str) -> None:
+            if self.codex:
+                await self.codex.steer(key, text)
+
+        async def stop() -> None:
+            if self.codex:
+                self.codex.stop_turn(key)
+
+        pace = dg.WorkerPace(self.store, jid, nudge, stop, spawn)
+
+        def step(item_id: str, label: str, failed: str = "") -> None:
+            if label:
+                on_step(label)
+                pace.on_step(label)
+
+        async def turn(text: str, thread: str | None, toolsets: set[str]) -> AgentResult:
+            kw = dict(model=(self.store.get("model") or "") if same_engine else "",
+                      effort=(self.store.get("effort") or "") if same_engine else "",
+                      toolsets=toolsets, tz=self.tz, job_id=jid, workdir=workdir)
+            if job["engine"] == "codex" and same_engine and self.codex:
+                try:
+                    return await self.codex.run(text, thread, [], on_step=step, key=key, timeout=limit, **kw)
+                except CodexServerError as e:
+                    log.warning("codex app-server failed on job %s, retrying with codex exec: %s", jid, e)
+                    if e.partial:
+                        text = RETRY_NOTE + text
+            return await run_turn(replace(self.cfg, chat_engine=job["engine"], codex_timeout_seconds=limit),
+                                  text, thread, [], **kw)
+
+        thread, has_browser = job["session_id"], False
+        try:
+            for _ in range(MAX_CONTINUATIONS + 1):
+                result = await turn(prompt, thread, {"browser"} if has_browser else set())
+                thread = result.thread_id or thread
+                if thread:
+                    self.store.update_job(jid, session_id=thread)
+                if pace.ended or has_browser or "browser" not in self._toolsets(key):
+                    break
+                self._drop_browser_request(key)
+                await self.browser_lock.acquire()
+                has_browser, self._browser_topic = True, f"job #{jid}: {short(job['task'], 80)}"
+                prompt = "[The browser tools are now attached; go on with the job.]"
+            if pace.ended:
+                result = await turn("[Friday stopped this job: it stopped making progress. Without using any tools, "
+                                    "report what you have, what's missing and what you tried.]", thread,
+                                    {"browser"} if has_browser else set())
+        finally:
+            if has_browser:
+                self.browser_lock.release()
+            self.store.delete(mcp_http.toolsets_key(key))
+        text = result.text.strip()
+        if pace.ended:
+            return Outcome("failed", text or "It stopped making progress and gave no report.")
+        if not text.strip(" .-") or (result.errors and not text):
+            raise JobError("; ".join(result.errors) or "the worker gave no report")
+        return Outcome("done", text)
+
+    async def _worker_done(self, jid: int, outcome: Outcome) -> None:
+        """A worker's report goes to the main agent, which tells the owner."""
+        try:
+            job = self.store.job(jid)
+            failed = outcome.status == "failed"
+            report = dg.keep_report(Path(job["workdir"]) if job["workdir"] else self.cfg.workspace, outcome.message)
+            self.store.update_job(jid, status=outcome.status, result=outcome.message,
+                                  error=short(outcome.message, 500) if failed else None)
+            self.store.log_message("worker", f"Job #{jid}: {short(job['task'], 200)}\n{report}")
+            note = dg.finished_note(self.store, job, outcome.status, report)
+            task = asyncio.create_task(self._turn(self.owner, note, lane=self.lanes["1"], source="note"))
+            self._bg.add(task)
+            task.add_done_callback(self._bg.discard)
+        except Exception:
+            log.exception("reporting job %s failed", jid)
+
+    async def _steer_job(self, jid: int, text: str) -> None:
+        """The main agent passes the owner's instruction to a job that's queued or running."""
+        job = self.store.job(jid)
+        if not job:
+            return
+        if job["status"] == "queued":
+            self.store.update_job(jid, followup=f"{job['followup']}\n{text}" if job["followup"] else text)
+        elif not (job["status"] == "running" and job["kind"] == "work" and self.codex
+                  and await self.codex.steer(f"job{jid}", f"[The owner adds: {text}]")):
+            await self._job_send(jid, f"⚠️ Couldn't pass this to job #{jid} while it runs: {short(text, 300)}\n"
+                                      "Reply to this message once it's done.")
 
     async def _job_status(self, mid: int | None, started: str, stop, steps: list[str], t0: float) -> None:
         """Keep the job's message current: minutes so far and what the agent did last."""
@@ -2832,6 +2950,8 @@ class Friday(WatchBot):
                             await self.say(f"⚠️ {problem}")
                 elif row["kind"] == "proposal":
                     await self._send_proposal(int(row["text"]))
+                elif row["kind"] == "job_steer":  # delegate(continue_job=...) on a job still going
+                    await self._steer_job(int(row["path"]), row["text"])
                 elif row["kind"] == "approval":  # text holds the approval id, path an optional screenshot
                     await self._send_approval(int(row["text"]), row["path"])
                 elif row["kind"] == "login_request":  # text holds the login request id

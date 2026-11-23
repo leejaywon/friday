@@ -177,12 +177,12 @@ def test_codex_args_attach_optional_toolsets_only_when_on(cfg):
     ov = _overrides(codex_args(cfg, None, [], toolsets={"browser", "github"}, chat=True))
     assert 'mcp_servers.playwright.args=["-m", "friday.browser_proxy"]' in ov  # through Friday's proxy
     assert any(o.startswith("mcp_servers.github.url=") for o in ov)
-    assert not any(o.startswith("mcp_servers.friday.disabled_tools=") for o in ov)
+    assert '"fill_login"' not in next(o for o in ov if o.startswith("mcp_servers.friday.disabled_tools="))
 
     # A scheduled run: the browser, its run id instead of the chat marker, and no use_tools.
     ov = _overrides(codex_args(cfg, None, [], run_id=7, toolsets={"browser"}, chat=True))
     assert 'mcp_servers.friday.http_headers={"X-Friday-Run" = "7"}' in ov
-    assert 'mcp_servers.friday.disabled_tools=["use_tools"]' in ov
+    assert 'mcp_servers.friday.disabled_tools=["use_tools", "delegate", "ledger"]' in ov
 
 
 def test_claude_gets_the_same_tools_as_codex(cfg, tmp_path):

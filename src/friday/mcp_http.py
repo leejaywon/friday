@@ -12,6 +12,7 @@ RUN_HEADER for a scheduled browser run, CHAT_HEADER for a Telegram chat turn.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
 import secrets
@@ -25,6 +26,7 @@ RUN_HEADER = "X-Friday-Run"
 WATCH_HEADER = "X-Friday-Watch"  # a watch check (watches.py)
 CHAT_HEADER = "X-Friday-Chat"  # a Telegram chat turn; the value is its lane (bot.Friday lanes)
 NO_BROWSER_HEADER = "X-Friday-No-Browser"  # a chat turn started while another one had the browser
+JOB_HEADER = "X-Friday-Job"  # a delegated job (delegate.py): only its tools work
 
 
 def toolsets_key(lane: str) -> str:
@@ -71,19 +73,27 @@ def token(cfg: Config) -> str:
 
 
 class BearerAuth:
-    """ASGI wrapper: HTTP requests without `Authorization: Bearer <token>` get 401."""
+    """ASGI wrapper: HTTP requests without `Authorization: Bearer <token>` get 401. job_for_token
+    (a token's SHA-256 -> running job id) also admits a project job's own token: that request
+    counts as that job whatever headers it sends, so it only reaches the job's tools."""
 
-    def __init__(self, app, token: str):
+    def __init__(self, app, token: str, job_for_token=None):
         if not token:
             raise ValueError("empty MCP token")
-        self.app, self.expected = app, f"Bearer {token}".encode()
+        self.app, self.expected, self.job_for_token = app, f"Bearer {token}".encode(), job_for_token
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             got = next((v for k, v in scope.get("headers", []) if k == b"authorization"), b"")
             if not hmac.compare_digest(got, self.expected):
-                await send({"type": "http.response.start", "status": 401,
-                            "headers": [(b"content-type", b"text/plain")]})
-                await send({"type": "http.response.body", "body": b"unauthorized"})
-                return
+                jid = None
+                if self.job_for_token and got.startswith(b"Bearer "):
+                    jid = self.job_for_token(hashlib.sha256(got[7:]).hexdigest())
+                if not jid:
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body", "body": b"unauthorized"})
+                    return
+                headers = [(k, v) for k, v in scope["headers"] if not k.startswith(b"x-friday-")]
+                scope = {**scope, "headers": [*headers, (JOB_HEADER.lower().encode(), str(jid).encode())]}
         await self.app(scope, receive, send)

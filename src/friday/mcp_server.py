@@ -19,9 +19,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver import Context
 
 from . import browser, browser_audio, browser_care, contacts, gcal, mcp_http
+from . import delegate as dg
 from . import timeutil as tu
 from . import watches as wt
 from . import workspace as wsfiles
@@ -47,6 +49,24 @@ class _PlainServer(MCPServer):
     def add_tool(self, fn, **kwargs) -> None:
         kwargs["structured_output"] = kwargs.get("structured_output") or False
         super().add_tool(fn, **kwargs)
+
+    # A delegated job only sees and can only call its own tools (delegate.py), whatever its client says.
+    async def _handle_list_tools(self, ctx, params):
+        result = await super()._handle_list_tools(ctx, params)
+        allowed = _job_tools(_job_from(getattr(getattr(ctx, "request", None), "headers", None)))
+        if allowed is not None:
+            result.tools = [t for t in result.tools if t.name in allowed]
+        return result
+
+    async def call_tool(self, name, arguments, context=None):
+        try:
+            headers = context.headers if context is not None else None
+        except Exception:  # no request (e.g. called directly)
+            headers = None
+        allowed = _job_tools(_job_from(headers))
+        if allowed is not None and name not in allowed:
+            raise ToolError(f"'{name}' isn't available to a delegated job.")
+        return await super().call_tool(name, arguments, context)
 
 
 server = _PlainServer(
@@ -85,17 +105,40 @@ def _watch_id(ctx: Context | None) -> int:
     return int(raw) if raw.isdigit() else 0
 
 
+def _job_from(headers) -> int:
+    raw = (headers.get(mcp_http.JOB_HEADER) or "") if headers else os.environ.get("FRIDAY_JOB_ID", "")
+    return int(raw) if raw.isdigit() else 0
+
+
+def _job_id(ctx: Context | None) -> int:
+    """The delegated job this call belongs to (delegate.py), or 0."""
+    raw = _context(ctx, mcp_http.JOB_HEADER, "FRIDAY_JOB_ID")
+    return int(raw) if raw.isdigit() else 0
+
+
+def _job_tools(jid: int) -> frozenset[str] | None:
+    """The tools a delegated job may use; None when the caller isn't one."""
+    if not jid:
+        return None
+    job = store.job(jid)
+    return dg.WORKER_TOOLS if job and job["kind"] == "work" else dg.PROJECT_TOOLS
+
+
 def _in_chat(ctx: Context | None) -> bool:
     """A Telegram chat turn: requests to the user return at once and the bot continues the
-    thread with the answer. Scheduled runs (nobody chatting) and other clients wait instead."""
-    return bool(_context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")) and not _run_id(ctx)
+    thread with the answer. Scheduled runs and delegated jobs (nobody chatting with them) and
+    other clients wait instead."""
+    return bool(_context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")) and not _run_id(ctx) and not _job_id(ctx)
 
 
 TOOLSETS = ("github",)  # browser requests are handled separately: one chat turn at a time
 
 
 def _lane(ctx: Context | None) -> str:
-    """The chat lane a call comes from (bot.Friday lanes): "1" is the main conversation."""
+    """The chat lane a call comes from (bot.Friday lanes): "1" is the main conversation; a
+    delegated job counts as its own."""
+    if jid := _job_id(ctx):
+        return f"job{jid}"
     return _context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT") or "1"
 
 
@@ -120,6 +163,8 @@ def use_tools(toolset: str, reason: str = "", ctx: Context | None = None) -> str
         store.set(key, json.dumps(sorted(on)))
         return ("Browser requested. End your turn now, writing nothing but \"-\"; "
                 "you'll be continued with the browser tools attached as soon as it's free.")
+    if _job_id(ctx):
+        return "A delegated job can only request the browser."
     if name not in TOOLSETS:
         return f"Unknown toolset '{toolset}'. Toolsets: {', '.join(TOOLSETS)}."
     if name == "github" and not (cfg.github_token_set or cfg.github_code_token):
@@ -564,36 +609,86 @@ def delete_contact(contact_id: int) -> str:
 
 
 @server.tool()
-def start_coding_job(repo: str, task: str, engine: str = "") -> str:
-    """Start a coding job: a coding agent changes one of the user's projects on this server.
-    Only when the user's own message asks for a code change or a new project.
+def delegate(goal: str, why: str = "", context: str = "", project: str = "", related: str = "",
+             continue_job: int = 0, engine: str = "") -> str:
+    """Hand heavy work to a worker agent that runs in the background and reports back to you.
 
-    repo: a project folder name in ~/code on the server (e.g. 'friday', 'myapp'), or 'owner/name'
-        on GitHub, which is cloned on first use. A name that doesn't exist yet becomes a new
-        local project. GitHub repos get a pull request; local projects are changed in place and
-        committed, with an Undo button.
-    task: the complete instruction for the coding agent. It can't see this chat or ask questions,
-        so write everything it needs in full: what to change, where if known, and any details,
-        names or wording the user gave. Same language as the user.
-    engine: 'claude' (Claude Code) or 'codex'. Empty uses the default; only set it when the user
-        names one.
+    Delegate what needs the browser or a login, playing or recording something, downloading or
+    working on files, comparing many sources, or changing code. Answer yourself what a quick look
+    settles: a fact, a rate, the weather, one or two web searches.
 
-    The job runs in the background, usually for several minutes. Friday messages the result
-    (with a pull request for GitHub repos); the user merges, closes or undoes it from that
-    message, or replies to it to ask for more changes.
+    goal: the outcome the owner wants, complete: the worker can't see this chat.
+    why: what it's for, so the worker can judge what matters and what to keep.
+    context: what you know that it needs (names, sites, dates, preferences). No secrets.
+    project: a code project: a folder name in ~/code or 'owner/name' on GitHub (list_projects). Only
+        when the user's own message asks for a code change; a new name creates a new local project.
+        GitHub repos get a pull request; local projects are committed in place with an Undo button.
+    related: ids of earlier jobs whose results it should build on, e.g. "12,14".
+    continue_job: go on with that job (its worker, ledger and open page) with `goal` as the new
+        instruction; if it's still running, the instruction reaches it right away.
+    engine: 'claude' or 'codex', only when the user names one.
+
+    After calling it, tell the owner in one short line what you handed off and end your turn. You
+    are continued with the result when the worker finishes.
     """
-    repo, task, engine = repo.strip(), task.strip(), (engine.strip().lower() or cfg.code_engine)
-    if not REPO_ARG.match(repo):
-        return f"Not queued: '{repo}' isn't a repo name. Use a folder name in ~/code or owner/name."
-    if engine not in ("claude", "codex"):
-        return f"Not queued: engine must be 'claude' or 'codex', not '{engine}'."
-    if not task:
-        return "Not queued: the task is empty."
-    if looks_secret(task):
+    goal, why, context = goal.strip(), why.strip(), context.strip()
+    if not goal:
+        return "Not delegated: the goal is empty."
+    if looks_secret(f"{goal} {why} {context}"):
         return REFUSAL
-    jid = store.add_job(repo, task, engine)
-    new = "" if "/" in repo or (cfg.code_dir / repo).exists() else f" It's a new project: ~/code/{repo}."
-    return f"Queued coding job #{jid} on {repo} ({engine}).{new} Friday will message the result when it's done."
+    engine = engine.strip().lower()
+    if engine and engine not in ("claude", "codex"):
+        return f"Not delegated: engine must be 'claude' or 'codex', not '{engine}'."
+    if continue_job:
+        job = store.job(continue_job)
+        if not job:
+            return f"No job #{continue_job}."
+        if job["status"] in ("queued", "running"):
+            store.queue("job_steer", text=goal, path=str(continue_job))
+            return f"Passed to job #{continue_job}, which is still {job['status']}."
+        if job["status"] not in ("review", "done", "failed", "cancelled"):
+            return f"Job #{continue_job} is {job['status']} and can't be continued: start a new one."
+        store.update_job(continue_job, followup=goal, status="queued")
+        return f"Job #{continue_job} goes on with this. Tell the owner in one short line and end your turn."
+    project = project.strip()
+    if project and not REPO_ARG.match(project):
+        return f"Not delegated: '{project}' isn't a project name. Use a folder name in ~/code or owner/name."
+    engine = engine or (cfg.code_engine if project else cfg.chat_engine)
+    jid = store.add_delegated_job(goal, engine, project, why, context, dg.parse_refs(related))
+    return (f"Delegated as job #{jid} ({engine}). Tell the owner in one short line what you handed off and "
+            "end your turn; you're continued with the result.")
+
+
+@server.tool()
+def ledger(action: str = "read", title: str = "", item_id: int = 0, status: str = "", evidence: str = "",
+           ctx: Context | None = None) -> str:
+    """Your job's ledger: everything it has to get through, kept so the work survives interruptions.
+
+    action: 'read'; 'add' (title: one item per line); 'update' (item_id, and status and/or evidence).
+    status: todo, doing, done or blocked. Mark done only with evidence you saw at the source.
+    evidence: what shows it's done (a progress figure, a saved path), or why it's blocked.
+    """
+    jid = _job_id(ctx)
+    if not jid:
+        return "The ledger belongs to a delegated job."
+    action = action.strip().lower()
+    if looks_secret(f"{title} {evidence}"):
+        return REFUSAL
+    if action == "add":
+        lines = [x.strip() for x in title.splitlines() if x.strip()]
+        if not lines:
+            return "Give at least one item title."
+        for line in lines:
+            store.add_job_item(jid, short(line, 200))
+    elif action == "update":
+        status = status.strip().lower()
+        if status and status not in dg.ITEM_STATUSES:
+            return f"status must be one of {', '.join(dg.ITEM_STATUSES)}."
+        if not store.update_job_item(jid, item_id, status, short(evidence, 500) if evidence else ""):
+            return f"No item #{item_id} in this job's ledger."
+    elif action != "read":
+        return "Unknown action: use read, add or update."
+    return dg.board(store, jid)
 
 
 @server.tool()
@@ -617,7 +712,7 @@ def list_coding_jobs() -> str:
 @server.tool()
 def list_projects() -> str:
     """The user's projects on this server (folders in ~/code): name, GitHub repo or 'local', and
-    the last commit. Use the name with start_coding_job."""
+    the last commit. Use the name as delegate's project."""
     import subprocess
 
     def git(path: Path, *args: str) -> str:
@@ -1068,12 +1163,13 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
         'Expense report: attach receipt.pdf, then press Submit'.
     """
     shot = cfg.files_dir / "browser" / f"approval-{tu.now_utc():%Y%m%d-%H%M%S}.png"
-    try:
+    job = store.job(_job_id(ctx)) if _job_id(ctx) else None
+    try:  # a job in a code project has nothing to do with the page the shared browser shows
         _use_own_tabs(ctx)
-        url = await browser.screenshot(shot)
+        url = None if job and job["kind"] == "project" else await browser.screenshot(shot)
     except Exception:
         url = None
-    text = f"✋ {summary}" + (f"\n{url}" if url else "")
+    text = (f"✋ Job #{job['id']}: " if job else "✋ ") + summary + (f"\n{url}" if url else "")
     if _in_chat(ctx):
         aid = store.add_approval("action", text)
         _follow_up("approval", aid, "request_approval", ctx)
@@ -1272,7 +1368,8 @@ def run_http(port: int | None = None) -> None:
     request needs the bearer token (mcp_http.token)."""
     import uvicorn
 
-    app = mcp_http.BearerAuth(server.streamable_http_app(host="127.0.0.1"), mcp_http.token(cfg))
+    app = mcp_http.BearerAuth(server.streamable_http_app(host="127.0.0.1"), mcp_http.token(cfg),
+                               job_for_token=store.job_for_token)
     uvicorn.run(app, host="127.0.0.1", port=port or mcp_http.friday_port(), log_level="warning")
 
 

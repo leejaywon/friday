@@ -83,6 +83,16 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, id);
 
+CREATE TABLE IF NOT EXISTS job_items (      -- a job's ledger: what it has to get through (delegate.py)
+    id         INTEGER PRIMARY KEY,
+    job_id     INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'todo', -- todo | doing | done | blocked
+    evidence   TEXT NOT NULL DEFAULT '',     -- what shows it, or why it's blocked
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS job_items_job ON job_items(job_id, id);
+
 CREATE TABLE IF NOT EXISTS job_messages (   -- Telegram messages about a job, so a reply continues it
     message_id INTEGER PRIMARY KEY,
     job_id     INTEGER NOT NULL
@@ -185,7 +195,7 @@ CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, id
 
 JOB_FIELDS = (
     "status", "followup", "branch", "base", "worktree", "gh_repo", "session_id",
-    "pr_number", "pr_url", "commits", "summary", "error",
+    "pr_number", "pr_url", "commits", "summary", "error", "workdir", "result", "token_hash",
 )
 
 # Columns added after the first release: (table, column, definition).
@@ -199,6 +209,14 @@ MIGRATIONS = [
     ("login_requests", "form_message_id", "INTEGER"),  # the message showing the Mini App keyboard
     ("login_requests", "spec", "TEXT NOT NULL DEFAULT '{}'"),
     ("login_requests", "result", "TEXT"),
+    # Delegated work (delegate.py). kind: project (a repo under ~/code) | work (a work folder).
+    ("jobs", "kind", "TEXT NOT NULL DEFAULT 'project'"),
+    ("jobs", "why", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "context", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "refs", "TEXT NOT NULL DEFAULT ''"),  # earlier jobs whose results it may read, "12,14"
+    ("jobs", "workdir", "TEXT"),
+    ("jobs", "result", "TEXT"),  # what the worker reported, in full
+    ("jobs", "token_hash", "TEXT"),  # a project job's own MCP token while it runs
 ]
 
 # Korean particles stripped from search words, longest first ("엄마한테" -> "엄마").
@@ -722,6 +740,42 @@ class Store:
             (repo, task, engine, self._now()),
         )
         return cur.lastrowid  # type: ignore[return-value]
+
+    def add_delegated_job(self, goal: str, engine: str, project: str = "", why: str = "", context: str = "",
+                          refs: str = "") -> int:
+        """A job from the delegate tool: in a project under ~/code, or in its own work folder."""
+        cur = self.conn.execute(
+            "INSERT INTO jobs(repo, task, engine, kind, why, context, refs, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (project or "work", goal, engine, "project" if project else "work", why, context, refs, self._now()),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def job_items(self, jid: int) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM job_items WHERE job_id = ? ORDER BY id", (jid,)).fetchall()
+
+    def add_job_item(self, jid: int, title: str) -> int:
+        cur = self.conn.execute("INSERT INTO job_items(job_id, title, updated_at) VALUES(?, ?, ?)",
+                                (jid, title.strip(), self._now()))
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def update_job_item(self, jid: int, item: int, status: str = "", evidence: str = "") -> bool:
+        cur = self.conn.execute(
+            "UPDATE job_items SET status = COALESCE(NULLIF(?, ''), status), "
+            "evidence = COALESCE(NULLIF(?, ''), evidence), updated_at = ? WHERE id = ? AND job_id = ?",
+            (status, evidence.strip(), self._now(), item, jid))
+        return cur.rowcount > 0
+
+    def job_for_token(self, token_hash: str) -> int | None:
+        """The running job this MCP token belongs to."""
+        row = self.conn.execute("SELECT id FROM jobs WHERE token_hash = ? AND status = 'running'",
+                                (token_hash,)).fetchone()
+        return row["id"] if row else None
+
+    def expired_work_dirs(self, before: datetime) -> list[sqlite3.Row]:
+        """Finished work jobs whose folder is still there and which ended before this time."""
+        return self.conn.execute(
+            "SELECT * FROM jobs WHERE kind = 'work' AND workdir IS NOT NULL AND status NOT IN ('queued', 'running') "
+            "AND COALESCE(updated_at, created_at) < ?", (tu.to_utc_iso(before),)).fetchall()
 
     def job(self, jid: int) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM jobs WHERE id = ?", (jid,)).fetchone()

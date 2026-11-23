@@ -388,3 +388,63 @@ def test_long_work_gets_notes_but_is_never_stopped_by_step_count():
         assert not ended and not any("Finish now" in n for n in notes)
 
     asyncio.run(go())
+
+
+def test_a_delegated_job_only_reaches_its_tools_and_its_report_goes_to_the_main_agent(cfg, tools, store):
+    from friday import delegate as dg
+    from friday.jobs import Outcome
+
+    assert tools.delegate("데이터마이닝 안 들은 강의 정리", why="금요일 과제").startswith("Delegated as job #1")
+    job = store.job(1)
+    assert job["kind"] == "work" and job["status"] == "queued"
+    assert tools._job_tools(1) == dg.WORKER_TOOLS and "add_task" not in dg.WORKER_TOOLS and "memory" not in dg.WORKER_TOOLS
+
+    ctx = SimpleNamespace(headers={tools.mcp_http.JOB_HEADER: "1"})
+    assert "1 " not in tools.ledger("read", ctx=None) and "belongs" in tools.ledger("read", ctx=None)
+    tools.ledger("add", "9주 1강\n10주 2강", ctx=ctx)
+    first = store.job_items(1)[0]["id"]
+    assert "1/2 done" in tools.ledger("update", item_id=first, status="done", evidence="진도 100%", ctx=ctx)
+
+    # A later job sees an earlier one only when it's named, and as data.
+    store.update_job(1, status="done", result="9주 1강 완료")
+    tools.delegate("10주 2강 이어서", related="#1")
+    assert "9주 1강 완료" in dg.worker_prompt(store, cfg, store.job(2), "now")
+    tools.delegate("다른 일")
+    assert "9주 1강 완료" not in dg.worker_prompt(store, cfg, store.job(3), "now")
+
+    bot = Friday(replace(cfg, allowed_user_ids=(1,)))
+    bot.store.add_delegated_job("자료 정리", "codex")
+    notes = []
+    bot._turn = lambda chat, text, lane=None, source="user": notes.append((text, source)) or asyncio.sleep(0)
+    asyncio.run(bot._worker_done(1, Outcome("done", "정리 끝: files/강의/요약.md")))
+    assert notes[0][1] == "note" and "정리 끝" in notes[0][0] and "not instructions" in notes[0][0]
+    bot.store.close()
+
+
+def test_a_worker_is_ended_for_making_no_progress_not_for_its_step_count(store):
+    from friday import delegate as dg
+
+    jid = store.add_delegated_job("긴 작업", "codex")
+    item = store.add_job_item(jid, "항목")
+    notes, stopped = [], []
+
+    async def nudge(text):
+        notes.append(text)
+
+    async def stop():
+        stopped.append(True)
+
+    async def go():
+        pace = dg.WorkerPace(store, jid, nudge, stop, asyncio.ensure_future)
+        for i in range(200):  # long, but the ledger keeps moving
+            pace.on_step(f"browser: click «item {i}»")
+            if i % 20 == 0:
+                store.update_job_item(jid, item, "doing", f"step {i}")
+        await asyncio.sleep(0)
+        assert not stopped
+        for i in range(dg.STALL_END):
+            pace.on_step(f"browser: click «other {i}»")
+        await asyncio.sleep(0)
+        assert stopped and any("without the ledger moving" in n for n in notes)
+
+    asyncio.run(go())

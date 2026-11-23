@@ -333,7 +333,7 @@ class CodexServer:
         finally:
             self._closed.pop(tid, None)
 
-    async def _open(self, thread_id: str | None, config: dict, model: str) -> str:
+    async def _open(self, thread_id: str | None, config: dict, model: str, cwd: Path | None = None) -> str:
         """The thread to run the turn in, loaded with this config."""
         if thread_id and thread_id in self._loaded:
             if self._loaded[thread_id] == config:
@@ -343,7 +343,7 @@ class CodexServer:
         # Idle threads are unloaded (they hold MCP connections); not ones with a turn running.
         for other in [t for t in self._loaded if t != thread_id and t not in self._turns]:
             await self._unload(other, wait=False)
-        params: dict = {"cwd": str(self.cfg.workspace), "config": config}
+        params: dict = {"cwd": str(cwd or self.cfg.workspace), "config": config}
         if model:
             params["model"] = model
         if thread_id:
@@ -372,23 +372,28 @@ class CodexServer:
         on_note: Callable[[str], None] | None = None,
         on_step: Callable[[str, str], None] | None = None,
         key: str = "",
+        job_id: int | None = None,
+        workdir: Path | None = None,
+        timeout: float = 0,
     ) -> AgentResult:
         """One turn, like agent.run_codex. Turns on different threads run at the same time.
         on_note gets the agent's progress lines ("checking X") as they come; on_step(item id,
         step_label) each tool call it starts and on_step(item id, "") when it ends. key names the
-        turn for stop_turn. Raises CodexServerError when the server fails."""
+        turn for stop_turn. job_id, workdir, timeout: a delegated job's worker, which runs in its
+        own folder for longer than a chat turn. Raises CodexServerError when the server fails."""
         async with self._lock:
             try:
                 await self._ensure(tz or self.cfg.default_tz)
-                config = codex_overrides(self.cfg, toolsets=toolsets, chat=chat, http=mcp_endpoints(toolsets))
+                config = codex_overrides(self.cfg, toolsets=toolsets, chat=False if job_id else chat,
+                                         http=mcp_endpoints(toolsets), job_id=job_id, workdir=workdir)
                 model = model or self.cfg.codex_model
-                tid = await self._open(thread_id, config, model)
+                tid = await self._open(thread_id, config, model, workdir)
             except CodexServerError:
                 await self._recover(thread_id)
                 raise
         try:
             return await self._turn(tid, prompt, images or [], model, effort or self.cfg.codex_effort, on_note,
-                                    on_step, key)
+                                    on_step, key, timeout)
         except CodexServerError:
             async with self._lock:
                 await self._recover(tid)
@@ -437,7 +442,9 @@ class CodexServer:
 
     async def _turn(self, tid: str, prompt: str, images: list[Path], model: str, effort: str,
                     on_note: Callable[[str], None] | None = None,
-                    on_step: Callable[[str, str], None] | None = None, key: str = "") -> AgentResult:
+                    on_step: Callable[[str, str], None] | None = None, key: str = "",
+                    timeout: float = 0) -> AgentResult:
+        limit = timeout or self.cfg.codex_timeout_seconds
         q: asyncio.Queue = asyncio.Queue()
         self._turns[tid] = q
         if key:
@@ -456,13 +463,13 @@ class CodexServer:
                 params["effort"] = effort
             turn_id = (await self._request("turn/start", params)).get("turn", {}).get("id", "")
             self._turn_ids[tid] = turn_id
-            deadline = time.monotonic() + self.cfg.codex_timeout_seconds
+            deadline = time.monotonic() + limit
             while True:
                 try:
                     msg = await asyncio.wait_for(q.get(), max(0.0, deadline - time.monotonic()))
                 except TimeoutError:
                     await self._interrupt(tid, turn_id, q)
-                    return AgentResult("", tid, [f"Codex took longer than {self.cfg.codex_timeout_seconds}s and was stopped."],
+                    return AgentResult("", tid, [f"Codex took longer than {limit:.0f}s and was stopped."],
                                        servers, tokens, calls)
                 if isinstance(msg, CodexServerError):
                     raise CodexServerError(str(msg), partial)

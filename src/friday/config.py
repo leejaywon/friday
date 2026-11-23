@@ -230,3 +230,7 @@ def ensure_dirs(cfg: Config) -> None:
     for d in (cfg.data_dir, cfg.workspace, cfg.files_dir / "inbox"):
         d.mkdir(parents=True, exist_ok=True)
     cfg.vault_dir.mkdir(mode=0o700, exist_ok=True)  # exists early, so the sandboxes can hide it
+    # Likewise. A sandbox hiding a path that doesn't exist yet leaves an empty file in its place.
+    if cfg.claude_mcp_dir.is_file() and not cfg.claude_mcp_dir.stat().st_size:
+        cfg.claude_mcp_dir.unlink()
+    cfg.claude_mcp_dir.mkdir(mode=0o700, exist_ok=True)

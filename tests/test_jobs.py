@@ -228,10 +228,10 @@ def test_local_folder_without_git(cfg, store, git_isolated, fake_agent):
 
 # --- MCP tool --------------------------------------------------------------------
 
-def test_start_coding_job(tools, store, repo):
-    assert tools.start_coding_job("proj", "README 오타 고쳐줘").startswith("Queued coding job #1 on proj (claude)")
+def test_delegate_to_a_project(tools, store, repo):
+    assert tools.delegate("README 오타 고쳐줘", project="proj").startswith("Delegated as job #1 (claude)")
     j = store.next_queued_job()
     assert (j["repo"], j["engine"], j["task"]) == ("proj", "claude", "README 오타 고쳐줘")
-    assert "Refused" in tools.start_coding_job("proj", "use password: hunter22 to log in")
-    assert "isn't a repo name" in tools.start_coding_job("..", "x")
+    assert "Refused" in tools.delegate("use password: hunter22 to log in", project="proj")
+    assert "isn't a project name" in tools.delegate("x", project="..")
     assert len(store.recent_jobs()) == 1
