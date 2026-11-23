@@ -91,10 +91,10 @@ WATCH_SHOT, WATCH_ADVISE, WATCH_STOP, WATCH_END = 10.0, 20.0, 30.0, 50.0
 WAITS = ("sleep", "wait", "friday:", "browser: evaluate", "browser: wait for")
 # Steps that only look: succeeding at them isn't progress.
 LOOKS = ("snapshot", "screenshot", "tabs", "console", "«status»", "network")
-# Pacing (TurnStatus._pace), for work that succeeds step by step without converging. Set from 228
-# real turns: steps per turn are 1 at the median, 13 at p95, 34 at p99 (the worst, 144, was a loop
-# of snapshot and press_key). Steps that wait on purpose don't count.
-CHECK_EVERY, WRAP_UP_STEPS, END_STEPS = 15, 45, 65
+# Pacing (TurnStatus._pace), for work that succeeds step by step without converging: notes to the
+# agent, never a stop. A step count can't tell a long task from a loop. 15 is just above p95 of 228
+# real turns (median 1, p99 34). Steps that wait on purpose don't count.
+CHECK_EVERY = 15
 WRAP_UP_TIME = 0.75  # of the turn's time limit, from its first step
 REPEAT_AFTER = 5  # the same action on the same target
 CHECK_NOTE = ("[Friday] {n} steps so far on this request. Take stock before the next one: what you have "
@@ -346,7 +346,7 @@ class TurnStatus:
         # Pacing (_pace): steps that count, from when, how often each action on a target came.
         self.time_limit, self.work, self.first_step = time_limit, 0, None
         self.repeats: Counter[str] = Counter()
-        self.wrapped, self.ended = False, False
+        self.wrapped = False
         # The watchdog (_watch): nudge(text, images) adds a note to the running turn, advise(facts)
         # -> a small model's advice, give_up(facts) stops the turn and explains, shoot() -> a
         # screenshot of the page (a Path) or None.
@@ -400,8 +400,7 @@ class TurnStatus:
             self.trouble_since, self.stage = None, 0  # it got somewhere
 
     def _pace(self, label: str, now: float) -> None:
-        """Work that goes on without converging: take stock, then finish, then Friday ends it. The
-        limits are notes to the agent first, so a long task that is getting somewhere can say so."""
+        """Work that may not be converging: a note to take stock, and one about repeating itself."""
         if not self.nudge or label.startswith(WAITS):
             return
         self.first_step = self.first_step or now
@@ -411,12 +410,7 @@ class TurnStatus:
             if self.repeats[label] == REPEAT_AFTER:
                 what = label.replace("«", "").replace("»", "")
                 self._spawn(self.nudge(REPEAT_NOTE.format(what=what, n=REPEAT_AFTER), []))
-        if self.work >= END_STEPS and self.give_up and not self.ended:
-            self.ended = True
-            self._spawn(self.give_up(self._facts()))
-        elif self.work >= WRAP_UP_STEPS:
-            self._wrap_up(now)
-        elif self.work % CHECK_EVERY == 0:
+        if self.work % CHECK_EVERY == 0 and not self.wrapped:
             self._spawn(self.nudge(CHECK_NOTE.format(n=self.work), []))
 
     def _wrap_up(self, now: float) -> None:
@@ -434,7 +428,7 @@ class TurnStatus:
 
     async def _watch(self, now: float) -> None:
         """Steps fail or hang with nothing succeeding after: see, rethink, stop, explain (WATCH_*)."""
-        if not self.nudge or self.ended:
+        if not self.nudge:
             return
         if self.time_limit and self.first_step and now - self.first_step >= WRAP_UP_TIME * self.time_limit:
             self._wrap_up(now)

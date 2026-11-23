@@ -362,8 +362,8 @@ def test_chats_from_before_the_log_are_imported_as_conversations(tmp_path, store
     assert len(store.all_messages()) == 6  # the log's own message stays; nothing twice
 
 
-def test_work_that_does_not_converge_is_paced_then_ended():
-    from friday.bot import END_STEPS, REPEAT_AFTER, WRAP_UP_STEPS, TurnStatus
+def test_long_work_gets_notes_but_is_never_stopped_by_step_count():
+    from friday.bot import CHECK_EVERY, REPEAT_AFTER, TurnStatus
 
     async def go():
         notes, ended = [], []
@@ -376,16 +376,15 @@ def test_work_that_does_not_converge_is_paced_then_ended():
 
         idle = lambda *a: asyncio.sleep(0)
         st = TurnStatus(idle, idle, idle, nudge=nudge, give_up=give_up, tick=60)
-        for i in range(END_STEPS + 5):  # every step succeeds: the failure watchdog sees nothing wrong
+        steps = CHECK_EVERY * 10
+        for i in range(steps):  # every step succeeds: the failure watchdog sees nothing wrong
             label = "browser: press key «PageDown»" if i % 2 else "browser: snapshot"
             st.on_step(str(i), label)
             st.on_step(str(i), "")
         await asyncio.sleep(0)
         await st.finish()
-        repeats = [n for n in notes if f"{REPEAT_AFTER} times" in n and "press key PageDown" in n]
-        assert len(repeats) == 1
-        assert sum("Take stock" in n for n in notes) == (WRAP_UP_STEPS - 1) // 15
-        assert sum("Finish now" in n for n in notes) == 1
-        assert len(ended) == 1
+        assert sum(f"{REPEAT_AFTER} times" in n and "press key PageDown" in n for n in notes) == 1
+        assert sum("Take stock" in n for n in notes) == 10
+        assert not ended and not any("Finish now" in n for n in notes)
 
     asyncio.run(go())
