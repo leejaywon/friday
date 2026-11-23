@@ -610,7 +610,7 @@ def delete_contact(contact_id: int) -> str:
 
 @server.tool()
 def delegate(goal: str, why: str = "", context: str = "", project: str = "", related: str = "",
-             continue_job: int = 0, engine: str = "") -> str:
+             continue_job: int = 0, engine: str = "", browser: bool = False) -> str:
     """Hand heavy work to a worker agent that runs in the background and reports back to you.
 
     Delegate what needs the browser or a login, playing or recording something, downloading or
@@ -627,6 +627,8 @@ def delegate(goal: str, why: str = "", context: str = "", project: str = "", rel
     continue_job: go on with that job (its worker, ledger and open page) with `goal` as the new
         instruction; if it's still running, the instruction reaches it right away.
     engine: 'claude' or 'codex', only when the user names one.
+    browser: true when the job will use a website's login or interface, so the worker has the
+        browser from the start. Leave it out otherwise (it can still ask for it later).
 
     After calling it, tell the owner in one short line what you handed off and end your turn. You
     are continued with the result when the worker finishes.
@@ -648,15 +650,15 @@ def delegate(goal: str, why: str = "", context: str = "", project: str = "", rel
             return f"Passed to job #{continue_job}, which is still {job['status']}."
         if job["status"] not in ("review", "done", "failed", "cancelled"):
             return f"Job #{continue_job} is {job['status']} and can't be continued: start a new one."
-        store.update_job(continue_job, followup=goal, status="queued")
+        store.update_job(continue_job, followup=goal, status="queued", **({"browser": 1} if browser else {}))
         return f"Job #{continue_job} goes on with this. Tell the owner in one short line and end your turn."
     project = project.strip()
     if project and not REPO_ARG.match(project):
         return f"Not delegated: '{project}' isn't a project name. Use a folder name in ~/code or owner/name."
     engine = engine or (cfg.code_engine if project else cfg.chat_engine)
-    jid = store.add_delegated_job(goal, engine, project, why, context, dg.parse_refs(related))
-    return (f"Delegated as job #{jid} ({engine}). Tell the owner in one short line what you handed off and "
-            "end your turn; you're continued with the result.")
+    jid = store.add_delegated_job(goal, engine, project, why, context, dg.parse_refs(related), browser)
+    return (f"Delegated as job #{jid} ({engine}). Tell the owner in one short line what you handed off (not its "
+            "number) and end your turn; you're continued with the result.")
 
 
 @server.tool()

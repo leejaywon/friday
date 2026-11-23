@@ -232,6 +232,16 @@ class CodexServer:
             self._broken_until = time.monotonic() + RETRY_START_AFTER
             raise
 
+    async def warm(self, tz: str) -> None:
+        """Start the server before the first message needs it. If it can't start, nothing is held
+        against it: the first turn tries again (_ensure) and falls back to `codex exec`."""
+        try:
+            async with self._lock:
+                if not self.running:
+                    await self._start(tz)
+        except Exception as e:
+            log.warning("codex app-server didn't warm up: %s", e)
+
     # --- JSON-RPC -----------------------------------------------------------------
 
     def _send(self, obj: dict) -> None:

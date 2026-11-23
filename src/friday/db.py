@@ -195,7 +195,7 @@ CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, id
 
 JOB_FIELDS = (
     "status", "followup", "branch", "base", "worktree", "gh_repo", "session_id",
-    "pr_number", "pr_url", "commits", "summary", "error", "workdir", "result", "token_hash",
+    "pr_number", "pr_url", "commits", "summary", "error", "workdir", "result", "token_hash", "browser",
 )
 
 # Columns added after the first release: (table, column, definition).
@@ -217,6 +217,7 @@ MIGRATIONS = [
     ("jobs", "workdir", "TEXT"),
     ("jobs", "result", "TEXT"),  # what the worker reported, in full
     ("jobs", "token_hash", "TEXT"),  # a project job's own MCP token while it runs
+    ("jobs", "browser", "INTEGER NOT NULL DEFAULT 0"),  # its worker has the browser from its first turn
 ]
 
 # Korean particles stripped from search words, longest first ("엄마한테" -> "엄마").
@@ -742,11 +743,13 @@ class Store:
         return cur.lastrowid  # type: ignore[return-value]
 
     def add_delegated_job(self, goal: str, engine: str, project: str = "", why: str = "", context: str = "",
-                          refs: str = "") -> int:
+                          refs: str = "", browser: bool = False) -> int:
         """A job from the delegate tool: in a project under ~/code, or in its own work folder."""
         cur = self.conn.execute(
-            "INSERT INTO jobs(repo, task, engine, kind, why, context, refs, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-            (project or "work", goal, engine, "project" if project else "work", why, context, refs, self._now()),
+            "INSERT INTO jobs(repo, task, engine, kind, why, context, refs, browser, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (project or "work", goal, engine, "project" if project else "work", why, context, refs,
+             int(browser and not project), self._now()),
         )
         return cur.lastrowid  # type: ignore[return-value]
 

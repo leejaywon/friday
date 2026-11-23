@@ -61,6 +61,22 @@ def test_turn_result_errors_and_timeout(server, tmp_path):
     assert start["input"][0] == {"type": "localImage", "path": str(img)}
 
 
+def test_warming_up_starts_the_server_and_a_failure_is_not_held_against_it(server):
+    async def go():
+        good = server.cfg.codex_bin
+        server.cfg = replace(server.cfg, codex_bin="/nonexistent/codex")
+        await server.warm("Asia/Seoul")  # doesn't raise
+        assert not server.running
+        server.cfg = replace(server.cfg, codex_bin=good)
+        await server.warm("Asia/Seoul")
+        assert server.running
+        pid = server.proc.pid
+        assert (await server.run("hi", tz="Asia/Seoul")).ok and server.proc.pid == pid  # the first turn uses it
+        await server.close()
+
+    asyncio.run(go())
+
+
 def test_crash_restarts_and_the_bot_falls_back_to_exec(server, cfg, monkeypatch):
     friday = botmod.Friday(cfg)
     friday.codex = server

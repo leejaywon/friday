@@ -467,3 +467,44 @@ def test_a_job_interrupted_during_an_approved_step_stops_and_asks(cfg):
     assert bot.store.job(safe)["status"] == "queued"  # reading just goes on
     assert bot.store.job(risky)["status"] == "failed" and any(j == risky and "과제 제출 버튼" in t for j, t in sent)
     bot.store.close()
+
+
+def test_a_job_that_needs_the_browser_has_it_from_its_first_turn(cfg, monkeypatch):
+    from friday import bot as botmod
+
+    bot = Friday(replace(cfg, allowed_user_ids=(1,), codex_server=False, browser_enabled=True))
+    turns = []
+
+    async def turn(cfg, text, thread=None, images=(), **kw):
+        turns.append(set(kw["toolsets"]))
+        return botmod.AgentResult("report", "t1")
+
+    monkeypatch.setattr(botmod, "run_turn", turn)
+    monkeypatch.setattr(botmod.mcp_http, "listening", lambda port: False)
+    needs, plain = (bot.store.add_delegated_job("일", "codex", browser=b) for b in (True, False))
+    for jid in (needs, plain):
+        asyncio.run(bot._run_worker(bot.store.job(jid), lambda step: None))
+    assert turns == [{"browser"}, set()] and not bot.browser_lock.locked()
+    bot.store.close()
+
+
+def test_pdf_reader_prints_text_and_saves_a_page_without_text_as_an_image(tmp_path):
+    import pypdfium2 as pdfium
+
+    from friday import pdf
+
+    text = b"BT /F1 18 Tf 40 700 Td (Assignment code QX-4471 is due Friday) Tj ET"
+    objs = [b"<</Type/Catalog/Pages 2 0 R>>", b"<</Type/Pages/Kids[3 0 R 5 0 R]/Count 2>>",
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
+            b"/Resources<</Font<</F1<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>>>>>>>",
+            b"<</Length %d>>stream\n%s\nendstream" % (len(text), text),
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>"]
+    body = b"%PDF-1.4\n" + b"".join(b"%d 0 obj\n%s\nendobj\n" % (i + 1, o) for i, o in enumerate(objs))
+    file = tmp_path / "notes.pdf"
+    file.write_bytes(body + b"trailer<</Root 1 0 R/Size 6>>\n%%EOF\n")
+
+    out = pdf.read(file, out_dir=tmp_path / "pages")
+    assert "2 pages" in out and "QX-4471" in out and "no text layer" in out
+    assert (tmp_path / "pages" / "notes-p2.png").stat().st_size > 0
+    assert "QX-4471" not in pdf.read(file, "2", tmp_path / "pages")
+    assert len(pdfium.PdfDocument(file)) == 2

@@ -696,9 +696,10 @@ class Friday(WatchBot):
         for loop in (self.reminder_loop, self.outbox_loop, self.brief_loop, self.heartbeat_loop, self.wake_loop,
                      self.job_loop, self.browser_run_loop, self.watch_loop, self.browser_care_loop):
             self._tasks.append(asyncio.create_task(self._forever(loop), name=loop.__name__))
-        task = asyncio.create_task(self._import_history())
-        self._bg.add(task)
-        task.add_done_callback(self._bg.discard)
+        for coro in (self._import_history(), *([self.codex.warm(self.tz)] if self.codex else [])):
+            task = asyncio.create_task(coro)
+            self._bg.add(task)
+            task.add_done_callback(self._bg.discard)
         log.info("Friday started; tz=%s, allowed=%s", self.tz, self.cfg.allowed_user_ids)
 
     async def _on_stop(self, app: Application) -> None:
@@ -1768,7 +1769,8 @@ class Friday(WatchBot):
             f"Upcoming reminders: {len(self.store.active_reminders())}",
             f"Conversation: {'ongoing' if self.store.get('thread_id') else 'fresh'}",
             f"Coding jobs: {self.cfg.code_engine} by default, "
-            + (", ".join(f"#{j}" for j in self._running_jobs()) + " running" if self._running_jobs() else "idle"),
+            + (", ".join(f"«{self._job_label(self.store.job(j))}»" for j in self._running_jobs()) + " running"
+               if self._running_jobs() else "idle"),
         ]
         await update.message.reply_text("\n".join(lines))
 
@@ -1788,7 +1790,7 @@ class Friday(WatchBot):
         jid = self.store.add_job(repo, task, engine)
         busy = self._running_jobs()
         note = f" Starts when one of {len(busy)} running jobs is done." if len(busy) >= self.cfg.coding_jobs else ""
-        msg = await update.message.reply_text(f"🛠 Job #{jid} queued: {repo} ({engine})…{note}")
+        msg = await update.message.reply_text(f"🛠 Queued: {repo} ({engine}), {short(task, 60)}…{note}")
         self.store.link_job_message(msg.message_id, jid)
         self.store.set(f"job_queued_msg:{jid}", str(msg.message_id))  # _run_job edits it into "started"
 
@@ -1806,7 +1808,7 @@ class Friday(WatchBot):
         if not arg:  # plain /stop: the running job, if there's one
             running = self._running_jobs()
             if len(running) > 1:
-                await update.message.reply_text("Jobs running: " + ", ".join(f"#{j}" for j in running)
+                await update.message.reply_text("Jobs running: " + ", ".join(f"#{j} {self._job_label(self.store.job(j))}" for j in running)
                                                 + ". Which one? /stop <id>")
                 return
             jid = running[0] if running else None
@@ -1816,31 +1818,31 @@ class Friday(WatchBot):
             return
         if job["status"] == "queued":
             self.store.update_job(jid, status="cancelled", followup=None)
-            await update.message.reply_text(f"⏹ Cancelled job #{jid} before it started.")
+            await update.message.reply_text(f"⏹ Cancelled «{self._job_label(job)}» before it started.")
         elif job["status"] == "running" and jid in self._job_execs:
             # _run_job sees the cancellation, kills the agent's processes and reports it.
             self._job_execs[jid].cancel()
         elif job["status"] == "running":  # not ours to cancel (shouldn't happen); don't leave it stuck
             self.store.update_job(jid, status="cancelled")
-            await update.message.reply_text(f"⏹ Marked job #{jid} as cancelled.")
+            await update.message.reply_text(f"⏹ Marked «{self._job_label(job)}» as cancelled.")
         else:
-            await update.message.reply_text(f"Job #{jid} isn't running (status: {job['status']}).")
+            await update.message.reply_text(f"«{self._job_label(job)}» isn't running (status: {job['status']}).")
 
     async def _job_followup(self, msg, job) -> None:
-        jid, status = job["id"], job["status"]
+        jid, status, name = job["id"], job["status"], self._job_label(job)
         if status == "running" and job["kind"] == "work" and self.codex \
                 and await self.codex.steer(f"job{jid}", f"[The owner adds: {msg.text}]"):
-            await msg.reply_text(f"↪️ Passed to job #{jid}.")
+            await msg.reply_text(f"↪️ Passed to «{name}».")
         elif status in ("queued", "running"):
-            await msg.reply_text(f"Job #{jid} is still {status}. Reply again when it's done, or /stop {jid}")
+            await msg.reply_text(f"«{name}» is still {status}. Reply again when it's done, or stop it (/jobs has its number).")
         elif status in ("review", "done", "failed"):
             self.store.update_job(jid, followup=msg.text, status="queued")
-            sent = await msg.reply_text(f"↩️ Job #{jid}: follow-up queued")
+            sent = await msg.reply_text(f"↩️ «{name}»: follow-up queued")
             self.store.link_job_message(sent.message_id, jid)
             self.store.set(f"job_queued_msg:{jid}", str(sent.message_id))
         else:
-            await msg.reply_text(f"Job #{jid} is {status}. For a new one, just ask me."
-                                 if job["kind"] == "work" else f"Job #{jid} is {status}. For a new job: /code {job['repo']} <task>")
+            await msg.reply_text(f"«{name}» is {status}. For a new one, just ask me."
+                                 if job["kind"] == "work" else f"«{name}» is {status}. For a new job: /code {job['repo']} <task>")
 
     async def on_job_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -1853,12 +1855,13 @@ class Friday(WatchBot):
         if not job:
             await q.answer("No such job")
             return
+        name = self._job_label(job)
         if action == "stop":
             if jid in self._job_execs:
                 await q.answer("Stopping…")
                 self._job_execs[jid].cancel()  # _run_job reports it
             else:
-                await q.answer(f"Job #{jid} isn't running.")
+                await q.answer(f"«{name}» isn't running.")
                 await self._quiet(q.edit_message_reply_markup(None))
             return
         if jid in self._job_busy:
@@ -1871,17 +1874,17 @@ class Friday(WatchBot):
                 return
             if action == "undo":
                 if job["status"] != "done" or not job["commits"]:
-                    await q.answer(f"Job #{jid} has nothing to undo.")
+                    await q.answer(f"«{name}» has nothing to undo.")
                     return
                 await q.answer("Undoing…")
                 await self._quiet(q.edit_message_reply_markup(None))
                 await self.runner.undo(job)
                 self.store.update_job(jid, status="undone")
-                await self._job_send(jid, f"↩️ Job #{jid} undone: reverted its changes to {job['repo']} with new commits "
+                await self._job_send(jid, f"↩️ «{name}» undone: reverted its changes to {job['repo']} with new commits "
                                           "(both stay in the history).")
                 return
             if job["status"] != "review":
-                await q.answer(f"Job #{jid} is {job['status']}.")
+                await q.answer(f"«{name}» is {job['status']}.")
                 await self._quiet(q.edit_message_reply_markup(None))
                 return
             # Answer now: merging can take longer than Telegram waits for a callback answer.
@@ -1895,17 +1898,17 @@ class Friday(WatchBot):
                     InlineKeyboardButton("🚀 Deploy", callback_data=f"job:deploy:{jid}"),
                 ]]) if own else None
                 hint = "\nDeploying restarts Friday on this version." if own else ""
-                await self._job_send(jid, f"🔀 #{jid} merged: {job['pr_url']}{hint}", buttons)
+                await self._job_send(jid, f"🔀 «{name}» merged: {job['pr_url']}{hint}", buttons)
             else:
                 await self.runner.close(job)
                 self.store.update_job(jid, status="closed")
-                await self._job_send(jid, f"🗑 #{jid} closed: closed the pull request and deleted the branch.")
+                await self._job_send(jid, f"🗑 «{name}» closed: closed the pull request and deleted the branch.")
         except Exception as e:
             if not isinstance(e, JobError):
                 log.exception("job button %s failed", q.data)
             detail = str(e) if isinstance(e, JobError) else f"{type(e).__name__}: {e}"
             await self._quiet(q.answer("Failed"))  # no-op if already answered
-            await self._job_send(jid, f"❌ #{jid} {action} failed: {detail}")
+            await self._job_send(jid, f"❌ «{name}» {action} failed: {detail}")
         finally:
             self._job_busy.discard(jid)
 
@@ -1916,8 +1919,8 @@ class Friday(WatchBot):
             return
         running = [j for j in self._running_jobs() if j != job["id"]]
         if running:  # the restart would interrupt them (they start again afterwards, from where they were)
-            await q.answer(f"Job {', '.join(f'#{j}' for j in running)} is running. Deploy after it finishes, "
-                           "or /stop it.", show_alert=True)
+            names = ", ".join(f"«{self._job_label(self.store.job(j))}»" for j in running)
+            await q.answer(f"{names[:120]} still running. Deploy after it finishes, or /stop it.", show_alert=True)
             return
         await q.answer("Deploying…")
         unit = f"friday-deploy-{datetime.now():%Y%m%d-%H%M%S}"
@@ -1934,7 +1937,7 @@ class Friday(WatchBot):
         if code != 0:
             self.store.delete("deploy_notify")
             raise JobError(f"couldn't start the deploy: {(err or out).strip()[-300:]}")
-        text = (q.message.text if q.message and q.message.text else f"🔀 Merged #{jid}")
+        text = (q.message.text if q.message and q.message.text else f"🔀 Merged «{self._job_label(job)}»")
         await self._quiet(q.edit_message_text(
             f"{text}\n\n🚀 Deploying… I'll tell you when I'm back. If you hear nothing: journalctl --user -u {unit}"
         ))
@@ -1968,25 +1971,26 @@ class Friday(WatchBot):
             if risky := self.store.get(dg.risky_key(jid)):  # it may or may not have gone through
                 self.store.delete(dg.risky_key(jid))
                 self.store.update_job(jid, status="failed", error="Friday restarted during a step the owner approved.")
-                await self._job_send(jid, f"⚠️ Friday restarted while job #{jid} was doing a step you approved: "
+                await self._job_send(jid, f"⚠️ Friday restarted while «{self._job_label(job)}» was doing a step you approved: "
                                           f"«{risky}». It may or may not have gone through, so I stopped instead of "
                                           "risking doing it twice. Check it, then reply here to continue.")
                 continue
             tries = int(self.store.get(f"job_resumes:{jid}") or 0)
             if tries >= MAX_RESUMES:
                 self.store.update_job(jid, status="failed", error="Friday restarted while this job was running.")
-                await self._job_send(jid, f"⚠️ Friday restarted, so job #{jid} ({self._job_label(job)}) stopped.\n"
+                await self._job_send(jid, f"⚠️ Friday restarted, so «{self._job_label(job)}» stopped.\n"
                                           "To try again, reply to this message with instructions.")
                 continue
             self.store.set(f"job_resumes:{jid}", str(tries + 1))
             self.store.update_job(jid, status="queued", followup=RESUME_NOTE if job["session_id"] else None)
-            await self._job_send(jid, f"🔁 Friday restarted while job #{jid} ({self._job_label(job)}) was running; "
+            await self._job_send(jid, f"🔁 Friday restarted while «{self._job_label(job)}» was running; "
                                       "it starts again where it was.")
 
     @staticmethod
     def _job_label(job) -> str:
-        """What a job is, in a message: its repo, or what it's doing when it has none."""
-        return short(job["task"], 40) if job["kind"] == "work" else job["repo"]
+        """What the owner knows a job by: what it's doing, and its repo if it has one. Its number
+        is only for /jobs and /stop."""
+        return short(job["task"], 40) if job["kind"] == "work" else f"{job['repo']}: {short(job['task'], 30)}"
 
     async def _job_send(self, jid: int, text: str, markup: InlineKeyboardMarkup | None = None) -> int | None:
         """Message the owner about a job and remember the message ids, so a reply to any of them
@@ -2028,9 +2032,9 @@ class Friday(WatchBot):
         """Run one job and report it. Never raises (except when Friday shuts down), so the loop goes on."""
         jid = job["id"]
         work = job["kind"] == "work"
-        head = f"#{jid} ({job['engine']})" if work else f"#{jid} {job['repo']} ({job['engine']})"
+        head = self._job_label(job)
         what = f"follow-up: {short(job['followup'], 200)}" if job["followup"] else short(job["task"], 200)
-        started = f"🛠 Job {head} started: {what}"
+        started = f"🛠 Started: {what}" if work else f"🛠 {job['repo']} ({job['engine']}) started: {what}"
         queued = self.store.get(f"job_queued_msg:{jid}")  # the /code or follow-up message: edit it
         self.store.delete(f"job_queued_msg:{jid}")
         stop = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"job:stop:{jid}")]])
@@ -2077,7 +2081,7 @@ class Friday(WatchBot):
             self.store.update_job(jid, status=outcome.status, error=outcome.message if failed else None)
             buttons = None
             if outcome.status == "review":
-                text = f"✅ Job {head} ready for review:\n\n{outcome.message}"
+                text = f"✅ {head}: ready for review\n\n{outcome.message}"
                 buttons = InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔀 Merge", callback_data=f"job:merge:{jid}"),
                     InlineKeyboardButton("🗑 Close", callback_data=f"job:close:{jid}"),
@@ -2085,11 +2089,11 @@ class Friday(WatchBot):
             elif failed:
                 row = self.store.job(jid)
                 summary = row["summary"] if row else None
-                text = f"❌ Job {head} failed: {outcome.message}"
+                text = f"❌ {head}: failed: {outcome.message}"
                 if summary and summary not in outcome.message:
                     text += f"\n\nThe agent said:\n{summary}"
             else:
-                text = f"✅ Job {head} done:\n\n{outcome.message}"
+                text = f"✅ {head}: done\n\n{outcome.message}"
                 if outcome.undo:  # a local project changed in place: offer to revert the job's commits
                     buttons = InlineKeyboardMarkup([[
                         InlineKeyboardButton("↩️ Undo", callback_data=f"job:undo:{jid}"),
@@ -2100,9 +2104,10 @@ class Friday(WatchBot):
             log.exception("reporting job %s failed", jid)
 
     async def _run_worker(self, job, on_step: Callable[[str], None]) -> Outcome:
-        """A delegated job without a project (delegate.py): an agent in its own folder and thread,
-        with the browser attached when it asks. It can run for as long as jobs may, as long as it
-        isn't going in circles (WorkerPace)."""
+        """A delegated job without a project (delegate.py): an agent in its own folder and thread.
+        The browser is attached from the first turn when the job says it needs it (or used it
+        before), and otherwise when the worker asks. It can run for as long as jobs may, as long
+        as it isn't going in circles (WorkerPace)."""
         jid, key = job["id"], f"job{job['id']}"
         workdir = dg.work_dir(self.cfg, jid)
         prompt = dg.worker_prompt(self.store, self.cfg, job, dg.now_str(self.tz))
@@ -2154,7 +2159,19 @@ class Friday(WatchBot):
                                   text, thread, [], **kw)
 
         thread, has_browser = job["session_id"], False
+
+        async def attach_browser() -> None:
+            nonlocal has_browser
+            if self.browser_lock.locked():
+                on_step("waiting for the browser")
+            await self.browser_lock.acquire()
+            has_browser, self._browser_topic = True, self._job_label(job)
+            if not self.doctor.fresh() and mcp_http.listening(browser.CDP_PORT):
+                await self.doctor.ensure("lock")  # a stuck Chrome is restarted before the worker starts on it
+
         try:
+            if job["browser"] and self.cfg.browser_enabled:
+                await attach_browser()
             for _ in range(MAX_CONTINUATIONS + 1):
                 result = await turn(prompt, thread, {"browser"} if has_browser else set())
                 thread = result.thread_id or thread
@@ -2163,10 +2180,8 @@ class Friday(WatchBot):
                 if pace.ended or has_browser or "browser" not in self._toolsets(key):
                     break
                 self._drop_browser_request(key)
-                await self.browser_lock.acquire()
-                has_browser, self._browser_topic = True, f"job #{jid}: {short(job['task'], 80)}"
-                if not self.doctor.fresh() and mcp_http.listening(browser.CDP_PORT):
-                    await self.doctor.ensure("lock")  # a stuck Chrome is restarted before the worker starts on it
+                self.store.update_job(jid, browser=1)  # a follow-up goes on with its page
+                await attach_browser()
                 prompt = "[The browser tools are now attached; go on with the job.]"
             if pace.ended:
                 result = await turn("[Friday stopped this job: it kept going in circles. Without using any tools, "
@@ -2208,7 +2223,7 @@ class Friday(WatchBot):
             self.store.update_job(jid, followup=f"{job['followup']}\n{text}" if job["followup"] else text)
         elif not (job["status"] == "running" and job["kind"] == "work" and self.codex
                   and await self.codex.steer(f"job{jid}", f"[The owner adds: {text}]")):
-            await self._job_send(jid, f"⚠️ Couldn't pass this to job #{jid} while it runs: {short(text, 300)}\n"
+            await self._job_send(jid, f"⚠️ Couldn't pass this to «{self._job_label(job)}» while it runs: {short(text, 300)}\n"
                                       "Reply to this message once it's done.")
 
     async def _job_status(self, mid: int | None, started: str, stop, steps: list[str], t0: float) -> None:
@@ -2241,7 +2256,7 @@ class Friday(WatchBot):
             job = self.store.job(jid)
             await self.runner.cleanup(job)  # cancelled jobs can't be resumed, so drop the worktree
             note = f"\nThe pull request is still open: {job['pr_url']}" if job["pr_number"] else ""
-            await self._job_send(jid, f"⏹ Job {head} stopped.{note}")
+            await self._job_send(jid, f"⏹ {head}: stopped.{note}")
         except Exception:
             log.exception("cleaning up stopped job %s failed", jid)
 
@@ -2684,7 +2699,7 @@ class Friday(WatchBot):
         def task(due: datetime | None, remind: str | None = None, extra: str = "") -> str:
             nudge = tu.from_iso(remind) if remind and remind != "none" else None
             t = self.store.add_task(title, due, nudge, notes)
-            return f"📝 #{t.id} {title}" + (f" (due {self._short_time(due)})" if due else "") + extra
+            return f"📝 {title}" + (f" (due {self._short_time(due)})" if due else "") + extra
 
         if item["kind"] == "task":
             return task(tu.from_iso(item["due"]) if item.get("due") else None, item.get("remind"))
@@ -2693,7 +2708,7 @@ class Friday(WatchBot):
             if not item.get("repeat") and when < now:
                 return f"⏭ {title}: skipped, the time has passed"
             r = self.store.add_reminder(title, when, tz, item.get("repeat"))
-            return f"⏰ Reminder #{r.id} {title} ({self._short_time(r.next_at)})"
+            return f"⏰ {title} ({self._short_time(r.next_at)})"
         start, end = tu.from_iso(item["start"]), tu.from_iso(item["end"])
         if not gcal.is_connected(self.cfg.google_token):
             return task(start, extra=" (added as a task: the calendar isn't connected)")
@@ -3053,7 +3068,7 @@ class Friday(WatchBot):
         self.store.set("heartbeat_last", key)
         wakes = [f"  {tu.local_str(tu.from_iso(w['at']), self.tz)}: {w['note']}" for w in self.store.pending_wakes()]
         self._own_turn(HEARTBEAT_NOTE.format(
-            hours=f"{self.cfg.heartbeat_hours:g}", state=await self.brief(),
+            hours=f"{self.cfg.heartbeat_hours:g}", state=await self.brief(ids=True),
             wakes="\n".join(wakes) or "  none", first=HEARTBEAT_FIRST if first else ""))
         return 30
 
@@ -3070,7 +3085,9 @@ class Friday(WatchBot):
             await self.say(await self.brief())
         return 30
 
-    async def brief(self) -> str:
+    async def brief(self, ids: bool = False) -> str:
+        """The day at a glance. ids: for the agent, which needs them to act on a task."""
+        ref = (lambda t: f"#{t.id} ") if ids else (lambda t: "")
         zone = ZoneInfo(self.tz)
         local = datetime.now(zone)
         start = datetime.combine(local.date(), time(0), zone)
@@ -3091,9 +3108,9 @@ class Friday(WatchBot):
         due_today = [t for t in open_tasks if t.due_at and start <= t.due_at < end]
         if overdue:
             lines.append("\nOverdue:")
-            lines += [f"  #{t.id} {t.title} (due {t.due_at.astimezone(zone):%m/%d %H:%M})" for t in overdue]
+            lines += [f"  {ref(t)}{t.title} (due {t.due_at.astimezone(zone):%m/%d %H:%M})" for t in overdue]
         lines.append("\nDue today:")
-        lines += [f"  {t.due_at.astimezone(zone):%H:%M} #{t.id} {t.title}" + (" ⚠️" if t.due_at < now else "")
+        lines += [f"  {t.due_at.astimezone(zone):%H:%M} {ref(t)}{t.title}" + (" ⚠️" if t.due_at < now else "")
                   for t in due_today] or ["  none"]
         no_deadline = sum(1 for t in open_tasks if not t.due_at)
         if no_deadline:
