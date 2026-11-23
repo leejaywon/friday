@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from . import browser, browser_audio, contacts, gcal, mcp_http
+from . import browser, browser_audio, browser_care, contacts, gcal, mcp_http
 from . import timeutil as tu
 from . import watches as wt
 from . import workspace as wsfiles
@@ -896,6 +896,13 @@ def _vault_login(name: str):
     return (login, None) if login else (None, f"No saved login named '{name}'. list_logins shows them.")
 
 
+def _use_own_tabs(ctx: Context | None) -> None:
+    """Browser calls of this request look at the calling task's tabs (browser.own_tabs)."""
+    chat = _context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")
+    who = browser_care.owner(_run_id(ctx), _watch_id(ctx), chat)
+    browser.own_tabs.set(tuple(browser_care.tabs_of(store, who)))
+
+
 @server.tool()
 async def fill_login(name: str, ctx: Context | None = None) -> str:
     """Log in with a saved login: types its username and password into the login form open in the
@@ -903,6 +910,7 @@ async def fill_login(name: str, ctx: Context | None = None) -> str:
     each site on Telegram; after that it fills there without asking (logins of an approved
     scheduled run are already approved). You never see the password. Returns 'Filled and
     submitted…', 'Denied' or 'Wrong site: <host>'."""
+    _use_own_tabs(ctx)
     login, err = _vault_login(name)
     if err:
         return err
@@ -930,6 +938,7 @@ async def fill_login_field(name: str, field: str, ctx: Context | None = None) ->
     """Type one extra field of a saved login (e.g. a member ID or PIN, see list_logins) into the
     input that has focus on the open page: click the input first. Only on the login's own domains
     over https, with the same approval as fill_login. Doesn't submit. You never see the value."""
+    _use_own_tabs(ctx)
     login, err = _vault_login(name)
     if err:
         return err
@@ -1060,6 +1069,7 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
     """
     shot = cfg.files_dir / "browser" / f"approval-{tu.now_utc():%Y%m%d-%H%M%S}.png"
     try:
+        _use_own_tabs(ctx)
         url = await browser.screenshot(shot)
     except Exception:
         url = None

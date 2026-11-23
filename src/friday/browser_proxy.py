@@ -12,9 +12,14 @@ better than the agent would on its own.
 - browser_evaluate (page JavaScript) runs only after the owner approves the exact script on
   Telegram, since a script could read what fill_login typed. The other blocked tools stay hidden.
 
-Every forwarded call gets CALL_TIMEOUT seconds: past that the agent hears so and moves on. After a
-navigation the agent's tab is brought to the front: Chrome throttles background tabs, which made
-screenshots take seconds and can keep a video from loading at all.
+Every forwarded call gets CALL_TIMEOUT seconds: past that the agent hears so and moves on.
+
+Each task works in its own tab (browser_care leases). Playwright MCP 0.0.84 starts a session on the
+browser's first tab, doesn't switch to a popup, and when the current tab closes moves to its
+neighbour, which may be another task's. So the session is put on the task's tab before its first
+call and after any of that, and tabs the task opens join its lease. The tab is brought to the front
+before each call and after a navigation: Chrome throttles background tabs, which made clicks time
+out and screenshots take seconds, and can keep a video from loading at all.
 """
 
 from __future__ import annotations
@@ -24,21 +29,28 @@ import itertools
 import json
 import os
 import re
+import signal
 import sys
 import time
+import uuid
+from contextlib import suppress
 from typing import Any
 
 import httpx
 
+from . import browser_care as care
 from .browser import BLOCKED_TOOLS, CDP_URL
 
 CALL_TIMEOUT = 30.0  # a forwarded browser step that takes longer is reported as failed
 PLAY_VERDICT = 5.0  # seconds to decide whether playback really started
 APPROVAL_TIMEOUT = 300
+TAB_TIMEOUT = 20.0  # finding or opening the task's tab
+LEASE_TOUCH = 60  # seconds between notes that the task still uses its tabs
 CLICKS = {"browser_click", "browser_hover"}
-# After these the agent's tab may be another one: bring it to the front (Chrome.page).
+# A click may open a popup, which Chrome puts in front: the agent's tab goes back there.
 FRONT_AFTER = {"browser_navigate", "browser_navigate_back", "browser_tabs", "browser_click"}
 PROTOCOL = "2025-06-18"
+TAB_LINE = re.compile(r"^- (\d+):( \(current\))? \[.*\]\((\S*)\)(?: \[[^\]\n]*\])*$", re.M)
 
 MEDIA_TOOL = {
     "name": "browser_media",
@@ -199,6 +211,13 @@ class Upstream:
             return _result(f"No answer from the browser in {timeout:.0f}s.", True)
         return out.get("result") or _result(str((out.get("error") or {}).get("message")), True)
 
+    async def close(self) -> None:
+        """End the session: the server keeps a session's connection to Chrome until told. Its tabs stay."""
+        if self.session:
+            with suppress(Exception):
+                await asyncio.wait_for(self.http.delete(self.url, headers=self.headers()), 5)
+            self.session = ""
+
 
 class Chrome:
     """Friday's own connection to the shared browser (CDP), kept for the proxy's life: screenshots,
@@ -206,20 +225,41 @@ class Chrome:
     front. A background tab is throttled: screenshots take seconds and video may not load."""
 
     def __init__(self):
-        self.pw = self.browser = None
+        self.pw = self.browser = self.root = None
         self.sessions: dict = {}
 
-    async def page(self, url: str):
+    async def connect(self):
         if self.browser is None or not self.browser.is_connected():
             from playwright.async_api import async_playwright
 
             if self.pw is None:
                 self.pw = await async_playwright().start()
             self.browser = await self.pw.chromium.connect_over_cdp(CDP_URL)
-            self.sessions = {}
-        pages = [pg for c in self.browser.contexts for pg in c.pages]
-        return next((pg for pg in pages if pg.url == url), None) or next(
-            (pg for pg in pages if url and pg.url.split("#")[0] == url.split("#")[0]), None)
+            self.sessions, self.root = {}, None
+        return self.browser
+
+    async def pages(self) -> list:
+        return [pg for c in (await self.connect()).contexts for pg in c.pages]
+
+    async def targets(self) -> dict[str, dict]:
+        """Open tabs: CDP target id -> its info (url, openerId)."""
+        browser = await self.connect()
+        if self.root is None:
+            self.root = await browser.new_browser_cdp_session()
+        infos = (await self.root.send("Target.getTargets"))["targetInfos"]
+        return {t["targetId"]: t for t in infos if t["type"] == "page"}
+
+    async def target_of(self, page) -> str:
+        return (await self.cdp(page, "Target.getTargetInfo"))["targetInfo"]["targetId"]
+
+    async def page_of(self, target: str):
+        for page in await self.pages():
+            try:
+                if await self.target_of(page) == target:
+                    return page
+            except Exception:  # a tab that went away
+                self.sessions.pop(page, None)
+        return None
 
     async def cdp(self, page, method: str, params: dict | None = None) -> dict:
         if page not in self.sessions:
@@ -237,6 +277,22 @@ class Relay:
         self.chrome = Chrome()
         self.out_lock = asyncio.Lock()
         self.tasks: set[asyncio.Task] = set()
+        self.owner = os.environ.get(care.OWNER_ENV) or f"session:{os.getpid()}"
+        self.tab = None  # the Playwright page this session is on
+        self.tab_id = ""
+        self.tab_lock = asyncio.Lock()
+        self.known: set[str] = set()  # tabs seen so far: any other is new
+        self.touched = 0.0
+        self._store = None
+
+    @property
+    def store(self):
+        if self._store is None:
+            from .config import load_config
+            from .db import Store
+
+            self._store = Store(load_config().db_path)
+        return self._store
 
     async def write(self, msg: dict) -> None:
         async with self.out_lock:
@@ -267,12 +323,14 @@ class Relay:
     async def tool(self, msg: dict) -> dict:
         params = msg.get("params") or {}
         name, args = params.get("name", ""), params.get("arguments") or {}
+        if name in BLOCKED_TOOLS and name != "browser_evaluate":
+            return _result(f"{name} isn't available.", True)
+        if problem := await self.use_tab():
+            return _result(problem, True)
         if name == "browser_media":
             return await self.media(str(args.get("action") or "status"), args.get("seconds"))
         if name == "browser_evaluate":
             return await self.evaluate(args)
-        if name in BLOCKED_TOOLS:
-            return _result(f"{name} isn't available.", True)
         timeout = 120.0 if name == "browser_wait_for" else CALL_TIMEOUT
         fwd = {**msg, "params": {**params, "arguments": args}}
         try:
@@ -284,6 +342,8 @@ class Relay:
         result = out.get("result") if out else None
         if result is None:
             return _result(str(((out or {}).get("error") or {}).get("message") or "no answer"), True)
+        await self.note_tabs(str(args.get("action") or "") if name == "browser_tabs" else None,
+                             name == "browser_close")
         if name in FRONT_AFTER:
             await self.front()
         error = _text(result)
@@ -296,12 +356,120 @@ class Relay:
         """The agent's current tab, brought to the front (None if it can't be found)."""
         try:
             async with asyncio.timeout(8):
-                page = await self.chrome.page(await self.current_url())
+                page = self.tab if self.tab is not None and not self.tab.is_closed() else None
                 if page is not None:
                     await self.chrome.cdp(page, "Page.bringToFront")
                 return page
         except Exception:
             return None
+
+    # --- the task's own tab -----------------------------------------------------------------
+
+    def _on_tab(self) -> bool:
+        return (self.tab is not None and not self.tab.is_closed()
+                and self.chrome.browser is not None and self.chrome.browser.is_connected())
+
+    async def use_tab(self) -> str:
+        """Before a tool runs: the session is on this task's tab, in front. An error rather than
+        going on, because the session would otherwise act on whichever tab comes first."""
+        try:
+            async with asyncio.timeout(TAB_TIMEOUT):
+                async with self.tab_lock:
+                    if not self._on_tab():
+                        await self.claim()
+                    await self.chrome.cdp(self.tab, "Page.bringToFront")
+            return ""
+        except Exception as e:
+            self.tab = None
+            return (f"Couldn't get this task's browser tab ({type(e).__name__}). The browser may be "
+                    "restarting; try again shortly.")
+
+    async def claim(self) -> None:
+        """Back to the tab this task used last, if it is still open; else a new one."""
+        targets = await self.chrome.targets()
+        self.known |= set(targets)
+        for tid in reversed(care.tabs_of(self.store, self.owner)):
+            if tid in targets and (page := await self.chrome.page_of(tid)) and await self.select(page):
+                self.tab, self.tab_id = page, tid
+                care.touch(self.store, self.owner, tid)
+                self.touched = time.monotonic()
+                return
+        # A unique URL is what identifies the new tab in Chrome: the session only knows indexes.
+        mark = f"about:blank#friday-{uuid.uuid4().hex}"
+        r = await self.up.call("browser_tabs", {"action": "new", "url": mark}, self.passthrough, timeout=10)
+        if r.get("isError"):
+            raise RuntimeError("no new tab")
+        for _ in range(30):
+            targets = await self.chrome.targets()
+            tid = next((t for t, info in targets.items() if info.get("url") == mark), "")
+            page = await self.chrome.page_of(tid) if tid else None
+            if page is not None:
+                self.tab, self.tab_id = page, tid
+                self.known |= set(targets)
+                care.touch(self.store, self.owner, tid)
+                self.touched = time.monotonic()
+                return
+            await asyncio.sleep(0.1)
+        raise RuntimeError("new tab not found")
+
+    async def listed(self) -> list[tuple[int, bool, str]]:
+        """The session's tabs: (index, is it the current one, URL)."""
+        r = await self.up.call("browser_tabs", {"action": "list"}, self.passthrough, timeout=8)
+        return [(int(m[1]), bool(m[2]), m[3]) for m in TAB_LINE.finditer(_text(r))]
+
+    async def select(self, page) -> bool:
+        """Put the session on this page, whose index in the session's list is only known by URL."""
+        same = [i for i, _, url in await self.listed() if url == page.url]
+        for i in same:
+            r = await self.up.call("browser_tabs", {"action": "select", "index": i}, self.passthrough, timeout=8)
+            if not r.get("isError") and (len(same) == 1 or await self.current_page() is page):
+                return True
+        return False
+
+    async def current_page(self):
+        """The page the session is on. With several tabs on its URL only the page can tell: the
+        session marks its own with a random value, and Friday's connection looks for it."""
+        url = await self.current_url()
+        pages = [p for p in await self.chrome.pages() if p.url == url]
+        if len(pages) < 2:
+            return pages[0] if pages else None
+        mark = uuid.uuid4().hex
+        await self.up.call("browser_evaluate", {"function": f"() => {{ window.__fridayTab = '{mark}'; }}"},
+                           self.passthrough, timeout=8)
+        for page in pages:
+            try:
+                if await page.evaluate("m => { const me = window.__fridayTab === m; "
+                                       "if (me) delete window.__fridayTab; return me; }", mark):
+                    return page
+            except Exception:
+                continue
+        return None
+
+    async def note_tabs(self, tabs_action: str | None, closed: bool = False) -> None:
+        """After a tool: follow a change of tab, and add tabs this task opened to its lease (a
+        login popup: its opener is ours, or it has none and nobody else claims it)."""
+        try:
+            async with asyncio.timeout(5):
+                async with self.tab_lock:
+                    if closed or tabs_action == "close":  # the session may be on a neighbour now
+                        self.tab = None
+                    elif tabs_action in ("new", "select"):
+                        if (page := await self.current_page()) is not None:
+                            self.tab, self.tab_id = page, await self.chrome.target_of(page)
+                    targets = await self.chrome.targets()
+                    mine = care.tabs_of(self.store, self.owner)
+                    others = {t for k, x in care.leases(self.store).items() if k != care.LEASE + self.owner
+                              for t in x["tabs"]}
+                    new = [t for t, info in targets.items() if t not in self.known and t not in others
+                           and (not info.get("openerId") or info["openerId"] in mine)]
+                    self.known |= set(targets)
+                    use = [self.tab_id] if self.tab is not None and self.tab_id not in others else []
+                    stale = time.monotonic() - self.touched > LEASE_TOUCH
+                    if stale or set(new) - set(mine) or (use and mine[-1:] != use):
+                        care.touch(self.store, self.owner, *new, *use)
+                        self.touched = time.monotonic()
+        except Exception:  # bookkeeping: the tool's own result still stands
+            pass
 
     # --- clicks that fail -------------------------------------------------------------------
 
@@ -377,9 +545,7 @@ class Relay:
     # --- media ---------------------------------------------------------------------------
 
     async def current_url(self) -> str:
-        r = await self.up.call("browser_tabs", {"action": "list"}, self.passthrough, timeout=8)
-        m = re.search(r"\(current\)[^\n]*?\]\((\S+?)\)", _text(r))
-        return m.group(1) if m else ""
+        return next((url for _, current, url in await self.listed() if current), "")
 
     async def media(self, action: str, seconds: Any = None) -> dict:
         page = await self.front()  # a background tab may not load its video at all
@@ -442,18 +608,25 @@ class Relay:
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
-        warm = asyncio.create_task(self.chrome.page(""))  # connecting takes ~2s: do it before it's needed
+        warm = asyncio.create_task(self.chrome.connect())  # connecting takes ~2s: do it before it's needed
         warm.add_done_callback(lambda t: t.exception())
         reader = asyncio.StreamReader(limit=1 << 25)
         await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-        while line := await reader.readline():
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            task = asyncio.create_task(self.handle(msg))
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, reader.feed_eof)
+        try:
+            while line := await reader.readline():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                task = asyncio.create_task(self.handle(msg))
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+        finally:
+            for task in self.tasks:
+                task.cancel()
+            await self.up.close()
 
 
 def main() -> None:

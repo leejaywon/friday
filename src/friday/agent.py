@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import browser, mcp_config, mcp_http
+from . import browser, browser_care, mcp_config, mcp_http
 from .config import Config, env_file
 from .timeutil import VAGUE_TIMES
 
@@ -342,7 +342,8 @@ def codex_overrides(
             o["mcp_servers.playwright.command"] = sys.executable
             o["mcp_servers.playwright.args"] = ["-m", "friday.browser_proxy"]
             o["mcp_servers.playwright.env"] = {"FRIDAY_PLAYWRIGHT_URL": mcp_http.url(mcp_http.playwright_port()),
-                                               "FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir)}
+                                               "FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir),
+                                               browser_care.OWNER_ENV: browser_care.owner(run_id, watch_id, chat)}
             o["mcp_servers.playwright.startup_timeout_sec"] = 20
         else:
             pw = browser.playwright_mcp_command(cfg)

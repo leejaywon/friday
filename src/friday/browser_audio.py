@@ -128,6 +128,17 @@ def _running(record: dict) -> bool:
     return result.stdout.strip() in ("active", "activating", "deactivating", "reloading")
 
 
+def recording(cfg: Config) -> bool:
+    """Is a recording in progress? If that can't be told, yes: Chrome mustn't restart under it."""
+    try:
+        record = _load(cfg)
+        return record["status"] == "recording" and _running(record)
+    except AudioError:  # none yet
+        return False
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return True
+
+
 def _probe(path: Path) -> float:
     try:
         duration = float(_run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",

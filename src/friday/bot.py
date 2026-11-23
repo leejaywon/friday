@@ -39,7 +39,8 @@ from telegram.ext import (
     filters,
 )
 
-from . import browser, gcal, mcp_config, mcp_http, miniapp, planner
+from . import browser, browser_audio, gcal, mcp_config, mcp_http, miniapp, planner
+from . import browser_care as care
 from . import timeutil as tu
 from . import workspace as wsfiles
 from .agent import AgentResult, engine_status, instructions, light_reply, run_turn
@@ -611,6 +612,7 @@ class Friday(WatchBot):
         # The shared browser, one chat turn or scheduled run at a time (two would drive the same tabs).
         self.browser_lock = asyncio.Lock()
         self._browser_topic = ""
+        self.doctor = care.Doctor(self._restart_browser, self._browser_busy, self.say, self.store)
         # Chat turns' Codex: one app-server process, started on the first message (codex_server.py)
         self.codex = CodexServer(cfg) if cfg.codex_server and cfg.chat_engine == "codex" else None
         self.app: Application | None = None
@@ -695,7 +697,7 @@ class Friday(WatchBot):
         except Exception:
             log.exception("browser runs startup failed")
         for loop in (self.reminder_loop, self.outbox_loop, self.brief_loop, self.heartbeat_loop, self.wake_loop,
-                     self.job_loop, self.browser_run_loop, self.watch_loop):
+                     self.job_loop, self.browser_run_loop, self.watch_loop, self.browser_care_loop):
             self._tasks.append(asyncio.create_task(self._forever(loop), name=loop.__name__))
         task = asyncio.create_task(self._import_history())
         self._bg.add(task)
@@ -797,6 +799,7 @@ class Friday(WatchBot):
             self._summarize_soon()
         for key in ("thread_id", "toolsets", "carry"):
             self.store.delete(key)
+        care.release_chats(self.store)
         for lane in self.lanes.values():
             self.store.delete(_meanwhile_key(lane.key))
             lane.last = ""
@@ -921,7 +924,8 @@ class Friday(WatchBot):
         free.sort(key=lambda x: (x.key != "1", x.thread is not None, x.finished_at))
         lane = free[0] if free else None
         if lane and lane.key != "1":
-            lane.thread = None  # a new request: not on top of an old side conversation
+            lane.thread = None  # a new request: not on top of an old side conversation, or in its tab
+            care.release(self.store, f"chat:{lane.key}")
         return lane
 
     async def _route(self, text: str, files: list[str]) -> Lane | None:
@@ -1101,6 +1105,7 @@ class Friday(WatchBot):
         if not self.browser_lock.locked():  # free: taken without yielding, so no other turn gets it too
             await self.browser_lock.acquire()
             self._browser_topic = lane.topic
+            await self._browser_ready(lane, status)
             return True
         status.waiting = f"waiting for the browser ({short(self._browser_topic, 40)})"
         lane.task = asyncio.create_task(self.browser_lock.acquire())
@@ -1114,7 +1119,66 @@ class Friday(WatchBot):
             lane.task = None
             status.waiting = ""
         self._browser_topic = lane.topic
+        await self._browser_ready(lane, status)
         return True
+
+    async def _browser_ready(self, lane: Lane, status: TurnStatus) -> None:
+        """Holding the browser: a stuck one is found and restarted before the agent starts on it.
+        [Stop] ends the wait for that, not a restart in progress."""
+        if self.doctor.fresh() or not mcp_http.listening(browser.CDP_PORT):  # not running: systemd's job
+            return
+        status.waiting = "checking the browser"
+        check = asyncio.create_task(self.doctor.ensure("lock"))
+        self._bg.add(check)
+        check.add_done_callback(self._bg.discard)
+        lane.task = asyncio.ensure_future(asyncio.shield(check))
+        try:
+            await lane.task
+        except asyncio.CancelledError:
+            if not lane.stopping:
+                raise
+        finally:
+            lane.task = None
+            status.waiting = ""
+
+    async def _browser_busy(self, me: str = "") -> bool:
+        """Is browser work running that a restart would break? me: the caller's own hold, not
+        counted ("lock": a chat turn's browser_lock, "run": a scheduled run, "watch": a watch
+        check). The recording's check comes first: from here to the restart nothing yields."""
+        if await asyncio.to_thread(browser_audio.recording, self.cfg):
+            return True
+        return bool((self.browser_lock.locked() and me not in ("lock", "run"))
+                    or (self._running_run_id() and me != "run")
+                    or (self._watch_busy() and me != "watch")
+                    or self._followups())
+
+    async def _restart_browser(self, me: str) -> str:
+        if me in ("lock", "run"):
+            return await care.restart_chrome()
+        async with self.browser_lock:  # a turn that asks for the browser now waits for this
+            self._browser_topic = "restarting the browser"
+            return await care.restart_chrome()
+
+    def _tabs_done(self, who: str):
+        """A task's done-callback: its tabs are for the next sweep."""
+        def done(_task: asyncio.Task) -> None:
+            try:
+                care.release(self.store, who)
+            except sqlite3.Error:  # Friday is shutting down
+                pass
+        return done
+
+    async def browser_care_loop(self) -> float:
+        """While no browser work runs: is Chrome still really usable (browser_care.Doctor), and
+        close the tabs no task holds any more."""
+        if not self.cfg.browser_enabled or not mcp_http.listening(browser.CDP_PORT):
+            return 60
+        if await self._browser_busy() or (self.doctor.due() and not await self.doctor.check()):
+            return 30
+        if not await self._browser_busy():
+            await care.sweep(self.store, lambda: {f"chat:{x.key}" for x in self.lanes.values() if x.lock.locked()},
+                             ROUTE_RECENT, self._browser_busy)
+        return 30
 
     async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str],
                           status: TurnStatus | None = None, lane: str = "1") -> AgentResult:
@@ -1181,6 +1245,7 @@ class Friday(WatchBot):
 
         async def shoot() -> Path | None:
             path = self.cfg.files_dir / "browser" / f"watch-{lane}.png"
+            browser.own_tabs.set(tuple(care.tabs_of(self.store, f"chat:{lane}")))
             async with asyncio.timeout(10):
                 return path if await browser.screenshot(path) else None
 
@@ -2379,6 +2444,7 @@ class Friday(WatchBot):
         if run and self.store.set_run_status(run["id"], "running", only_from="pending"):
             self._run_id = run["id"]
             self._run_task = asyncio.create_task(self._browser_run(self.store.scheduled_run(run["id"])), name=f"run-{run['id']}")
+            self._run_task.add_done_callback(self._tabs_done(f"run:{run['id']}"))
         return 10
 
     async def _browser_run(self, run) -> None:
@@ -2391,6 +2457,8 @@ class Friday(WatchBot):
         async with self.browser_lock:
             self._browser_topic = f"scheduled browser run #{rid}"
             try:
+                if mcp_http.listening(browser.CDP_PORT):
+                    await self.doctor.ensure("run")
                 result = await run_turn(
                     replace(self.cfg, codex_timeout_seconds=browser.RUN_TIMEOUT_SECONDS), prompt,
                     model=self.store.get("model") or "", effort=self.store.get("effort") or "", run_id=rid,
@@ -2408,6 +2476,7 @@ class Friday(WatchBot):
             self.store.set_run_status(rid, "done" if result.ok else "failed", text, only_from="running")
             try:
                 shot = self.cfg.files_dir / "browser" / f"run-{rid}.png"
+                browser.own_tabs.set(tuple(care.tabs_of(self.store, f"run:{rid}")))
                 if await browser.screenshot(shot):
                     with shot.open("rb") as fh:
                         await self.app.bot.send_photo(self.owner, fh, caption=f"🌐 #{rid} last screen")  # type: ignore[union-attr]
@@ -2805,7 +2874,7 @@ class Friday(WatchBot):
         due = self.store.due_wakes(tu.now_utc())
         if not due:
             return 15
-        if not self._free_lane():
+        if all(x.lock.locked() for x in self.lanes.values()):  # not _free_lane: it resets the lane it picks
             return 15
         zone = ZoneInfo(self.tz)
         notes = [f"«{w['note']}» (set {tu.from_iso(w['created_at']).astimezone(zone):%m/%d %H:%M} for "
@@ -2839,7 +2908,7 @@ class Friday(WatchBot):
         key = tu.to_utc_iso(at)
         if self.store.get("heartbeat_last") == key or now - at > HEARTBEAT_STALE:
             return 30
-        if not self._free_lane():
+        if all(x.lock.locked() for x in self.lanes.values()):
             return 30
         self.store.set("heartbeat_last", key)
         wakes = [f"  {tu.local_str(tu.from_iso(w['at']), self.tz)}: {w['note']}" for w in self.store.pending_wakes()]

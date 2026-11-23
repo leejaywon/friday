@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
+from . import browser, mcp_http
 from . import timeutil as tu
 from .agent import instructions, run_turn
 from .jobs import short
@@ -189,7 +190,7 @@ def describe(w, tz: str) -> str:
 
 class WatchBot:
     """The bot side, mixed into bot.Friday: the check loop, notifications, /watches and buttons.
-    Uses Friday's store, cfg, app, owner, tz, say, _quiet and _running_run_id."""
+    Uses Friday's store, cfg, app, owner, tz, say, doctor, _quiet, _tabs_done and _running_run_id."""
 
     _watch_task: asyncio.Task | None = None  # the check in progress, if any
 
@@ -204,7 +205,7 @@ class WatchBot:
         # Polled, because add_watch (in the MCP server) adds watches. One unattended Codex run at a
         # time: scheduled browser runs (often deadlines) go first.
         now = tu.now_utc()
-        if self._watch_busy() or self._running_run_id() or self.store.next_due_run(now):
+        if self._watch_busy() or self._running_run_id() or self.store.next_due_run(now) or self.doctor.repairing:
             return 15
         self.store.clear_watch_checks()
         w = self.store.next_due_watch(now)
@@ -216,6 +217,7 @@ class WatchBot:
             return 1
         self.store.update_watch(w["id"], checking=1)
         self._watch_task = asyncio.create_task(self._watch_check(w), name=f"watch-{w['id']}")
+        self._watch_task.add_done_callback(self._tabs_done(f"watch:{w['id']}"))
         return 15
 
     async def _watch_check(self, w) -> None:
@@ -224,6 +226,8 @@ class WatchBot:
         prompt = instructions(self.cfg) + "\n---\n" + check_prompt(w, tu.local_str(tu.now_utc(), self.tz))
         toolsets = {t for t in w["toolsets"].split(",") if t in TOOLSETS}
         try:
+            if "browser" in toolsets and mcp_http.listening(browser.CDP_PORT):
+                await self.doctor.ensure("watch")
             result = await run_turn(
                 replace(self.cfg, codex_timeout_seconds=CHECK_TIMEOUT_SECONDS), prompt,
                 # Routine checks are simple and frequent: low effort spares the subscription quota.

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -25,6 +26,9 @@ PLAYWRIGHT_MCP_CLI = Path.home() / ".local/share/friday/playwright-mcp/node_modu
 # Tools that would hand the agent what fill_login typed: page JavaScript (reads the password field),
 # request bodies (the login POST), and arbitrary Playwright code in the MCP server's process.
 BLOCKED_TOOLS = ["browser_evaluate", "browser_run_code_unsafe", "browser_network_request", "browser_network_requests"]
+
+# The calling task's tabs (browser_care leases), for fill_login and screenshots.
+own_tabs: ContextVar[tuple[str, ...]] = ContextVar("own_tabs", default=())
 
 PASSWORD = "input[type=password]:visible"
 SUBMIT_BUTTON = "button[type=submit], input[type=submit], button:not([type])"
@@ -96,7 +100,23 @@ def _allowed(url: str, domains: tuple[str, ...]) -> bool:
 
 
 async def _pages(browser) -> list:
-    return [p for ctx in browser.contexts for p in ctx.pages]
+    """Open tabs. In a task with tabs of its own (own_tabs), only those, the one in use last, so a
+    login is never typed into another task's tab and an approval shows the right page."""
+    pages = [p for ctx in browser.contexts for p in ctx.pages]
+    tabs = own_tabs.get()
+    if not tabs:
+        return pages
+    ranked = []
+    for page in pages:
+        try:
+            session = await page.context.new_cdp_session(page)
+            tid = (await session.send("Target.getTargetInfo"))["targetInfo"]["targetId"]
+            await session.detach()
+        except Exception:  # a tab that went away
+            continue
+        if tid in tabs:
+            ranked.append((tabs.index(tid), page))
+    return [p for _, p in sorted(ranked, key=lambda x: x[0])]
 
 
 async def _login_frame(browser, domains: tuple[str, ...]):
