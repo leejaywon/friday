@@ -448,3 +448,19 @@ def test_a_worker_is_ended_for_making_no_progress_not_for_its_step_count(store):
         assert stopped and any("without the ledger moving" in n for n in notes)
 
     asyncio.run(go())
+
+
+def test_a_job_interrupted_during_an_approved_step_stops_and_asks(cfg):
+    from friday import delegate as dg
+
+    bot = Friday(replace(cfg, allowed_user_ids=(1,)))
+    safe, risky = (bot.store.add_delegated_job(g, "codex") for g in ("자료 읽기", "과제 제출"))
+    for j in (safe, risky):
+        bot.store.update_job(j, status="running", session_id="t")
+    bot.store.set(dg.risky_key(risky), "과제 제출 버튼 누르기")
+    sent = []
+    bot._job_send = lambda jid, text, markup=None: sent.append((jid, text)) or asyncio.sleep(0)
+    asyncio.run(bot._jobs_startup())
+    assert bot.store.job(safe)["status"] == "queued"  # reading just goes on
+    assert bot.store.job(risky)["status"] == "failed" and any(j == risky and "과제 제출 버튼" in t for j, t in sent)
+    bot.store.close()

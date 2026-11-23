@@ -45,8 +45,11 @@ RELEASED = LEASE + "done:"
 PLAYING = "() => [...document.querySelectorAll('video, audio')].some(m => !m.paused && !m.ended)"
 
 
-def owner(run_id: int | None = None, watch_id: int | None = None, chat: bool | str = False) -> str:
+def owner(run_id: int | None = None, watch_id: int | None = None, chat: bool | str = False,
+          job_id: int | None = None) -> str:
     """The lease name of a task; "" for one outside the bot."""
+    if job_id:
+        return f"job:{job_id}"
     if run_id:
         return f"run:{run_id}"
     if watch_id:

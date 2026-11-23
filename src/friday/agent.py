@@ -371,7 +371,7 @@ def codex_overrides(
             o["mcp_servers.playwright.args"] = ["-m", "friday.browser_proxy"]
             o["mcp_servers.playwright.env"] = {"FRIDAY_PLAYWRIGHT_URL": mcp_http.url(mcp_http.playwright_port()),
                                                "FRIDAY_ENV": str(env_file()), "FRIDAY_DATA_DIR": str(cfg.data_dir),
-                                               browser_care.OWNER_ENV: browser_care.owner(run_id, watch_id, chat)}
+                                               browser_care.OWNER_ENV: browser_care.owner(run_id, watch_id, chat, job_id)}
             o["mcp_servers.playwright.startup_timeout_sec"] = 20
         else:
             pw = browser.playwright_mcp_command(cfg)

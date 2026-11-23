@@ -1176,8 +1176,8 @@ class Friday(WatchBot):
         if await self._browser_busy() or (self.doctor.due() and not await self.doctor.check()):
             return 30
         if not await self._browser_busy():
-            await care.sweep(self.store, lambda: {f"chat:{x.key}" for x in self.lanes.values() if x.lock.locked()},
-                             ROUTE_RECENT, self._browser_busy)
+            await care.sweep(self.store, lambda: {f"chat:{x.key}" for x in self.lanes.values() if x.lock.locked()}
+                             | {f"job:{j}" for j in self._running_jobs()}, ROUTE_RECENT, self._browser_busy)
         return 30
 
     async def _codex_turn(self, prompt: str, thread: str | None, images: list[Path], toolsets: set[str],
@@ -1964,6 +1964,13 @@ class Friday(WatchBot):
         # and the agent's session when it had one. Not forever: a job that keeps getting cut off fails.
         for jid in self.store.interrupted_jobs():
             job = self.store.job(jid)
+            if risky := self.store.get(dg.risky_key(jid)):  # it may or may not have gone through
+                self.store.delete(dg.risky_key(jid))
+                self.store.update_job(jid, status="failed", error="Friday restarted during a step the owner approved.")
+                await self._job_send(jid, f"⚠️ Friday restarted while job #{jid} was doing a step you approved: "
+                                          f"«{risky}». It may or may not have gone through, so I stopped instead of "
+                                          "risking doing it twice. Check it, then reply here to continue.")
+                continue
             tries = int(self.store.get(f"job_resumes:{jid}") or 0)
             if tries >= MAX_RESUMES:
                 self.store.update_job(jid, status="failed", error="Friday restarted while this job was running.")
@@ -2055,6 +2062,7 @@ class Friday(WatchBot):
                 await self._quiet(self.app.bot.edit_message_text(  # type: ignore[union-attr]
                     f"{started}\n\n⏱ {took} min", chat_id=self.owner, message_id=mid))
 
+        self.store.delete(dg.risky_key(jid))
         if work:
             await self._worker_done(jid, outcome)
             return
@@ -2142,6 +2150,8 @@ class Friday(WatchBot):
                 self._drop_browser_request(key)
                 await self.browser_lock.acquire()
                 has_browser, self._browser_topic = True, f"job #{jid}: {short(job['task'], 80)}"
+                if not self.doctor.fresh() and mcp_http.listening(browser.CDP_PORT):
+                    await self.doctor.ensure("lock")  # a stuck Chrome is restarted before the worker starts on it
                 prompt = "[The browser tools are now attached; go on with the job.]"
             if pace.ended:
                 result = await turn("[Friday stopped this job: it stopped making progress. Without using any tools, "
@@ -2211,6 +2221,7 @@ class Friday(WatchBot):
 
     async def _stopped_job(self, jid: int, head: str) -> None:
         try:
+            self.store.delete(dg.risky_key(jid))
             self.store.update_job(jid, status="cancelled", followup=None)
             job = self.store.job(jid)
             await self.runner.cleanup(job)  # cancelled jobs can't be resumed, so drop the worktree

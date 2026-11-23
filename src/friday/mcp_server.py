@@ -686,6 +686,7 @@ def ledger(action: str = "read", title: str = "", item_id: int = 0, status: str 
             return f"status must be one of {', '.join(dg.ITEM_STATUSES)}."
         if not store.update_job_item(jid, item_id, status, short(evidence, 500) if evidence else ""):
             return f"No item #{item_id} in this job's ledger."
+        store.delete(dg.risky_key(jid))  # what came of an approved step is on record
     elif action != "read":
         return "Unknown action: use read, add or update."
     return dg.board(store, jid)
@@ -994,7 +995,7 @@ def _vault_login(name: str):
 def _use_own_tabs(ctx: Context | None) -> None:
     """Browser calls of this request look at the calling task's tabs (browser.own_tabs)."""
     chat = _context(ctx, mcp_http.CHAT_HEADER, "FRIDAY_CHAT")
-    who = browser_care.owner(_run_id(ctx), _watch_id(ctx), chat)
+    who = browser_care.owner(_run_id(ctx), _watch_id(ctx), chat, _job_id(ctx))
     browser.own_tabs.set(tuple(browser_care.tabs_of(store, who)))
 
 
@@ -1176,6 +1177,8 @@ async def request_approval(summary: str, ctx: Context | None = None) -> str:
         store.queue("approval", text=str(aid), path=str(shot) if url else None)
         return SENT
     status = await _ask("action", text, shot if url else None)
+    if job and status == "approved":
+        store.set(dg.risky_key(job["id"]), short(summary, 300))
     return {"approved": "approved", "denied": "denied: don't do it", "expired": "timed out: don't do it"}[status]
 
 
