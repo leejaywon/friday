@@ -185,7 +185,7 @@ def click_plan(probe: dict | None, error: str) -> tuple[str, str]:
         return "scroll", "the element is outside the visible area"
     if probe.get("covered") or "intercepts pointer events" in error:
         return "escape", f"something covers it ({probe.get('by') or 'an overlay'})"
-    return "xy", "the element keeps moving or changing (an animation, a loading player)"
+    return "xy", "the click didn't reach it (it may be moving or changing)"
 
 
 def action_effect(before: dict | None, after: dict | None, again: str | None = None, focus_only: bool = False) -> str:

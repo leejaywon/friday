@@ -22,7 +22,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver import Context
 
-from . import browser, browser_audio, browser_care, contacts, gcal, mcp_http
+from . import browser, browser_audio, browser_care, contacts, gcal, mcp_http, secret_http
 from . import delegate as dg
 from . import timeutil as tu
 from . import watches as wt
@@ -260,7 +260,7 @@ def wake(when: str, note: str) -> str:
     time, use add_reminder: it goes out even if you can't run.
 
     note: what to look at and why, complete on its own (the conversation may have moved on),
-        e.g. "Naver internship application due 23:59 today; check list_tasks, nudge if still open".
+        e.g. "Application due 23:59 today; check list_tasks, nudge if still open".
     Quiet hours (no wakes then) move it to their end."""
     if looks_secret(note):
         return REFUSAL
@@ -444,10 +444,10 @@ def recall(query: str = "", conversation: int = 0, after: int = 0, before: int =
            since: str = "", until: str = "") -> str:
     """What you know and what was said before: saved memories and past conversations with the user
     (their titles, summaries and messages, including the links and findings you gave). Call it
-    whenever the user refers to something earlier ("the CCTVs we looked at", "what did I say
+    whenever the user refers to something earlier ("the ones we looked at", "what did I say
     about…") or a request may depend on what you know about them, before asking them.
 
-    query: key words, nouns without particles ("CCTV", "엄마 생일"). Nothing found: try other words,
+    query: key words, nouns without particles ("laptop", "엄마 생일"). Nothing found: try other words,
         a shorter form, or the English/Korean name.
     since / until: ISO dates or date-times to narrow the search ("2026-11-01").
     conversation: read that conversation's messages, from its start, after a message id (after)
@@ -775,7 +775,7 @@ def list_projects() -> str:
 def show_tree(project: str, path: str = "", depth: int = 2) -> str:
     """Show the user a folder's structure in Telegram as a monospace tree: a project (a name from
     list_projects; without ignored, build and dependency files, with the branch and last commit)
-    or a workspace folder ('konkuk', 'files/inbox', '.' for the whole workspace). path: a
+    or a workspace folder ('files/inbox', '.' for the whole workspace). path: a
     subfolder to open; depth: levels to unfold (1-4, default 2). Use this for any "show me the
     folders/directory", never a tree written by hand. The user sees the tree itself, so don't
     repeat it: end your turn with "-" unless you have more to say."""
@@ -943,11 +943,11 @@ async def list_browser_recordings() -> str:
 
 @server.tool()
 async def transcribe_browser_recording(recording_id: str = "", max_parts: int = 3) -> str:
-    """Transcribe a stopped recording using the existing speech provider (Groq). Use when the
+    """Transcribe a stopped recording using the configured speech provider. Use when the
     user asks to transcribe, understand or summarize its content. Sends audio to that provider.
     Processes up to 3 five-minute parts per call; repeat while remaining_parts > 0. Successful
     parts are cached across retries/restarts. Returns text plus a workspace .txt path.
-    Read the whole transcript before summarizing a whole lecture; identify partial intervals.
+    Read the whole transcript before summarizing all of it; identify partial intervals.
     """
     try:
         result = await browser_audio.transcribe_recording(cfg, recording_id, max_parts)
@@ -1004,7 +1004,8 @@ def list_logins() -> str:
     return "\n".join(lines) or "No saved logins."
 
 
-async def _may_fill(name: str, login, host: str, run_id: int = 0, watch_id: int = 0) -> str | None:
+async def _may_fill(name: str, login, host: str, run_id: int = 0, watch_id: int = 0,
+                    question: str = "") -> str | None:
     """None if the login may be typed on host: trusted there (approved once, or typed in for it),
     pre-approved for this run or watch, or approved now on Telegram. Otherwise the refusal to return.
     A watch check never asks: only its pre-approved logins work there."""
@@ -1014,8 +1015,8 @@ async def _may_fill(name: str, login, host: str, run_id: int = 0, watch_id: int 
         if store.watch_allows_login(watch_id, name):
             return None
         return f"'{name}' isn't pre-approved for this watch; report it as an error."
-    status = await _ask("login", f"🔑 Type the login '{name}' into {host}?\n"
-                                 "(If you allow it, I won't ask again on this site. Undo it in /logins.)")
+    status = await _ask("login", (question or f"🔑 Type the login '{name}' into {host}?") +
+                        "\n(If you allow it, I won't ask again on this site. Undo it in /logins.)")
     if status != "approved":
         return NOT_APPROVED[status]
     try:
@@ -1099,6 +1100,57 @@ async def fill_login_field(name: str, field: str, ctx: Context | None = None) ->
         return await browser.fill_focused(login.domains, login.extra[field], field)
     except Exception as e:
         return f"Couldn't fill the field ({type(e).__name__})."
+
+
+@server.tool()
+async def http_request(method: str, url: str, secret: str, header: str = "Authorization: Bearer {secret}",
+                       headers: str = "", body: str = "", content_type: str = "",
+                       ctx: Context | None = None) -> str:
+    """Call an HTTP API with a key or token from Friday's vault. Use this whenever an API needs a
+    stored key: you name the secret and write the header with {secret} where the value goes;
+    Friday puts the value in at sending time, so you never see it and never need to. Never ask the
+    user to paste a key in chat, and never try to read one. Only https, only to the secret's own
+    site (the domain it was saved for with request_form); redirects aren't followed. Returns the
+    status, the useful response headers and the body (up to 20,000 characters; anything that
+    echoes the secret is shown as [redacted]). A 401 or 403 usually means the stored key is wrong,
+    expired or revoked: tell the user and offer request_form (save_as the same name, domain the
+    API's host) to replace it.
+
+    method: GET, HEAD, POST, PUT, PATCH or DELETE.
+    url: the full https URL, e.g. 'https://api.example.com/v1/me'.
+    secret: the vault name, e.g. 'example_api', or 'name.field' for one field of an entry with
+        several (request_form's result says "stored as <name>.<field>").
+    header: the header that carries it, with {secret} exactly once, e.g.
+        'Authorization: Bearer {secret}' (the default), 'X-API-Key: {secret}'.
+    headers: optional other headers, a JSON object or 'Name: value' lines (no {secret}).
+    body: optional request body (not for GET/HEAD); JSON is sent as application/json, other text
+        as text/plain unless content_type says otherwise.
+    """
+    try:
+        req = secret_http.prepare(method, url, header, headers, body, content_type)
+    except secret_http.Refused as e:
+        return f"Not sent: {e}"
+    watch_id = _watch_id(ctx)
+    if watch_id and req.method not in secret_http.READ_ONLY:
+        return "Not sent: a watch check only observes (GET or HEAD)."
+    try:
+        v = Vault(cfg.vault_dir)
+        names = [n for n, _ in v.names()]
+    except Exception as e:  # e.g. a missing or wrong key; the message never holds a secret
+        return f"Not sent: the vault can't be read ({type(e).__name__})."
+    name, field = (secret.strip(), "") if secret.strip() in names else secret_http.split_ref(secret)
+    login = v.get(name) if name in names else None
+    if login is None:
+        return f"Not sent: no secret named '{secret.strip()}'. Saved: {', '.join(names) or 'none'}."
+    try:
+        secret_http.check_host(req, login)
+        value = secret_http.pick_secret(login, field)
+    except secret_http.Refused as e:
+        return f"Not sent: {e}"
+    if refusal := await _may_fill(name, login, req.host, _run_id(ctx), watch_id,
+                                  question=f"🔑 Send the secret '{name}' to {req.host} ({req.method} {req.url})?"):
+        return refusal
+    return await secret_http.send(req, value)
 
 
 async def _run_form(spec: dict, kind: str = "form", name: str = "", domain: str = "",
@@ -1393,7 +1445,7 @@ def set_model(model: str = "", effort: str = "") -> str:
     """Show or change the model (and, for Codex, the reasoning effort) Friday answers with (same as /model).
 
     With no arguments: the current choice and the available models with their efforts. When the
-    user asks to switch ("a smaller model than sol", "medium effort"), call it once with no
+    user asks to switch ("a smaller model", "medium effort"), call it once with no
     arguments to see the list, pick the model they mean, then call it with model and/or effort.
     model='default' resets both. The change applies from the user's next message.
     """

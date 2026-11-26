@@ -30,7 +30,7 @@ from .jobs import short
 
 log = logging.getLogger(__name__)
 
-MIN_EVERY = timedelta(minutes=15)  # protects the owner's ChatGPT plan quota
+MIN_EVERY = timedelta(minutes=15)  # each check is an agent run on the user's plan
 MAX_ACTIVE = 10
 MAX_FAILS = 3  # failed checks in a row before a watch is paused
 CHECK_TIMEOUT_SECONDS = 600
@@ -55,7 +55,7 @@ def parse_every(every: str) -> str:
         raise ValueError(f"'{every}' isn't an interval: use e.g. '30m', '2h', '1d' or 'daily 09:00'.")
     minutes = int(m[1]) * _UNITS[m[2]]
     if timedelta(minutes=minutes) < MIN_EVERY:
-        raise ValueError("Checks can't run more often than every 15 minutes (each one uses the ChatGPT plan).")
+        raise ValueError("Checks can't run more often than every 15 minutes (each one is an agent run on your plan).")
     return f"{minutes}m"
 
 

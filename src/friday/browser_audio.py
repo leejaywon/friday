@@ -305,7 +305,7 @@ async def transcribe_recording(cfg: Config, recording_id: str = "", max_parts: i
             if completed >= max_parts:
                 break
             source = _file(directory, name)
-            # The fixed 5-minute mono AAC chunks stay well below Groq's upload limit.
+            # The fixed 5-minute mono AAC chunks stay well below the speech providers' 25 MB upload limit.
             if source.stat().st_size > 24 * 1024 * 1024:
                 raise AudioError("Audio part exceeds the transcription upload limit.")
             if await asyncio.to_thread(_peak, source) < -55:

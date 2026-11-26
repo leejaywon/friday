@@ -161,6 +161,14 @@ every Friday, so all installs use the copy this repo publishes at
 https://leejaywon.github.io/friday/app/. To use your own copy, host `site/` on any https address
 and set `FRIDAY_APP_URL` to its `app/` page; `FRIDAY_APP_URL=` (empty) turns the button off.
 
+**API keys**: a key or token in the vault can be used against its API with the `http_request`
+tool: Friday names the secret and writes the header (`Authorization: Bearer {secret}`), and the
+tool puts the value in at sending time, so the AI never sees it. A secret only goes to the domain
+it is bound to (the form's domain, subdomains included), over https, without following
+redirects; anything the server echoes back is shown as `[redacted]`, responses are cut at 1 MB
+read and 20,000 characters shown, and a request times out after 20 seconds. A key saved without a
+domain is never sent; Friday asks for it again with the API's domain.
+
 **Watches**: say what to watch in plain words. Friday sends a 🔔 approval with what it will
 check, how often (at least every 15 minutes), until when, and which tools and saved logins it may
 use. Checks only look: no submitting, sending, buying or posting. You get a message only when the

@@ -50,7 +50,7 @@ def available_models(path: Path | None = None, engine: str = "codex") -> list[Mo
 
 
 # Words in a model's slug that mark the small, fast one (progress updates).
-LIGHT_HINTS = ("luna", "mini", "nano", "haiku", "affordable", "easier tasks")
+LIGHT_HINTS = ("luna", "mini", "nano", "haiku")
 
 
 def light_model(engine: str = "codex", override: str = "", path: Path | None = None) -> tuple[str, str]:
