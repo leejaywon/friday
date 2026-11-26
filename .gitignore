@@ -15,6 +15,7 @@ dist/
 !.env.example
 
 # Local data: database, files, Google token, browser profile, login vault
+.docs/
 data/
 friday-data/
 *.db
