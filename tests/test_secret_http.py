@@ -182,6 +182,12 @@ def test_a_secret_also_goes_to_subdomains_of_its_domain(tools, mock):
     assert out.startswith("HTTP 200") and SECRET not in out
 
 
+def test_workers_can_call_apis_too():
+    from friday import delegate as dg
+
+    assert "http_request" in dg.WORKER_TOOLS  # delegated work reaches APIs the same way
+
+
 def test_errors_never_hold_the_secret(tools, monkeypatch):
     _save(tools, "example_api", {"api_key": SECRET}, ["api.example.com"])
 

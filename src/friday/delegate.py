@@ -29,7 +29,7 @@ from .db import Store
 PROJECT_TOOLS = frozenset({"ledger", "request_form", "request_code", "request_approval"})
 WORKER_TOOLS = PROJECT_TOOLS | frozenset({
     "finish_job", "use_tools", "current_time", "list_logins", "fill_login", "fill_login_field",
-    "start_browser_recording", "stop_browser_recording", "browser_recording_status",
+    "http_request", "start_browser_recording", "stop_browser_recording", "browser_recording_status",
     "list_browser_recordings", "transcribe_browser_recording", "read_browser_transcript",
 })
 ITEM_STATUSES = ("todo", "doing", "done", "blocked")
